@@ -90,6 +90,17 @@
       </div>
       <p id="statusLine" class="status-line">No frames captured.</p>
     </section>
+
+    <section id="debugConsole" class="debug-console" aria-label="Debug console">
+      <details>
+        <summary>Debug console <span id="debugCount">0 entries</span></summary>
+        <div class="debug-toolbar">
+          <button id="copyDebugButton" class="secondary" type="button">Copy all</button>
+          <button id="clearDebugButton" class="secondary" type="button">Clear</button>
+        </div>
+        <pre id="debugOutput" tabindex="0">Debug log initialized. Console messages will appear here.</pre>
+      </details>
+    </section>
   </main>
   <script src="app.js" defer></script>
 </body>
