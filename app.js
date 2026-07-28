@@ -1,5 +1,80 @@
 'use strict';
 
+const debugEntries = [];
+const originalConsole = {};
+
+function formatDebugValue(value) {
+  if (value instanceof Error) return `${value.name}: ${value.message}${value.stack ? `\n${value.stack}` : ''}`;
+  if (typeof value === 'string') return value;
+  if (value === undefined) return 'undefined';
+  if (value === null) return 'null';
+  try { return JSON.stringify(value, null, 2); }
+  catch (_) { return String(value); }
+}
+
+function appendDebug(level, args) {
+  const time = new Date().toISOString();
+  const message = args.map(formatDebugValue).join(' ');
+  debugEntries.push(`[${time}] [${level.toUpperCase()}] ${message}`);
+  if (debugEntries.length > 1000) debugEntries.splice(0, debugEntries.length - 1000);
+  const output = document.getElementById('debugOutput');
+  const count = document.getElementById('debugCount');
+  if (output) {
+    output.textContent = debugEntries.join('\n\n');
+    output.scrollTop = output.scrollHeight;
+  }
+  if (count) count.textContent = `${debugEntries.length} ${debugEntries.length === 1 ? 'entry' : 'entries'}`;
+}
+
+['log', 'info', 'warn', 'error', 'debug'].forEach(level => {
+  originalConsole[level] = console[level].bind(console);
+  console[level] = (...args) => {
+    originalConsole[level](...args);
+    appendDebug(level, args);
+  };
+});
+
+window.addEventListener('error', event => {
+  console.error('Unhandled window error', {
+    message: event.message,
+    source: event.filename,
+    line: event.lineno,
+    column: event.colno,
+    error: event.error ? formatDebugValue(event.error) : null
+  });
+});
+
+window.addEventListener('unhandledrejection', event => {
+  console.error('Unhandled promise rejection', event.reason);
+});
+
+async function copyDebugLog() {
+  const text = debugEntries.join('\n\n') || 'No debug entries.';
+  try {
+    await navigator.clipboard.writeText(text);
+    console.info(`Copied ${debugEntries.length} debug entries to clipboard.`);
+  } catch (error) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    const copied = document.execCommand('copy');
+    area.remove();
+    if (!copied) throw error;
+    console.info(`Copied ${debugEntries.length} debug entries using fallback copy.`);
+  }
+}
+
+function clearDebugLog() {
+  debugEntries.length = 0;
+  const output = document.getElementById('debugOutput');
+  const count = document.getElementById('debugCount');
+  if (output) output.textContent = 'Debug log cleared.';
+  if (count) count.textContent = '0 entries';
+}
+
 const SAMPLE_COUNT = 720;
 const STEP_DEG = 0.5;
 const INVALID = 255;
@@ -23,6 +98,7 @@ function wrap360(v) { return ((v % 360) + 360) % 360; }
 function deg(v) { return `${v.toFixed(1)}°`; }
 
 function setStatus(message, error = false) {
+  console[error ? 'error' : 'info']('Status:', message);
   el('statusLine').textContent = message;
   el('statusLine').style.color = error ? 'var(--danger)' : '';
 }
@@ -104,6 +180,7 @@ function handleOrientation(event) {
 }
 
 async function requestOrientationPermission() {
+  console.info('Requesting orientation access.');
   if (typeof DeviceOrientationEvent === 'undefined') return;
   if (typeof DeviceOrientationEvent.requestPermission === 'function') {
     const result = await DeviceOrientationEvent.requestPermission();
@@ -113,6 +190,7 @@ async function requestOrientationPermission() {
 }
 
 async function startCapture() {
+  console.info('Starting camera and sensors.', { secureContext: window.isSecureContext });
   try {
     if (!window.isSecureContext) throw new Error('Camera capture requires HTTPS or localhost.');
     await requestOrientationPermission();
@@ -121,6 +199,7 @@ async function startCapture() {
       audio: false
     });
     video.srcObject = stream;
+    console.info('Camera stream acquired.', stream.getVideoTracks()[0]?.getSettings?.() || {});
     await video.play();
     el('cameraMessage').style.display = 'none';
     el('startButton').textContent = 'Camera active';
@@ -134,6 +213,7 @@ async function startCapture() {
 }
 
 function captureTracedFrame() {
+  console.info('Capturing traced frame.', { tracePoints: trace.length, orientation, hfov: Number(el('fovInput').value) });
   if (trace.length < 2) return;
   const heading = orientation.heading ?? 0;
   const centerAlt = orientation.pitch;
@@ -265,6 +345,7 @@ function resetProfile() {
 }
 
 function useLocation() {
+  console.info('Requesting phone location.');
   if (!navigator.geolocation) return setStatus('Geolocation is unavailable in this browser.', true);
   navigator.geolocation.getCurrentPosition(pos => {
     el('latitude').value = pos.coords.latitude.toFixed(7);
@@ -280,6 +361,7 @@ function writeFixedUtf8(bytes, offset, length, text) {
 }
 
 function exportHzn() {
+  console.info('Preparing HZN1 export.');
   const valid = profile.reduce((n, v) => n + (v !== INVALID), 0);
   if (!valid) return setStatus('Capture or draw at least part of a horizon before exporting.', true);
 
@@ -319,7 +401,18 @@ el('fovInput').addEventListener('input', e => { el('frameSpanValue').textContent
 el('locationButton').addEventListener('click', useLocation);
 el('resetButton').addEventListener('click', resetProfile);
 el('exportButton').addEventListener('click', exportHzn);
+el('copyDebugButton').addEventListener('click', () => copyDebugLog().catch(error => console.error('Copy failed', error)));
+el('clearDebugButton').addEventListener('click', clearDebugLog);
 window.addEventListener('resize', resizeTraceCanvas);
+
+console.info('Horizon Profile web app initialized.', {
+  userAgent: navigator.userAgent,
+  secureContext: window.isSecureContext,
+  online: navigator.onLine,
+  language: navigator.language,
+  screen: `${screen.width}x${screen.height}`,
+  devicePixelRatio: window.devicePixelRatio || 1
+});
 
 el('secureBadge').textContent = window.isSecureContext ? 'Secure context' : 'HTTPS required for camera';
 resizeTraceCanvas();
