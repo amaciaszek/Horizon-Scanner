@@ -4,104 +4,32 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#0b1115" />
-  <title>Horizon Profile Capture</title>
+  <title>Horizon Profile Scanner</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-  <main class="app-shell">
-    <header class="topbar">
-      <div>
-        <p class="eyebrow">ONSTEP ADVANCED</p>
-        <h1>Horizon Profile</h1>
+<main class="app-shell">
+  <header class="topbar"><div><p class="eyebrow">ONSTEP ADVANCED</p><h1>Horizon Scanner</h1></div><span id="secureBadge" class="badge">Checking browser…</span></header>
+  <section class="panel intro">
+    <p>Stand at the telescope position and hold the phone upright near the telescope’s optical height. The cyan line should automatically follow the highest visible obstruction. Slowly rotate through a full circle.</p>
+    <div class="button-row"><button id="startButton" class="primary">Start camera</button><button id="scanButton" class="primary" disabled>Begin automatic scan</button><button id="demoButton" class="secondary">Load demo</button></div>
+  </section>
+  <section class="capture-layout">
+    <div class="camera-card">
+      <div id="cameraStage" class="camera-stage"><video id="video" playsinline muted></video><canvas id="traceCanvas"></canvas><div class="reticle" aria-hidden="true"><span></span><span></span></div><div id="cameraMessage" class="camera-message">Camera not started</div><div id="scanPill" class="scan-pill">NOT SCANNING</div></div>
+      <div class="sensor-grid"><div><span>Direction</span><strong id="headingValue">—</strong></div><div><span>Camera altitude</span><strong id="altitudeValue">—</strong></div><div><span>Skyline confidence</span><strong id="confidenceValue">—</strong></div><div><span>Frames accepted</span><strong id="framesValue">0</strong></div></div>
+      <div class="controls">
+        <label>Approx. horizontal camera FOV<input id="fovInput" type="range" min="45" max="90" step="0.5" value="66.5" /></label>
+        <label>Detection sensitivity<input id="sensitivityInput" type="range" min="0" max="100" step="1" value="48" /></label>
+        <p id="liveAdvice" class="live-advice">Start the camera. A cyan detected skyline should appear automatically.</p>
+        <details class="manual-fallback"><summary>Manual correction fallback</summary><p>Only use this when the cyan line is wrong. Drag a replacement line over the camera, then add it once.</p><div class="button-row"><button id="clearTraceButton" class="secondary">Clear manual line</button><button id="captureFrameButton" class="secondary" disabled>Add manual frame</button></div></details>
       </div>
-      <span id="secureBadge" class="badge">Checking browser…</span>
-    </header>
-
-    <section class="panel intro">
-      <p>Stand where the telescope normally sits. Hold the phone near the optical height, point the rear camera at the skyline, and trace the highest obstruction.</p>
-      <div class="button-row">
-        <button id="startButton" class="primary">Start camera & sensors</button>
-        <button id="demoButton" class="secondary">Load demo</button>
-      </div>
-    </section>
-
-    <section class="capture-layout">
-      <div class="camera-card">
-        <div id="cameraStage" class="camera-stage">
-          <video id="video" playsinline muted></video>
-          <canvas id="traceCanvas"></canvas>
-          <div class="reticle" aria-hidden="true"><span></span><span></span></div>
-          <div id="cameraMessage" class="camera-message">Camera not started</div>
-        </div>
-
-        <div class="sensor-grid">
-          <div><span>Heading</span><strong id="headingValue">—</strong></div>
-          <div><span>Altitude</span><strong id="altitudeValue">—</strong></div>
-          <div><span>Roll</span><strong id="rollValue">—</strong></div>
-          <div><span>Frame span</span><strong id="frameSpanValue">65.0°</strong></div>
-        </div>
-
-        <div class="controls">
-          <label>Approx. horizontal FOV
-            <input id="fovInput" type="range" min="45" max="90" step="0.5" value="65" />
-          </label>
-          <div class="button-row">
-            <button id="clearTraceButton" class="secondary">Clear trace</button>
-            <button id="captureFrameButton" class="primary" disabled>Add traced frame</button>
-          </div>
-        </div>
-      </div>
-
-      <aside class="panel instructions">
-        <h2>Capture</h2>
-        <ol>
-          <li>Point at one section of skyline.</li>
-          <li>Drag across the image along the roof, trees, or ridge.</li>
-          <li>Add the frame, turn until the next view overlaps, and repeat.</li>
-          <li>Cover the full circle, then correct the chart below.</li>
-        </ol>
-        <p class="note">The compass only provides a starting estimate. The completed profile can later be rotated against an OnStep azimuth reading.</p>
-      </aside>
-    </section>
-
-    <section class="panel profile-panel">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">360° PROFILE</p>
-          <h2>Practical horizon</h2>
-        </div>
-        <div class="coverage"><span id="coverageValue">0%</span> covered</div>
-      </div>
-      <canvas id="profileCanvas" width="1080" height="360"></canvas>
-      <p class="chart-help">Drag directly on the chart to correct altitude. North is provisional until mount calibration.</p>
-    </section>
-
-    <section class="panel export-panel">
-      <div class="form-grid">
-        <label>Site name<input id="siteName" maxlength="23" value="Home — back yard" /></label>
-        <label>Latitude<input id="latitude" inputmode="decimal" placeholder="42.000000" /></label>
-        <label>Longitude<input id="longitude" inputmode="decimal" placeholder="-72.000000" /></label>
-        <label>Azimuth offset<input id="azOffset" type="number" step="0.1" value="0.0" /></label>
-      </div>
-      <div class="button-row export-actions">
-        <button id="locationButton" class="secondary">Use phone location</button>
-        <button id="resetButton" class="secondary">Reset profile</button>
-        <button id="exportButton" class="primary">Download .hzn</button>
-      </div>
-      <p id="statusLine" class="status-line">No frames captured.</p>
-    </section>
-
-    <section id="debugConsole" class="debug-console" aria-label="Debug console">
-      <details>
-        <summary>Debug console <span id="debugCount">0 entries</span></summary>
-        <div class="debug-toolbar">
-          <button id="copyDebugButton" class="secondary" type="button">Copy all</button>
-          <button id="clearDebugButton" class="secondary" type="button">Clear</button>
-        </div>
-        <pre id="debugOutput" tabindex="0">Debug log initialized. Console messages will appear here.</pre>
-      </details>
-    </section>
-  </main>
-  <script src="app.js" defer></script>
-</body>
-</html>
+    </div>
+    <aside class="panel instructions"><h2>Automatic scan</h2><ol><li>Start the camera and confirm the cyan line follows the roof, trees, or ridge.</li><li>Tap <strong>Begin automatic scan</strong>.</li><li>Rotate slowly in place. The page records frames automatically as direction changes.</li><li>If the obstruction fills the whole image, tilt upward until some sky is visible.</li></ol><p class="note">The compass establishes a provisional direction only. The finished profile can later be rotated against an OnStep azimuth reading.</p></aside>
+  </section>
+  <section class="panel profile-panel"><div class="section-heading"><div><p class="eyebrow">360° PROFILE</p><h2>Practical horizon</h2></div><div class="coverage"><span id="coverageValue">0%</span> covered</div></div><canvas id="profileCanvas" width="1080" height="360"></canvas><p class="chart-help">Automatic results appear here while you rotate. Drag on the chart afterward to fix isolated mistakes.</p></section>
+  <section class="panel export-panel"><div class="form-grid"><label>Site name<input id="siteName" maxlength="23" value="Home — back yard" /></label><label>Latitude<input id="latitude" inputmode="decimal" placeholder="42.000000" /></label><label>Longitude<input id="longitude" inputmode="decimal" placeholder="-72.000000" /></label><label>Azimuth offset<input id="azOffset" type="number" step="0.1" value="0.0" /></label></div><div class="button-row export-actions"><button id="locationButton" class="secondary">Use phone location</button><button id="resetButton" class="secondary">Reset profile</button><button id="exportButton" class="primary">Download .hzn</button></div><p id="statusLine" class="status-line">Camera has not started.</p></section>
+  <section id="debugConsole" class="debug-console" aria-label="Debug console"><details><summary>Debug console <span id="debugCount">0 entries</span></summary><div class="debug-toolbar"><button id="copyDebugButton" class="secondary" type="button">Copy all</button><button id="clearDebugButton" class="secondary" type="button">Clear</button></div><pre id="debugOutput" tabindex="0"></pre></details></section>
+</main>
+<script src="app.js" defer></script>
+</body></html>
