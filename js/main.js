@@ -25,6 +25,7 @@ const camera = new CameraSource($('video'), log);
 const pipeline = new Pipeline(log);
 
 const state = {
+  fovCal: null,
   running: false,
   paused: false,
   processing: false,
@@ -451,6 +452,7 @@ function renderLive() {
   drawRing($('miniRing'), survey, view);
   drawProfile($('profile'), survey, view);
   updateStats();
+  updateFovCal();
 
   const phaseLabels = {
     idle: 'Idle', calibrating: 'Calibrating', pass1: 'Pass 1 — survey',
@@ -458,6 +460,14 @@ function renderLive() {
   };
   setChip($('phaseChip'), phaseLabels[director.phase] || director.phase,
     director.phase === PHASE.COMPLETE ? '' : director.phase === PHASE.IDLE ? 'quiet' : '');
+}
+
+function updateFovCal() {
+  if (!state.fovCal?.active) return;
+  const st = survey.focalStats();
+  $('fovCalState').textContent = st.median === null
+    ? `collecting ${st.n}`
+    : `${st.n} samples, spread ${st.iqrPct.toFixed(1)}%${st.converged ? ' — ready' : ''}`;
 }
 
 function updateStats() {
@@ -778,6 +788,78 @@ function wire() {
     camera.setHfov(Number(e.target.value));
     $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
   });
+  /* ---- lens inventory ------------------------------------------------- */
+  async function scanLenses() {
+    if (!camera.stream) { log('warn', 'Start the camera first — lens labels are hidden until access is granted.'); return; }
+    const found = await camera.enumerate();
+    if (!found.length) { log('warn', 'No selectable cameras reported.'); return; }
+    await camera.probeLenses();
+    const sel = $('lensSelect');
+    sel.innerHTML = '<option value="">Default rear camera</option>';
+    for (const d of found) {
+      const o = document.createElement('option');
+      o.value = d.deviceId;
+      o.textContent = `${d.label}${d.zoomMin ? ` (wide, zoom ${d.zoomMin})` : ''}${d.error ? ' — unavailable' : ''}`;
+      if (d.error) o.disabled = true;
+      sel.appendChild(o);
+    }
+    log('info', `${found.length} rear lens(es) found. Labels come from the browser and are not always meaningful.`);
+  }
+
+  $('scanLensBtn').addEventListener('click', () => scanLenses().catch(e => log('error', 'Lens scan failed:', e)));
+
+  $('widestLensBtn').addEventListener('click', async () => {
+    if (!camera.devices.length) await scanLenses();
+    // Prefer measured evidence (a sub-1 zoom minimum is an ultra-wide) and fall
+    // back to the label only when the browser exposed nothing to measure.
+    const byZoom = camera.devices.filter(d => !d.error && Number.isFinite(d.zoomMin)).sort((a, b) => a.zoomMin - b.zoomMin)[0];
+    const byLabel = camera.devices.find(d => !d.error && d.isWide);
+    const pick = byZoom || byLabel;
+    if (!pick) { log('warn', 'Nothing identifiable as a wide lens. Pick one manually and calibrate its field of view.'); return; }
+    $('lensSelect').value = pick.deviceId;
+    $('lensSelect').dispatchEvent(new Event('change'));
+    log('info', `Selected "${pick.label}" as widest, by ${byZoom ? 'measured zoom range' : 'label only — verify by calibrating'}.`);
+  });
+
+  $('lensSelect').addEventListener('change', async e => {
+    try {
+      await camera.switchTo(e.target.value || null);
+      survey.focalSamples.length = 0;
+      survey.focalPx = null;
+      $('fovCalState').textContent = 'not run';
+      log('info', 'Lens switched. Focal length reset — calibrate the field of view for this lens before surveying.');
+    } catch (err) {
+      log('error', 'Could not open that lens:', err.message || err);
+    }
+  });
+
+  /* ---- explicit field-of-view calibration ------------------------------ */
+  $('fovCalBtn').addEventListener('click', () => {
+    if (!camera.ready) { log('warn', 'Start the camera first.'); return; }
+    state.fovCal = { active: !state.fovCal?.active };
+    if (state.fovCal.active) {
+      survey.focalSamples.length = 0;
+      survey.focalPx = null;
+      $('fovCalBtn').textContent = 'Stop calibration';
+      $('fovCalState').textContent = 'collecting';
+      log('info', 'FOV calibration started. Pan slowly left and right across a textured scene.');
+    } else {
+      $('fovCalBtn').textContent = 'Calibrate field of view';
+      const st = survey.focalStats();
+      if (st.converged) {
+        const workFocal = st.median * (WORK_W / LUMA_W);
+        camera.adoptFocal(workFocal);
+        $('fovRange').value = camera.hfovDeg.toFixed(1);
+        $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+        $('fovCalState').textContent = `${camera.hfovDeg.toFixed(1)}° ±${(st.iqrPct / 2).toFixed(1)}%`;
+        log('info', `Field of view calibrated to ${camera.hfovDeg.toFixed(2)}° from ${st.n} samples, spread ${st.iqrPct.toFixed(1)}%.`);
+      } else {
+        $('fovCalState').textContent = 'not converged';
+        log('warn', `Calibration rejected: ${st.n} sample(s)${st.iqrPct !== null ? `, spread ${st.iqrPct.toFixed(1)}% (needs under 8%)` : ''}. Pan more slowly across a scene with more texture, and keep the phone level.`);
+      }
+    }
+  });
+
   $('modeSelect').addEventListener('change', e => {
     if (director.setMode(e.target.value)) {
       const m = director.mode;

@@ -354,3 +354,8 @@ details[open] > *:not(summary) { margin-top: 14px; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* lens + fov calibration */
+.calib-block { margin: 14px 0; padding: 12px; border: 1px solid var(--hairline, #23303a); border-radius: 10px; }
+.calib-block .chip { margin-left: 10px; }
+.calib-block .hint { margin-top: 8px; }

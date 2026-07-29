@@ -250,3 +250,49 @@ js/main.js          orchestration and UI wiring
 workers/segment.worker.js   sky segmentation and boundary refinement
 workers/vision.worker.js    visual registration
 ```
+
+
+---
+
+## Field fix log
+
+### 2026-07-28 — calibration never completed
+
+Symptom: turn rate read 371–2586°/s with the phone held still, so stillness never
+rose, calibration never finished, and zero keyframes were captured. The log showed
+orientation reporting frame-to-frame yaw deltas near ±175° while visual registration
+correctly reported 0.5°.
+
+Cause: `rawYaw()` read the DeviceOrientation `alpha` scalar. The ZXY Euler
+decomposition is singular at beta = ±90° — which is precisely the pose this app is
+held in. Two triples describe the same physical orientation there and the browser
+alternates between them; `(30, 88, -3.4)` and `(210, 92, 176.6)` are the same pose,
+and alpha-derived yaw differs between them by 180°.
+
+Fix: yaw is now the azimuth of the camera forward axis taken from the quaternion,
+which is continuous across that alias. Convention is unchanged, so datums and
+keyframes recorded before and after remain comparable. Pitch rate no longer reads
+`beta`, which flips across the same alias. A rate above 400°/s is now rejected as a
+glitch rather than smoothed into the estimate. Covered by `tests/sim6.mjs`.
+
+This one bug also explains why focal self-calibration never landed: it solves focal
+length from visual shift against *measured rotation*, and the rotation was garbage.
+
+### Lens selection
+
+`Find lenses` enumerates the rear cameras and opens each briefly to read its
+capabilities. `Use widest` prefers measured evidence — a zoom range starting below
+1.0 identifies an ultra-wide — and falls back to the label only when the browser
+exposed nothing to measure, saying which of the two it used. Android exposes each
+physical lens separately; iOS generally presents one virtual rear camera, where
+switching is a no-op. Switching discards the calibrated focal length, because
+intrinsics belong to the lens.
+
+### Field-of-view calibration
+
+The FOV slider was always a seed, never a measurement. `Calibrate field of view`
+now makes the solve explicit: pan slowly across a textured scene and the app
+compares measured pixel shift against measured rotation. It reports sample count
+and interquartile spread live, and refuses to adopt a result until the spread is
+under 8% across at least 25 samples — a lens solved from consistent geometry
+tightens, one solved from a drifting sensor or a textureless wall does not.

@@ -1,7 +1,7 @@
 'use strict';
 import {
   quatFromEuler, quatNormalize, wrap360, angDiff, clamp, circMean,
-  screenQuat, quatRotate, DEG, RAD
+  screenQuat, quatRotate, vecToAzAlt, DEG, RAD
 } from './math3d.js';
 
 /**
@@ -43,6 +43,7 @@ export class OrientationSource {
     this.tiltRate = 0;
     this._prevYaw = null;
     this._prevPitch = null;
+    this._lastYaw = null;
     this._prevAt = 0;
     this.stillness = 0;
 
@@ -115,9 +116,32 @@ export class OrientationSource {
     this.lastEventAt = now;
   }
 
-  /** Yaw implied by the orientation stream, before the datum is applied. */
+  /**
+   * Yaw implied by the orientation stream, before the datum is applied.
+   *
+   * This must NOT read `alpha` directly. The DeviceOrientation ZXY Euler
+   * decomposition is singular at beta = ±90°, which is exactly the pose this
+   * app is used in — phone upright, camera at the skyline. At that pose two
+   * different (alpha, beta, gamma) triples describe the same physical
+   * orientation, and the browser is free to report either one frame to frame.
+   * The pair (30, 88, -3.4) and (210, 92, 176.6) are the same pose; alpha-derived
+   * yaw differs between them by 180°.
+   *
+   * The quaternion rebuilt from all three angles is continuous across that
+   * alias, so the azimuth of the camera forward axis is stable where alpha is
+   * not. Same convention as the old scalar — alpha = 0 still yields yaw 0 —
+   * so datums and keyframes recorded either way remain comparable.
+   */
   rawYaw() {
-    return wrap360(360 - (this.alpha || 0));
+    // The forward axis lies along device Z, so the screen rotation (also about
+    // device Z) leaves it unchanged and does not need to be applied here.
+    const fwd = quatRotate(this.quat, [0, 0, -1]);
+    const horiz = Math.hypot(fwd[0], fwd[1]);
+    // Within ~8° of zenith or nadir the azimuth of the forward axis is not
+    // meaningful. Hold the last good value rather than emitting noise.
+    if (horiz < 0.14) return this._lastYaw ?? 0;
+    this._lastYaw = vecToAzAlt(fwd).az;
+    return this._lastYaw;
   }
 
   /** Camera-axis elevation and screen roll, both derived from the same
@@ -137,13 +161,22 @@ export class OrientationSource {
     const dt = (now - this._prevAt) / 1000;
     if (this._prevYaw !== null && dt > 0.02 && dt < 1) {
       const dYaw = angDiff(yaw, this._prevYaw) / dt;
-      this.rotationRate = this.rotationRate * 0.7 + dYaw * 0.3;
-      const dPitch = (this.beta - this._prevPitch) / dt;
+      // A phone cannot be turned faster than a few hundred deg/s by hand. A
+      // sample above that is a sensor glitch, not motion, and must not be
+      // smoothed into the rate or it poisons the stillness gate for seconds.
+      if (Math.abs(dYaw) < 400) {
+        this.rotationRate = this.rotationRate * 0.7 + dYaw * 0.3;
+        this.rateGlitches = 0;
+      } else {
+        this.rateGlitches = (this.rateGlitches || 0) + 1;
+      }
+      const pitch = this.attitude().elevation;   // beta flips across the same alias
+      const dPitch = (pitch - this._prevPitch) / dt;
       this.tiltRate = this.tiltRate * 0.7 + dPitch * 0.3;
       const speed = Math.hypot(this.rotationRate, this.tiltRate);
       this.stillness = clamp(1 - speed / 6, 0, 1);
     }
-    if (dt > 0.02) { this._prevYaw = yaw; this._prevPitch = this.beta; this._prevAt = now; }
+    if (dt > 0.02) { this._prevYaw = yaw; this._prevPitch = this.attitude().elevation; this._prevAt = now; }
   }
 
   /**

@@ -198,6 +198,21 @@
     </label>
     <p class="hint" id="modeHint">Tripod mode holds the optical centre still, so there is no parallax on nearby structures. It tightens the roll, rate, and overlap gates to match. Choose it before starting the survey.</p>
 
+    <label class="slider">Lens
+      <select id="lensSelect"><option value="">Default rear camera</option></select>
+    </label>
+    <div class="row">
+      <button id="scanLensBtn" class="btn small">Find lenses</button>
+      <button id="widestLensBtn" class="btn small">Use widest</button>
+    </div>
+    <p class="hint" id="lensHint">Android exposes each physical lens separately, so the ultra-wide is reachable here. iOS usually presents one virtual rear camera and switching does nothing. Changing lens discards any calibrated focal length, because intrinsics belong to the lens.</p>
+
+    <div class="calib-block">
+      <button id="fovCalBtn" class="btn small">Calibrate field of view</button>
+      <span id="fovCalState" class="chip">not run</span>
+      <p class="hint" id="fovCalHint">Point at a textured scene — foliage, brickwork, a fence — and pan slowly left and right through about 40°. The app compares measured pixel shift against measured rotation and solves the focal length. It reports the spread, and only accepts the result once the spread is tight.</p>
+    </div>
+
     <label class="slider">Horizontal field of view <output id="fovOut">66.0°</output>
       <input type="range" id="fovRange" min="40" max="100" step="0.5" value="66" />
     </label>

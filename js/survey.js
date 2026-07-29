@@ -103,6 +103,24 @@ export class Survey {
     }
   }
 
+  /**
+   * Convergence state of the focal-length estimate.
+   *
+   * The median alone says nothing about whether it can be trusted, so the
+   * calibration UI gates on the interquartile spread instead: a lens solved
+   * from consistent geometry tightens, one solved from a drifting sensor or a
+   * textureless scene does not, however many samples accumulate.
+   */
+  focalStats() {
+    const n = this.focalSamples.length;
+    if (n < 4) return { n, median: null, iqrPct: null, converged: false };
+    const s = this.focalSamples.slice().sort((a, b) => a - b);
+    const q = f => s[Math.min(s.length - 1, Math.max(0, Math.floor(f * s.length)))];
+    const median = q(0.5), iqr = q(0.75) - q(0.25);
+    const iqrPct = median > 0 ? (iqr / median) * 100 : null;
+    return { n, median, iqrPct, converged: n >= 25 && iqrPct !== null && iqrPct < 8 };
+  }
+
   /* ---------------------------------------------------------- reprojection */
 
   /** Rebuild every bin from stored keyframe column data. */

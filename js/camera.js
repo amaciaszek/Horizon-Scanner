@@ -38,9 +38,78 @@ export class CameraSource {
     this.hfovDeg = 66;
     this.focalPx = null;
     this.focalSource = 'default';
+
+    // Lens inventory
+    this.devices = [];           // [{deviceId, label, hfovDeg|null, isWide}]
+    this.activeDeviceId = null;
   }
 
-  async start() {
+  /**
+   * Enumerate the rear cameras.
+   *
+   * Labels are empty until a getUserMedia grant exists, so this is only useful
+   * after start(). Android exposes each physical lens as its own videoinput,
+   * which is how the ultra-wide becomes reachable at all; iOS usually exposes
+   * a single virtual rear camera and switching is a no-op there.
+   */
+  async enumerate() {
+    if (!navigator.mediaDevices?.enumerateDevices) return [];
+    const all = await navigator.mediaDevices.enumerateDevices();
+    const cams = all.filter(d => d.kind === 'videoinput');
+    // Front cameras are useless here and only clutter the picker.
+    const rear = cams.filter(d => !/front|user|face|selfie/i.test(d.label || ''));
+    this.devices = (rear.length ? rear : cams).map(d => ({
+      deviceId: d.deviceId,
+      label: d.label || 'Camera',
+      hfovDeg: null,
+      isWide: /wide|ultra|0\.5|uw/i.test(d.label || '')
+    }));
+    return this.devices;
+  }
+
+  /**
+   * Measure each rear lens by opening it briefly and reading its capabilities.
+   *
+   * This is how "widest" gets decided from evidence rather than from a label
+   * string, since vendor labels are inconsistent and often absent. Where the
+   * browser exposes nothing useful the entry stays null and the label heuristic
+   * is the only signal left.
+   */
+  async probeLenses() {
+    for (const d of this.devices) {
+      let stream = null;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: { deviceId: { exact: d.deviceId }, width: { ideal: 1920 } }, audio: false
+        });
+        const t = stream.getVideoTracks()[0];
+        const caps = t.getCapabilities ? t.getCapabilities() : {};
+        const set = t.getSettings ? t.getSettings() : {};
+        // Chrome on Android exposes zoom range; a lens whose minimum zoom is
+        // below 1 is the ultra-wide of a virtual multi-camera device.
+        if (Number.isFinite(caps.zoom?.min) && caps.zoom.min < 1) d.zoomMin = caps.zoom.min;
+        d.width = set.width; d.height = set.height;
+        this.log('info', `Lens "${d.label}": ${set.width}x${set.height}${d.zoomMin ? `, zoom from ${d.zoomMin}` : ''}.`);
+      } catch (err) {
+        d.error = err.name || 'unavailable';
+      } finally {
+        if (stream) stream.getTracks().forEach(t => t.stop());
+      }
+    }
+    return this.devices;
+  }
+
+  /** Restart on a specific lens, preserving nothing: intrinsics belong to the
+   *  lens, so a switch invalidates any focal length calibrated for the old one. */
+  async switchTo(deviceId) {
+    this.stop();
+    this.activeDeviceId = deviceId;
+    this.focalPx = null;
+    this.focalSource = 'default';
+    return this.start(deviceId);
+  }
+
+  async start(deviceId = null) {
     if (!window.isSecureContext) {
       throw new Error('Camera access needs HTTPS or localhost. Serve the folder over https and reload.');
     }
@@ -49,11 +118,13 @@ export class CameraSource {
     }
     const constraints = {
       audio: false,
-      video: {
-        facingMode: { ideal: 'environment' },
-        width: { ideal: 1920 }, height: { ideal: 1080 },
-        frameRate: { ideal: 30 }
-      }
+      video: deviceId
+        ? { deviceId: { exact: deviceId }, width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }
+        : {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1920 }, height: { ideal: 1080 },
+          frameRate: { ideal: 30 }
+        }
     };
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
     this.video.srcObject = this.stream;
