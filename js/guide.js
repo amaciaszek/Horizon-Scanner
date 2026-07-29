@@ -216,6 +216,9 @@ export class ScanDirector {
 
   /** Frame-level problems that make the current view unusable. */
   _frameProblem(ctx) {
+    if (ctx.frameStatus === 'trackingLost') {
+      return { tone: 'fix', headline: 'Tracking lost — stop turning', detail: 'Visual registration failed and the inertial sensors cannot be trusted here, so azimuth cannot be advanced. Stop, hold still until the view locks, then turn much more slowly. Nothing is being recorded until it does.', arrow: null, tilt: null, phase: this.phase };
+    }
     if (ctx.frameStatus === 'tooDark') {
       return { tone: 'fix', headline: 'Too dark to survey', detail: 'Sky segmentation needs daylight. At night the sky is the dark region and the ground carries the bright lights, so every cue inverts and the traced line is meaningless. Come back in daylight — flat overcast is ideal.', arrow: null, tilt: null, phase: this.phase };
     }

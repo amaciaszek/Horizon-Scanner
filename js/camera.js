@@ -149,11 +149,43 @@ export class CameraSource {
       }
     } catch (_) { /* capabilities are optional */ }
 
+    await this._lockOptics();
     this.pinned = !!deviceId;
     this.activeDeviceId = this.settings.deviceId || deviceId || null;
     this._startSwapWatch();
     this.detectRotation();
     return this.settings;
+  }
+
+  /**
+   * Discourage the platform from changing lens mid-survey.
+   *
+   * On a Pixel the rear camera is one logical device backed by several physical
+   * sensors, and the HAL picks between them mainly on zoom level and focus
+   * distance. A horizon survey is the easy case — everything is at infinity and
+   * nothing needs zoom — so holding zoom at 1.0 and focus at infinity keeps it
+   * on the main lens. Both constraints are best-effort; browsers differ in what
+   * they honour, which is why the focal-change detector exists as well.
+   */
+  async _lockOptics() {
+    const track = this.stream?.getVideoTracks()[0];
+    if (!track?.getCapabilities) return;
+    const caps = track.getCapabilities();
+    const advanced = [];
+    if (caps.zoom && caps.zoom.min <= 1 && caps.zoom.max >= 1) advanced.push({ zoom: 1 });
+    if (Array.isArray(caps.focusMode) && caps.focusMode.includes('manual') && caps.focusDistance) {
+      // Largest focus distance the lens offers is its infinity stop.
+      advanced.push({ focusMode: 'manual', focusDistance: caps.focusDistance.max });
+    } else if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
+      advanced.push({ focusMode: 'continuous' });
+    }
+    if (!advanced.length) return;
+    try {
+      await track.applyConstraints({ advanced });
+      this.log('info', `Optics locked: ${advanced.map(a => Object.keys(a).join('+')).join(', ')}. This reduces the chance of the platform switching lenses mid-scan.`);
+    } catch (err) {
+      this.log('warn', `Could not lock zoom or focus (${err.name || err}). The focal-change detector will catch a lens swap if one happens.`);
+    }
   }
 
   /**
@@ -285,7 +317,7 @@ export class CameraSource {
   }
 
   setHfov(deg) {
-    this.hfovDeg = clamp(deg, 35, 110);
+    this.hfovDeg = clamp(deg, 35, 120);
     this.focalPx = (WORK_W / 2) / Math.tan(this.hfovDeg / 2 * DEG);
     this.focalSource = 'manual';
   }

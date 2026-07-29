@@ -223,7 +223,11 @@
     </div>
 
     <label class="slider">Horizontal field of view <output id="fovOut">66.0°</output>
-      <input type="range" id="fovRange" min="40" max="100" step="0.5" value="66" />
+      <input type="range" id="fovRange" min="40" max="120" step="0.5" value="66" />
+    </label>
+    <div class="row">
+      <button class="btn small fov-preset" data-fov="82">Pixel main 82°</button>
+      <button class="btn small fov-preset" data-fov="107">Pixel ultra-wide 107°</button>
     </label>
     <p class="hint">This is only a starting value. Once the scan produces enough motion, the app measures the focal length from the imagery itself and replaces it.</p>
 

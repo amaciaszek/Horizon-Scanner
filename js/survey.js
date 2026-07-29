@@ -30,6 +30,9 @@ export class Survey {
     this.loopClosed = false;
     this.focalPx = null;          // self-calibrated horizontal focal length, in working-frame pixels
     this.focalSamples = [];
+    this.focalRecent = [];
+    this.focalEstablished = null;
+    this.lensChanges = [];
     this.yawDatum = 0;
     this.startedAt = Date.now();
     this.manualEdits = 0;
@@ -96,11 +99,55 @@ export class Survey {
     const f = Math.abs(pixelDx) / Math.tan(a * DEG * Math.cos(pitchDeg * DEG));
     if (!Number.isFinite(f) || f < 40 || f > 4000) return;
     this.focalSamples.push(f);
+    this.focalRecent.push(f);
+    if (this.focalRecent.length > 24) this.focalRecent.shift();
+
     if (this.focalSamples.length >= 12) {
       const s = this.focalSamples.slice().sort((x, y) => x - y);
       this.focalPx = s[Math.floor(s.length / 2)];
       if (this.focalSamples.length > 400) this.focalSamples.splice(0, this.focalSamples.length - 400);
     }
+    return this._checkLensChange();
+  }
+
+  /**
+   * Detect a lens change from the imagery, not from the device list.
+   *
+   * A phone that exposes one logical rear camera can switch physical sensors
+   * without changing deviceId, resolution, or anything else visible to
+   * getSettings(). What it cannot hide is the focal length: the main and
+   * ultra-wide lenses differ by roughly 30-40%, so the pixel shift produced by
+   * a given rotation changes by the same factor the instant the swap happens.
+   *
+   * This only works because rotation is now measured by a gyroscope rather than
+   * a magnetometer. Against a noisy rotation estimate the focal samples were too
+   * scattered to see a step in.
+   *
+   * Returns a descriptor when a change is detected, otherwise null. The caller
+   * starts a new focal segment; keyframes already captured keep the intrinsics
+   * they were captured with.
+   */
+  _checkLensChange() {
+    if (this.focalRecent.length < 24 || !this.focalEstablished) return null;
+    const r = this.focalRecent.slice().sort((a, b) => a - b);
+    const recentMedian = r[Math.floor(r.length / 2)];
+    const ratio = recentMedian / this.focalEstablished;
+    // 18% is comfortably above the scatter of a settled estimate and well below
+    // the gap between any two lenses a phone actually ships.
+    if (ratio > 1.18 || ratio < 1 / 1.18) {
+      const change = { from: this.focalEstablished, to: recentMedian, ratio };
+      this.focalEstablished = recentMedian;
+      this.focalSamples = this.focalRecent.slice();
+      this.focalPx = recentMedian;
+      this.lensChanges.push(change);
+      return change;
+    }
+    return null;
+  }
+
+  /** Called once the focal estimate has converged, to arm change detection. */
+  establishFocal(px) {
+    this.focalEstablished = px;
   }
 
   /**
@@ -131,7 +178,13 @@ export class Survey {
   }
 
   _projectKeyframe(kf, intrinsics) {
-    const tanH = intrinsics.tanHalfH, tanV = intrinsics.tanHalfV;
+    // A keyframe carries the intrinsics it was actually captured with. On a
+    // phone that exposes one logical rear camera backed by several physical
+    // lenses, the platform may change lens mid-scan without changing deviceId
+    // or resolution, so a single global focal length would silently misproject
+    // every frame on the far side of the swap.
+    const tanH = kf.tanHalfH ?? intrinsics.tanHalfH;
+    const tanV = kf.tanHalfV ?? intrinsics.tanHalfV;
     const total = (kf.yawBase || 0) + (kf.yawCorrection || 0) + (this.yawDatum || 0);
     const q = total ? quatMul(yawQuat(total), kf.quat) : kf.quat;
     const n = kf.boundary.length;

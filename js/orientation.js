@@ -1,7 +1,7 @@
 'use strict';
 import {
   quatFromEuler, quatNormalize, wrap360, angDiff, clamp, circMean,
-  screenQuat, quatRotate, vecToAzAlt, DEG, RAD
+  screenQuat, quatRotate, quatConj, vecToAzAlt, DEG, RAD
 } from './math3d.js';
 
 /**
@@ -73,6 +73,19 @@ export class OrientationSource {
     this._yawUnwrapped = null;
     this._prevWrapped = 0;
     this.jitterDeg = 0;           // residual sensor scatter, deg
+
+    // Raw gyroscope, from devicemotion. Separate from everything above,
+    // because deviceorientationabsolute fuses the magnetometer and is therefore
+    // useless for relative rotation in a magnetically disturbed spot — which is
+    // most back yards, with gutters, wiring, cars, and a steel mount head.
+    // The gyroscope has bias drift and no absolute reference, and drift is what
+    // loop closure already exists to remove. Interference is not.
+    this.gyroAvailable = false;
+    this.gyroYaw = 0;             // integrated, unwrapped, arbitrary datum
+    this.gyroYawRate = 0;         // deg/s about world vertical
+    this.gyroSamples = 0;
+    this._lastMotionAt = 0;
+    this._onMotion = this._onMotion.bind(this);
     this.eventDt = 0;
     this._prevAt = 0;
     this.stillness = 0;
@@ -94,6 +107,7 @@ export class OrientationSource {
       const result = await DeviceOrientationEvent.requestPermission();
       if (result !== 'granted') throw new Error('Motion and orientation access was declined. Enable it in Settings > Safari > Motion & Orientation Access, then reload.');
     }
+    window.addEventListener('devicemotion', this._onMotion, true);
     window.addEventListener('deviceorientationabsolute', this._onOrientation, true);
     window.addEventListener('deviceorientation', this._onOrientation, true);
     this._onScreen();
@@ -184,6 +198,39 @@ export class OrientationSource {
     // Roll: how far the screen's right axis is tipped out of the horizontal.
     const roll = Math.asin(clamp(right[2], -1, 1)) * RAD;
     return { elevation, roll, forward: fwd };
+  }
+
+  /**
+   * Integrate the raw gyroscope into a yaw that no magnet can touch.
+   *
+   * DeviceMotionEvent.rotationRate is the gyroscope alone: alpha about device
+   * z, beta about x, gamma about y, in deg/s. What the survey needs is rotation
+   * about the WORLD vertical, so the angular velocity vector is projected onto
+   * the up direction expressed in the device frame.
+   *
+   * Sign: azimuth increases clockwise seen from above, which is the negative
+   * sense of a right-handed rotation about up, hence the minus.
+   *
+   * This drifts. That is fine and expected — drift is exactly what loop closure
+   * was built to distribute, and a slow bias is recoverable in a way that a
+   * magnetometer swinging by 69 degrees is not.
+   */
+  _onMotion(e) {
+    const r = e.rotationRate;
+    if (!r || r.alpha === null || r.alpha === undefined) return;
+    const now = e.timeStamp || performance.now();
+    const dt = this._lastMotionAt ? (now - this._lastMotionAt) / 1000 : 0;
+    this._lastMotionAt = now;
+    if (!(dt > 0 && dt < 0.5)) return;
+
+    // Angular velocity in the device frame, deg/s.
+    const w = [r.beta || 0, r.gamma || 0, r.alpha || 0];
+    // World up, expressed in the device frame.
+    const up = quatRotate(quatConj(this.quat), [0, 0, 1]);
+    this.gyroYawRate = -(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]);
+    this.gyroYaw += this.gyroYawRate * dt;
+    this.gyroSamples++;
+    if (this.gyroSamples > 20) this.gyroAvailable = true;
   }
 
   /**
@@ -297,6 +344,8 @@ export class OrientationSource {
       gyroReliability: this.eventRate >= 25 ? 'good' : this.eventRate >= 10 ? 'fair' : 'poor',
       screenAngle: this.screenAngle,
       jitterDeg: Number(this.jitterDeg.toFixed(2)),
+      gyro: this.gyroAvailable ? 'available' : 'absent',
+      gyroSamples: this.gyroSamples,
       sampleIntervalMs: Math.round(this.eventDt * 1000)
     };
   }

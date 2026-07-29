@@ -382,3 +382,73 @@ Classification is verified in `tests/sim8.mjs` against synthetic environments:
 a constant 137° bias does not change the verdict by more than 0.5°, a 12° swing
 is caught, a 30° sweep correctly refuses to rule, and a single wild outlier is
 rejected by the percentile span.
+
+
+### 2026-07-29 — the first full survey, and why its profile is not usable
+
+The report read 360.0° of 360.0° observed, 39 534 observations, 54 per bin — and
+0 of 720 verified, 19.74° maximum spread, 13 spike bins. The pass-1 counter said
+"0° of 360°" the whole way round while the ring filled completely.
+
+That combination has one explanation: **azimuth was advancing on a random walk.**
+The log recorded orientation jitter of ±57°, a compass datum spread of 154.8°,
+and 7913 of 7956 compass samples rejected. The app knew the magnetometer was dead
+and still blended 25% of it into every fused step, and fell back to *100%* of it
+whenever visual registration failed — which at 50–86°/s was often, because motion
+blur kills registration. Zero-mean noise integrates into a walk that eventually
+visits every azimuth, so coverage looks complete while no bin points where it
+claims. Signed travel stays near zero, which is why the counter never moved: it
+was the one honest number on the screen, and the acceptance report was right to
+grade the result INSUFFICIENT.
+
+Cause: the app had no gyroscope. It derived "gyro" rotation from
+`deviceorientationabsolute`, which fuses the magnetometer, so its yaw swings by
+tens of degrees while the phone sits still. Relative rotation was being taken
+from the one sensor that cannot supply it in a back yard full of gutters,
+wiring, cars, and a steel mount head.
+
+Fix: a `devicemotion` listener now integrates `rotationRate` — the raw
+gyroscope, which no magnet touches — projected onto the world vertical. It
+drifts, and drift is precisely what loop closure already exists to distribute; a
+slow bias is recoverable in a way that a magnetometer swinging by 69° is not.
+Where there is no gyroscope *and* the compass is condemned, azimuth no longer
+advances at all: the frame is marked `trackingLost`, no keyframe is written, no
+observation is recorded, and the overlay draws nothing while the operator is
+told to stop turning. Reproduced and verified in `tests/sim9.mjs` — the old
+fusion manufactures 99.3% coverage from pure noise, the new one tracks real
+rotation to within 1°.
+
+**What did work.** Segmentation in daylight was solid: 73.4% mean confidence,
+and the roofline traces in the field screenshots are clean across the sky-facing
+portions. Frames dropped: zero on both workers. The failure was geometry, not
+vision.
+
+
+### Multiple lenses behind one logical camera
+
+The Pixel exposes a single rear `videoinput` — the field log shows exactly one,
+"camera 0, facing back" — backed by several physical sensors that the platform
+picks between on its own. So lens pinning by `deviceId` does nothing here, and a
+swap changes nothing that `getSettings()` reports. This is handled in three
+layers rather than one:
+
+1. **Reduce the chance.** The HAL chooses mainly on zoom level and focus
+distance, and a horizon survey is the easy case: everything is at infinity and
+nothing needs zoom. Zoom is now pinned at 1.0 and focus at the lens's infinity
+stop where the browser honours those constraints.
+
+2. **Detect it from the imagery.** Main and ultra-wide differ in focal length by
+30–40%, so the pixel shift produced by a given rotation changes by that factor
+the instant a swap happens. A step of more than 18% in the running focal
+estimate is a lens change. This only works because rotation now comes from a
+gyroscope — `tests/sim10.mjs` shows the same detector firing six false alarms
+against magnetometer-grade rotation noise, and exactly once with a clean gyro.
+
+3. **Survive it.** Every keyframe stores the intrinsics it was captured with, and
+reprojection uses those rather than one global focal length. A swap at 200° no
+longer misprojects the first 200°; it just starts a new focal segment. The count
+and ratio of any swaps appear in the report.
+
+The FOV presets (Pixel main 82°, ultra-wide 107°) are seeds only. The pre-flight
+sweep still measures the real value, and 82° versus the old 66° default is a 24%
+error in every altitude — worth setting even before the sweep runs.

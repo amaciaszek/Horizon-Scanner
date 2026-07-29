@@ -262,7 +262,7 @@ export function drawProfile(canvas, survey, view) {
 export function drawOverlay(canvas, frame, directive) {
   // When the director has declared the frame unusable, draw nothing. A traced
   // line on screen reads as a measurement whatever the confidence chip says.
-  if (directive && directive.headline === 'Too dark to survey') {
+  if (directive && (directive.headline === 'Too dark to survey' || directive.headline === 'Tracking lost — stop turning')) {
     const c = canvas.getContext('2d');
     c.clearRect(0, 0, canvas.width, canvas.height);
     return;

@@ -29,6 +29,8 @@ const preflight = new PreflightSweep();
 const state = {
   sceneLuma: null,
   frameCount: 0,
+  prevGyroYaw: null,
+  trackingLost: false,
   calFirstTry: 0,
   calGaveUp: false,
   running: false,
@@ -129,7 +131,22 @@ async function processFrame() {
 
     // ---- visual / inertial fusion of yaw --------------------------------
     let dFused = 0;
-    const dGyro = state.prevRawYaw === null ? 0 : angDiff(rawYaw, state.prevRawYaw);
+    state.trackingLost = false;
+
+    // Relative rotation must come from the gyroscope, never from the
+    // orientation stream's yaw. deviceorientationabsolute fuses the
+    // magnetometer, so in a disturbed spot its yaw swings by tens of degrees
+    // while the phone sits still. Only fall back to it when there is no
+    // gyroscope at all AND the compass has not been condemned.
+    let dGyro, gyroTrusted;
+    if (orientation.gyroAvailable) {
+      dGyro = state.prevGyroYaw === null ? 0 : orientation.gyroYaw - state.prevGyroYaw;
+      state.prevGyroYaw = orientation.gyroYaw;
+      gyroTrusted = true;
+    } else {
+      dGyro = state.prevRawYaw === null ? 0 : angDiff(rawYaw, state.prevRawYaw);
+      gyroTrusted = orientation.compassReliability !== 'poor';
+    }
     if (vis && vis.result) {
       const r = vis.result;
       state.visualQuality = r.quality;
@@ -148,18 +165,36 @@ async function processFrame() {
         }
       }
       const dVis = dVisMag * (state.visualSign ?? -1);
-      survey.addFocalSample(r.dx, dGyro, att.elevation, r.quality);
+      const lensChange = survey.addFocalSample(r.dx, dGyro, att.elevation, r.quality);
+      if (lensChange) {
+        const oldFov = camera.hfovDeg;
+        camera.adoptFocal(lensChange.to * (WORK_W / LUMA_W));
+        $('fovRange').value = camera.hfovDeg.toFixed(1);
+        $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+        log('warn', `Lens changed mid-scan: field of view ${oldFov.toFixed(1)}° -> ${camera.hfovDeg.toFixed(1)}° (focal ratio ${lensChange.ratio.toFixed(2)}). Frames already captured keep their own geometry; new frames use the new lens.`);
+      }
 
       if (state.visualSign !== null && r.quality > 0.45 && Math.abs(dVis) < 25) {
-        dFused = 0.75 * dVis + 0.25 * dGyro;
-        if (Math.abs(dVis - dGyro) > Math.max(3, Math.abs(dGyro) * 0.5)) {
-          log('warn', `Rotation disagreement: visual ${dVis.toFixed(2)}° vs orientation ${dGyro.toFixed(2)}°. Visual accepted.`);
+        dFused = gyroTrusted ? 0.75 * dVis + 0.25 * dGyro : dVis;
+        if (gyroTrusted && Math.abs(dVis - dGyro) > Math.max(3, Math.abs(dGyro) * 0.5)) {
+          log('warn', `Rotation disagreement: visual ${dVis.toFixed(2)}° vs inertial ${dGyro.toFixed(2)}°. Visual accepted.`);
         }
-      } else {
+      } else if (gyroTrusted) {
         dFused = dGyro;
+      } else {
+        // Visual registration failed and there is no inertial source worth
+        // integrating. Advancing azimuth on a condemned magnetometer is how a
+        // survey ends up with 360 degrees of "coverage" assembled from a random
+        // walk: every bin filled, none of them pointing where it claims.
+        // Stop accumulating and say so.
+        dFused = 0;
+        state.trackingLost = true;
       }
-    } else {
+    } else if (gyroTrusted) {
       dFused = dGyro;
+    } else {
+      dFused = 0;
+      state.trackingLost = true;
     }
     state.prevRawYaw = rawYaw;
     state.fusedYaw += dFused;
@@ -188,7 +223,8 @@ async function processFrame() {
       // points the wrong way, and what it draws is a trace of sensor noise in
       // black pixels. Refuse rather than produce a confident-looking wrong line.
       if (state.frameCount % 15 === 0) state.sceneLuma = camera.meanLuma();
-      state.frameStatus = (state.sceneLuma !== null && state.sceneLuma < 26) ? 'tooDark'
+      state.frameStatus = state.trackingLost ? 'trackingLost'
+      : (state.sceneLuma !== null && state.sceneLuma < 26) ? 'tooDark'
         : seg.noSky ? 'noSky'
         : seg.allSky ? 'allSky'
           : (clippedTop / seg.flags.length > 0.22) ? 'clippedTop' : 'ok';
@@ -245,9 +281,16 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
   }
   if (!accept) return;
 
+  const intr = camera.intrinsics();
   const kf = survey.addKeyframe({
     t: Date.now(),
     pass: director.phase === PHASE.PASS2 ? 2 : 1,
+    // Stamp the intrinsics in force right now. If the platform swaps lenses
+    // later, frames captured before the swap keep the geometry they were
+    // actually taken with instead of being reprojected through the new lens.
+    tanHalfH: intr.tanHalfH,
+    tanHalfV: intr.tanHalfV,
+    focalPx: camera.focalPx,
     quat,
     screenAngle: orientation.screenAngle,
     yawRaw: rawYaw,
@@ -433,6 +476,7 @@ function resetSurvey() {
   director.target = null;
   state.fusedYaw = 0;
   state.prevRawYaw = null;
+  state.prevGyroYaw = null;
   state.calibFirstTry = 0;
   state.calibGaveUp = false;
   state.visualSign = null;
@@ -577,6 +621,9 @@ function reportText(r) {
   lines.push(`Visual loop error      ${survey.loopClosed ? survey.loopError.toFixed(2) + '°' : 'not measured'}`);
   lines.push('');
   lines.push(`Capture mode           ${director.mode.label}`);
+  if (survey.lensChanges.length) {
+    lines.push(`Lens changes mid-scan  ${survey.lensChanges.length} (${survey.lensChanges.map(c => c.ratio.toFixed(2) + 'x').join(', ')})`);
+  }
   lines.push(`Keyframes              ${survey.keyframes.length}`);
   lines.push(`Field of view          ${camera.hfovDeg.toFixed(2)}° horizontal (${camera.focalSource})`);
   lines.push(`Compass reliability    ${h.compassReliability}${h.compassChecks ? ` (${h.compassRejects}/${h.compassChecks} rejected)` : ''}`);
@@ -916,6 +963,7 @@ function wire() {
     if (st.converged) {
       const workFocal = st.median * (WORK_W / LUMA_W);
       camera.adoptFocal(workFocal);
+      survey.establishFocal(st.median);   // arms mid-scan lens-change detection
       $('fovRange').value = camera.hfovDeg.toFixed(1);
       $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
       $('pfFov').textContent = `${camera.hfovDeg.toFixed(1)}° ±${(st.iqrPct / 2).toFixed(1)}%`;
@@ -930,6 +978,16 @@ function wire() {
       : r.verdict === VERDICT.FAIR ? 'compass fair'
         : r.verdict === VERDICT.INCONCLUSIVE ? 'sweep too short' : 'relative azimuth';
     chip.className = `chip ${r.verdict === VERDICT.GOOD ? 'ok' : r.verdict === VERDICT.INCONCLUSIVE ? '' : 'warn'}`;
+  }
+
+  for (const b of document.querySelectorAll('.fov-preset')) {
+    b.addEventListener('click', () => {
+      camera.setHfov(Number(b.dataset.fov));
+      camera.focalSource = 'preset';
+      $('fovRange').value = camera.hfovDeg.toFixed(1);
+      $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+      log('info', `Field of view seeded to ${camera.hfovDeg}° from a preset. This is still a seed — run the pre-flight sweep to measure it.`);
+    });
   }
 
   $('preflightBtn').addEventListener('click', () => {
