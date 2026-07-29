@@ -103,6 +103,8 @@ export class OrientationSource {
     this._spinActive = false;
     this._spinStart = null;
     this._spinFlat = [];
+    this.sensorSource = 'none';
+    this._genericSensors = [];
 
     this._onOrientation = this._onOrientation.bind(this);
     this._onScreen = this._onScreen.bind(this);
@@ -137,8 +139,24 @@ export class OrientationSource {
     this._onScreen();
     if (screen.orientation) screen.orientation.addEventListener('change', this._onScreen);
     window.addEventListener('orientationchange', this._onScreen);
-    await new Promise(r => setTimeout(r, 400));
-    if (!this.lastEventAt) this.log('warn', 'No orientation events received yet. On desktop this is expected.');
+    await new Promise(r => setTimeout(r, 650));
+    if (!this.lastEventAt && this.gyroSamples === 0) {
+      this.log('warn', 'Legacy motion events delivered no samples. Trying the Generic Sensor API fallback.');
+      await this._startGenericSensors();
+      await new Promise(r => setTimeout(r, 650));
+    }
+    if (!this.lastEventAt && this.gyroSamples === 0) {
+      const availability = {
+        DeviceOrientationEvent: typeof DeviceOrientationEvent !== 'undefined',
+        DeviceMotionEvent: typeof DeviceMotionEvent !== 'undefined',
+        Gyroscope: typeof Gyroscope !== 'undefined',
+        Accelerometer: typeof Accelerometer !== 'undefined',
+        AbsoluteOrientationSensor: typeof AbsoluteOrientationSensor !== 'undefined',
+        RelativeOrientationSensor: typeof RelativeOrientationSensor !== 'undefined'
+      };
+      this.log('error', 'NO_MOTION_SENSORS', JSON.stringify(availability),
+        'Chrome supplied neither legacy events nor Generic Sensor readings. Check Chrome > Settings > Site settings > Motion sensors, Android sensor privacy, and Permissions-Policy headers.');
+    }
   }
 
   stop() {
@@ -147,6 +165,98 @@ export class OrientationSource {
     window.removeEventListener('deviceorientation', this._onOrientation, true);
     if (screen.orientation) screen.orientation.removeEventListener('change', this._onScreen);
     window.removeEventListener('orientationchange', this._onScreen);
+    for (const sensor of this._genericSensors) {
+      try { sensor.stop(); } catch (_) { /* optional sensor */ }
+    }
+    this._genericSensors = [];
+  }
+
+  async _permissionState(name) {
+    try {
+      const status = await navigator.permissions?.query({ name });
+      return status?.state || 'unknown';
+    } catch (_) {
+      return 'unsupported';
+    }
+  }
+
+  async _startGenericSensors() {
+    const permissionStates = {};
+    for (const name of ['accelerometer', 'gyroscope', 'magnetometer']) {
+      permissionStates[name] = await this._permissionState(name);
+    }
+    this.log('info', 'GENERIC_SENSOR_PERMISSIONS', JSON.stringify(permissionStates));
+
+    const startSensor = (sensor, name) => {
+      sensor.addEventListener('error', event => {
+        this.log('error', `Generic ${name} failed:`, event.error?.name || 'Error', event.error?.message || '');
+      });
+      sensor.start();
+      this._genericSensors.push(sensor);
+      this.log('info', `Generic ${name} requested.`);
+      return sensor;
+    };
+
+    try {
+      if (typeof Accelerometer !== 'undefined') {
+        const accel = startSensor(new Accelerometer({ frequency: 60 }), 'accelerometer');
+        accel.addEventListener('reading', () => {
+          this.lastGravity = [accel.x || 0, accel.y || 0, accel.z || 0];
+        });
+      }
+    } catch (error) {
+      this.log('error', 'Could not start Generic accelerometer:', error.name, error.message);
+    }
+
+    try {
+      if (typeof Gyroscope !== 'undefined') {
+        const gyro = startSensor(new Gyroscope({ frequency: 60 }), 'gyroscope');
+        gyro.addEventListener('reading', () => {
+          this._onMotion({
+            timeStamp: gyro.timestamp || performance.now(),
+            rotationRate: {
+              beta: (gyro.x || 0) * RAD,
+              gamma: (gyro.y || 0) * RAD,
+              alpha: (gyro.z || 0) * RAD
+            },
+            accelerationIncludingGravity: this.lastGravity
+              ? { x: this.lastGravity[0], y: this.lastGravity[1], z: this.lastGravity[2] }
+              : null
+          });
+          this.sensorSource = 'generic-sensor';
+        });
+      }
+    } catch (error) {
+      this.log('error', 'Could not start Generic gyroscope:', error.name, error.message);
+    }
+
+    const OrientationCtor = typeof AbsoluteOrientationSensor !== 'undefined'
+      ? AbsoluteOrientationSensor
+      : (typeof RelativeOrientationSensor !== 'undefined' ? RelativeOrientationSensor : null);
+    if (OrientationCtor) {
+      try {
+        const isAbsolute = typeof AbsoluteOrientationSensor !== 'undefined'
+          && OrientationCtor === AbsoluteOrientationSensor;
+        const name = isAbsolute ? 'absolute orientation' : 'relative orientation';
+        const sensor = startSensor(new OrientationCtor({ frequency: 60, referenceFrame: 'device' }), name);
+        sensor.addEventListener('reading', () => {
+          const q = sensor.quaternion;
+          if (!q || q.length !== 4) return;
+          // Generic Sensor quaternions are [x,y,z,w]; this project uses [w,x,y,z].
+          this.quat = quatNormalize([q[3], q[0], q[1], q[2]]);
+          const now = sensor.timestamp || performance.now();
+          this._rateWindow.push(now);
+          while (this._rateWindow.length && now - this._rateWindow[0] > 1000) this._rateWindow.shift();
+          this.eventRate = this._rateWindow.length;
+          this.lastEventAt = now;
+          this.absolute = isAbsolute;
+          this.sensorSource = 'generic-sensor';
+          this._trackMotion(now);
+        });
+      } catch (error) {
+        this.log('error', 'Could not start Generic orientation sensor:', error.name, error.message);
+      }
+    }
   }
 
   _onScreen() {
@@ -167,6 +277,7 @@ export class OrientationSource {
     this.beta = Number.isFinite(e.beta) ? e.beta : this.beta;
     this.gamma = Number.isFinite(e.gamma) ? e.gamma : this.gamma;
     this.absolute = this.absolute || !!e.absolute;
+    this.sensorSource = 'legacy-events';
     this.quat = quatNormalize(quatFromEuler(this.alpha || 0, this.beta, this.gamma));
 
     if (Number.isFinite(e.webkitCompassHeading)) {
@@ -286,6 +397,10 @@ export class OrientationSource {
     // Do not carry an old correction into a new measurement.
     this.gyroBias = [0, 0, 0];
     this.gyroScale = 1;
+  }
+
+  get stationarySampleCount() {
+    return this._stationarySamples.length;
   }
 
   screenFlatnessDeg() {
@@ -504,6 +619,7 @@ export class OrientationSource {
       gyro: this.gyroAvailable ? 'available' : 'absent',
       motionSource: this.motionSource,
       gyroSamples: this.gyroSamples,
+      sensorSource: this.sensorSource,
       gyroBiasDegPerSec: this.gyroBias.map(v => Number(v.toFixed(4))),
       gyroScale: Number(this.gyroScale.toFixed(6)),
       stationaryDiagnostic: this.stationaryDiagnostic,

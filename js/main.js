@@ -375,7 +375,18 @@ function tickCalibration(now) {
     const flatEnough = flat === null || flat <= 12;
     const quietEnough = Math.abs(orientation.gyroYawRate) <= 5;
     director.calibrationProgress = clamp(elapsed / 4000, 0, 1);
-    if ((elapsed >= 4000 && flatEnough && quietEnough) || elapsed >= 12000) {
+    const enoughSamples = orientation.stationarySampleCount >= 40;
+    if (elapsed >= 12000 && !enoughSamples) {
+      const r = orientation.finishStationaryDiagnostic();
+      log('error', 'SENSOR_STATIONARY_FAILED', JSON.stringify(r),
+        'No gyroscope samples arrived. Calibration stopped; no zero-sample result was accepted.');
+      state.sensorCal = { stage: 'failed', startedAt: now };
+      state.paused = true;
+      director.calibrationProgress = 0;
+      syncControls();
+      return;
+    }
+    if (elapsed >= 4000 && enoughSamples && flatEnough && quietEnough) {
       const r = orientation.finishStationaryDiagnostic();
       log(r.biasApplied ? 'info' : 'warn', 'SENSOR_STATIONARY', JSON.stringify(r));
       log(r.biasApplied ? 'info' : 'warn',
@@ -396,6 +407,8 @@ function tickCalibration(now) {
     director.calibrationProgress = clamp(Math.abs(orientation.spinProgress()) / 360, 0, 1);
     return;
   }
+
+  if (state.sensorCal.stage === 'failed') return;
 
   const att = orientation.attitude();
   const level = Math.abs(att.roll) <= 12;
@@ -650,6 +663,14 @@ function renderLive() {
     $('primaryBtn').disabled = travelled < 270 && orientation.gyroSamples > 20;
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'settle') {
     d.detail = 'Now lift the phone into its normal upright scanning position and hold it still. This final step establishes the survey datum.';
+  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
+    d = {
+      tone: 'fix',
+      headline: 'Motion sensors unavailable',
+      detail: 'Chrome returned no orientation or gyroscope samples. Enable Motion sensors for this site in Chrome settings, check Android sensor privacy, then press Reload and retry. No survey data was recorded.',
+      progress: 0,
+      arrow: null
+    };
   }
 
   $('directive').dataset.tone = d.tone;
@@ -809,6 +830,12 @@ function syncControls() {
     btn.disabled = true;
     return;
   }
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
+    btn.textContent = 'Reload and retry sensors';
+    btn.disabled = false;
+    sec.hidden = true;
+    return;
+  }
   if (p === PHASE.CALIBRATING) { btn.textContent = 'Calibrating…'; btn.disabled = true; return; }
   if (p === PHASE.PASS1) {
     const enough = Math.abs(director.pass1Travel) >= 300 || survey.coverage().observedBins >= 700;
@@ -830,6 +857,7 @@ function syncControls() {
 function onPrimary() {
   const p = director.phase;
   if (!state.running) return startCapture();
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') return location.reload();
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') return finishSpinDiagnostic();
   if (p === PHASE.PASS1) return finishPass1();
   if (p === PHASE.PASS2) return finishSurvey();
