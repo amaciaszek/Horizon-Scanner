@@ -229,6 +229,7 @@ async function processFrame() {
         dFused = 0;
         state.trackingLost = true;
       }
+    }
     state.prevRawYaw = rawYaw;
     state.fusedYaw += dFused;
     if (director.phase === PHASE.PASS1) director.notePass1Travel(dFused);
@@ -760,7 +761,6 @@ function reportText(r) {
   lines.push(`Mean segmentation conf ${(c.meanConfidence * 100).toFixed(1)}%`);
   lines.push(`Visual loop error      ${survey.loopClosed ? survey.loopError.toFixed(2) + '°' : 'not measured'}`);
   lines.push('');
-  const h = orientation.health();
   lines.push(`Rotation source        ${h.gyro === 'available' ? 'gyroscope (metric)' : 'visual only (scaled by field of view)'}`);
   if (state.visualScale !== null) {
     lines.push(`Visual/gyro scale      ${state.visualScale.toFixed(3)} — field of view is ${state.visualScale > 1 ? 'under' : 'over'}stated by ${Math.abs(1 - state.visualScale) * 100 < 200 ? (Math.abs(1 - state.visualScale) * 100).toFixed(0) + '%' : 'a lot'}`);
