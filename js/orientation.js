@@ -13,6 +13,31 @@ import {
  * disagrees with the integrated rotation. Visual registration (elsewhere) is the
  * arbiter of relative motion.
  */
+const MOTION_WINDOW_MS = 450;
+
+/** Least-squares slope of `key` against time, in units per second. */
+function slope(pts, tKey, key) {
+  const n = pts.length;
+  let st = 0, sv = 0;
+  for (const p of pts) { st += p[tKey]; sv += p[key]; }
+  const mt = st / n, mv = sv / n;
+  let num = 0, den = 0;
+  for (const p of pts) { const dt = p[tKey] - mt; num += dt * (p[key] - mv); den += dt * dt; }
+  return den === 0 ? 0 : (num / den) * 1000;
+}
+
+/** Peak-to-peak scatter about the fitted line, in degrees. */
+function residualSpread(pts, key, ratePerSec) {
+  const t0 = pts[0].t, v0 = pts[0][key];
+  let lo = Infinity, hi = -Infinity;
+  for (const p of pts) {
+    const r = p[key] - (v0 + ratePerSec * (p.t - t0) / 1000);
+    if (r < lo) lo = r;
+    if (r > hi) hi = r;
+  }
+  return hi - lo;
+}
+
 export class OrientationSource {
   constructor(log) {
     this.log = log || (() => {});
@@ -44,6 +69,11 @@ export class OrientationSource {
     this._prevYaw = null;
     this._prevPitch = null;
     this._lastYaw = null;
+    this._motion = [];            // {t, y (unwrapped yaw), p (pitch)}
+    this._yawUnwrapped = null;
+    this._prevWrapped = 0;
+    this.jitterDeg = 0;           // residual sensor scatter, deg
+    this.eventDt = 0;
     this._prevAt = 0;
     this.stillness = 0;
 
@@ -156,27 +186,50 @@ export class OrientationSource {
     return { elevation, roll, forward: fwd };
   }
 
+  /**
+   * Rotation rate and stillness, measured over a window rather than between
+   * consecutive samples.
+   *
+   * Differentiating two samples 20 ms apart amplifies sensor noise by 50x: a
+   * phone clamped to a tripod, with elevation and roll reading dead steady,
+   * still produced 44.7 deg/s of apparent turn because the magnetometer-derived
+   * yaw jitters by about a degree and dt is tiny. Nothing about that number was
+   * motion, but it held the stillness gate at zero and calibration never
+   * finished.
+   *
+   * A least-squares slope over a ~450 ms window divides that noise by both a
+   * much larger time base and the square root of the sample count, taking the
+   * residual rate error to roughly 1 deg/s. The measured jitter is kept
+   * separately so the operator can be told that the problem is the sensor and
+   * not their hands.
+   */
   _trackMotion(now) {
     const yaw = this.rawYaw();
-    const dt = (now - this._prevAt) / 1000;
-    if (this._prevYaw !== null && dt > 0.02 && dt < 1) {
-      const dYaw = angDiff(yaw, this._prevYaw) / dt;
-      // A phone cannot be turned faster than a few hundred deg/s by hand. A
-      // sample above that is a sensor glitch, not motion, and must not be
-      // smoothed into the rate or it poisons the stillness gate for seconds.
-      if (Math.abs(dYaw) < 400) {
-        this.rotationRate = this.rotationRate * 0.7 + dYaw * 0.3;
-        this.rateGlitches = 0;
-      } else {
-        this.rateGlitches = (this.rateGlitches || 0) + 1;
-      }
-      const pitch = this.attitude().elevation;   // beta flips across the same alias
-      const dPitch = (pitch - this._prevPitch) / dt;
-      this.tiltRate = this.tiltRate * 0.7 + dPitch * 0.3;
-      const speed = Math.hypot(this.rotationRate, this.tiltRate);
-      this.stillness = clamp(1 - speed / 6, 0, 1);
-    }
-    if (dt > 0.02) { this._prevYaw = yaw; this._prevPitch = this.attitude().elevation; this._prevAt = now; }
+    const pitch = this.attitude().elevation;
+
+    // Unwrap into a continuous track so the window can be fitted across 0/360.
+    if (this._yawUnwrapped === null) this._yawUnwrapped = yaw;
+    else this._yawUnwrapped += angDiff(yaw, this._prevWrapped);
+    this._prevWrapped = yaw;
+
+    this._motion.push({ t: now, y: this._yawUnwrapped, p: pitch });
+    while (this._motion.length > 2 && now - this._motion[0].t > MOTION_WINDOW_MS) this._motion.shift();
+    if (this._motion.length < 5) return;
+
+    const span = (this._motion[this._motion.length - 1].t - this._motion[0].t) / 1000;
+    if (span < 0.2) return;
+
+    this.rotationRate = slope(this._motion, 't', 'y');
+    this.tiltRate = slope(this._motion, 't', 'p');
+
+    // Jitter is the residual scatter about those fitted lines: what the sensor
+    // is doing that is not steady rotation.
+    this.jitterDeg = Math.max(residualSpread(this._motion, 'y', this.rotationRate),
+      residualSpread(this._motion, 'p', this.tiltRate));
+
+    const speed = Math.hypot(this.rotationRate, this.tiltRate);
+    this.stillness = clamp(1 - speed / 6, 0, 1);
+    this.eventDt = span / (this._motion.length - 1);
   }
 
   /**
@@ -242,7 +295,9 @@ export class OrientationSource {
       compassRejects: this.compassRejects,
       compassChecks: this.compassChecks,
       gyroReliability: this.eventRate >= 25 ? 'good' : this.eventRate >= 10 ? 'fair' : 'poor',
-      screenAngle: this.screenAngle
+      screenAngle: this.screenAngle,
+      jitterDeg: Number(this.jitterDeg.toFixed(2)),
+      sampleIntervalMs: Math.round(this.eventDt * 1000)
     };
   }
 }

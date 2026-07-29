@@ -296,3 +296,89 @@ compares measured pixel shift against measured rotation. It reports sample count
 and interquartile spread live, and refuses to adopt a result until the spread is
 under 8% across at least 25 samples — a lens solved from consistent geometry
 tightens, one solved from a drifting sensor or a textureless wall does not.
+
+
+### 2026-07-28, 02:16 — still stuck on "Hold still", now on a tripod
+
+Symptom: phone clamped to a tripod. Elevation 11.8° and roll −0.1° dead steady,
+azimuth a stable 296.9° — and turn rate reporting 44.7°/s. Stillness stayed at
+zero, calibration never completed, keyframes 0. The camera also swapped between
+physical lenses mid-session, producing two frames seconds apart with completely
+different focus and framing.
+
+Cause, and it is a different bug from the one above: `rotationRate` was a
+derivative between consecutive orientation samples. At 30–60 Hz that dt is
+16–33 ms, so roughly a degree of ordinary magnetometer jitter becomes tens of
+degrees per second. Position was fine; only its derivative was noise. A stable
+reading with an unstable derivative is the signature.
+
+Fix: rate is now a least-squares slope over a ~450 ms window, which divides the
+noise by both a longer time base and √N. Residual scatter about that fit is kept
+as `jitterDeg`, so the guide can say *"Sensor noise, not you"* instead of telling
+someone on a tripod to hold still. Verified in `tests/sim7.mjs`: 1° of jitter now
+reads 0.25°/s instead of 44.7, a real 7°/s rotation still measures 7.4°/s, and a
+genuine stop registers within 800 ms.
+
+**Calibration no longer blocks forever.** Calibration exists only to fix the
+compass yaw datum — and the compass is the input this whole design already
+treats as suspect, with the mount supplying the real azimuth afterwards. A phone
+clamped to a steel mount head may never produce a quiet magnetometer, so
+refusing to start blocks the entire tool on the one number that does not have to
+be right. After 12 s it now proceeds on a relative datum, marks the compass poor,
+and says so in the log.
+
+**Lens swapping.** Android exposes a logical rear camera that the HAL may back
+with different physical sensors, switching on its own as the scene changes. That
+silently changes the intrinsics mid-survey: every focal length solved before the
+swap is wrong after it, and registration across the swap is meaningless. Opening
+by explicit `deviceId` (Advanced → Lens) pins one physical lens. A watchdog also
+polls `getSettings()` once a second and, on a change, discards the calibrated
+focal length and warns rather than carrying on with stale intrinsics.
+
+**Night capture is now refused, not attempted.** Both field sessions were after
+dark, and the traced lines in them are noise in black pixels. At night the
+premise inverts — the sky is the dark region and the ground carries the bright
+lights — so every cue the segmenter uses points the wrong way. Mean working-frame
+luminance below 26/255 now raises `tooDark`, and the overlay draws nothing at all
+in that state, because a line on screen reads as a measurement no matter what the
+confidence chip says. Daylight, ideally flat overcast, is a requirement rather
+than a preference.
+
+
+### Pre-flight sweep — measuring the compass instead of calibrating it
+
+A figure-8 gesture calibrates hard and soft iron: a constant bias and a fixed
+distortion **in the device frame**. That is the one error this design already
+discards, because the mount supplies real azimuth afterwards. It is also
+uncorrectable in the case that matters most — a phone standing beside a steel
+tripod sits in a distortion fixed in the **world** frame, which changes as the
+phone moves through it and which no device-frame calibration can model. The
+browser cannot trigger the platform's magnetometer calibration or read whether it
+converged, so a gesture sold as calibration would be an unverifiable ritual.
+
+`Run pre-flight sweep` measures instead. It is a compass swing, the same
+procedure a ship's compass gets on a swinging berth: turn through at least 60°
+across a textured scene while the app compares compass heading against its own
+fused visual + inertial rotation — the reference the scan itself trusts. It
+reports the **spread** of the residual across headings, not its mean, because a
+constant offset is just the datum and is harmless; a residual that swings as you
+turn is magnetic distortion, and that is what rotates parts of the profile
+relative to others. The 5th–95th percentile span is used so one bad frame cannot
+set the verdict, and a per-30° swing table says *which directions* are distorted,
+distinguishing iron (varies smoothly with heading) from noise (scatters without
+pattern).
+
+Verdicts: under 5° good, under 15° fair — a rough starting azimuth only — and
+above that the compass is dropped for a relative datum, because a
+direction-dependent error is worse than no compass at all. The sweep never
+blocks the survey.
+
+The same gesture solves the focal length, since pixel shift against measured
+rotation needs exactly the same motion over exactly the same kind of scene. The
+separate FOV calibration button is gone; one sweep now returns compass verdict,
+orientation jitter, and field of view with its spread.
+
+Classification is verified in `tests/sim8.mjs` against synthetic environments:
+a constant 137° bias does not change the verdict by more than 0.5°, a 12° swing
+is caught, a 30° sweep correctly refuses to rule, and a single wild outlier is
+rejected by the percentile span.

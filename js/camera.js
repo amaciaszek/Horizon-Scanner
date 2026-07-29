@@ -42,6 +42,10 @@ export class CameraSource {
     // Lens inventory
     this.devices = [];           // [{deviceId, label, hfovDeg|null, isWide}]
     this.activeDeviceId = null;
+    this.pinned = false;         // opened by explicit deviceId, not facingMode
+    this.lensSwaps = 0;
+    this._watch = null;
+    this.onLensSwap = null;
   }
 
   /**
@@ -145,13 +149,64 @@ export class CameraSource {
       }
     } catch (_) { /* capabilities are optional */ }
 
+    this.pinned = !!deviceId;
+    this.activeDeviceId = this.settings.deviceId || deviceId || null;
+    this._startSwapWatch();
     this.detectRotation();
     return this.settings;
   }
 
+  /**
+   * Watch for the platform swapping physical lenses underneath us.
+   *
+   * Android exposes a "logical" rear camera that the HAL is free to back with
+   * different physical sensors — it will switch to a wider or a low-light lens
+   * on its own as the scene changes, which is what produced two frames with
+   * completely different focus and framing seconds apart at night. That silently
+   * changes the intrinsics mid-survey, so every focal length solved before the
+   * swap is wrong afterwards and registration between the two frames is
+   * meaningless. Opening by explicit deviceId pins one physical lens; this watch
+   * catches it when pinning is unavailable or ignored.
+   */
+  _startSwapWatch() {
+    clearInterval(this._watch);
+    const track = this.stream?.getVideoTracks()[0];
+    if (!track?.getSettings) return;
+    let prev = track.getSettings();
+    this._watch = setInterval(() => {
+      const t = this.stream?.getVideoTracks()[0];
+      if (!t?.getSettings) return;
+      const cur = t.getSettings();
+      const changed = cur.deviceId !== prev.deviceId
+        || cur.width !== prev.width
+        || cur.height !== prev.height;
+      if (changed) {
+        this.lensSwaps++;
+        this.focalPx = null;
+        this.focalSource = 'default';
+        this.log('warn', `Camera changed underneath the survey: ${prev.width}x${prev.height} -> ${cur.width}x${cur.height}. Intrinsics discarded. Pin a lens under Advanced to stop this.`);
+        if (this.onLensSwap) this.onLensSwap(prev, cur);
+        prev = cur;
+      }
+    }, 1000);
+  }
+
   stop() {
+    clearInterval(this._watch);
+    this._watch = null;
     if (this.stream) this.stream.getTracks().forEach(t => t.stop());
     this.stream = null;
+  }
+
+  /** Mean luminance of the working frame, 0-255. Used to refuse to segment a
+   *  scene too dark for a sky boundary to exist in the imagery at all. */
+  meanLuma() {
+    if (!this.ready) return null;
+    this._drawRotated(this.workCtx, WORK_W, WORK_H);
+    const d = this.workCtx.getImageData(0, 0, WORK_W, WORK_H).data;
+    let sum = 0;
+    for (let i = 0; i < d.length; i += 64) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    return sum / (d.length / 64);
   }
 
   get ready() {

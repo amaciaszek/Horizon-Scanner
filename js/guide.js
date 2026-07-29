@@ -149,7 +149,15 @@ export class ScanDirector {
 
     if (this.phase === PHASE.CALIBRATING) {
       if (Math.abs(ctx.roll) > M.rollLimitCal) return say('fix', 'Level the phone', `Roll is ${ctx.roll.toFixed(0)}°. Bring it within ±${M.rollLimitCal}°.`);
-      if (ctx.stillness < 0.6) return say('fix', 'Hold still', 'Sensor calibration needs a few seconds of stillness.');
+      if (ctx.stillness < 0.6) {
+        // Distinguish "you are moving" from "the sensor is noisy". Telling a
+        // person to hold still when they are already on a tripod is useless.
+        if (ctx.jitterDeg > 1.2) {
+          return say('warn', 'Sensor noise, not you',
+            `The orientation stream is scattering ±${(ctx.jitterDeg / 2).toFixed(1)}°. Move away from steel, magnets, and motors. The survey will start on a relative azimuth in a few seconds regardless — the mount supplies the real azimuth later.`);
+        }
+        return say('fix', 'Hold still', 'Sensor calibration needs a few seconds of stillness.');
+      }
       return say('work', 'Calibrating sensors', M.calDetail, null, this.calibrationProgress);
     }
 
@@ -208,6 +216,9 @@ export class ScanDirector {
 
   /** Frame-level problems that make the current view unusable. */
   _frameProblem(ctx) {
+    if (ctx.frameStatus === 'tooDark') {
+      return { tone: 'fix', headline: 'Too dark to survey', detail: 'Sky segmentation needs daylight. At night the sky is the dark region and the ground carries the bright lights, so every cue inverts and the traced line is meaningless. Come back in daylight — flat overcast is ideal.', arrow: null, tilt: null, phase: this.phase };
+    }
     if (ctx.frameStatus === 'noSky') {
       const how = this.mode.id === 'tripod'
         ? 'Raise the altitude axis without moving the tripod.'

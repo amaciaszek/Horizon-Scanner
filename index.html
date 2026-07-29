@@ -208,9 +208,18 @@
     <p class="hint" id="lensHint">Android exposes each physical lens separately, so the ultra-wide is reachable here. iOS usually presents one virtual rear camera and switching does nothing. Changing lens discards any calibrated focal length, because intrinsics belong to the lens.</p>
 
     <div class="calib-block">
-      <button id="fovCalBtn" class="btn small">Calibrate field of view</button>
-      <span id="fovCalState" class="chip">not run</span>
-      <p class="hint" id="fovCalHint">Point at a textured scene — foliage, brickwork, a fence — and pan slowly left and right through about 40°. The app compares measured pixel shift against measured rotation and solves the focal length. It reports the spread, and only accepts the result once the spread is tight.</p>
+      <button id="preflightBtn" class="btn small">Run pre-flight sweep</button>
+      <span id="preflightState" class="chip">not run</span>
+      <p class="hint">Point at a textured scene — foliage, brickwork, a fence — and turn steadily through at least 60°, then back. One gesture measures two things: how far your compass disagrees with measured rotation as you turn, and the true focal length from pixel shift against that rotation.</p>
+      <div id="preflightResult" class="preflight-result" hidden>
+        <div class="pf-row"><span>Swept</span><b id="pfSweep">—</b></div>
+        <div class="pf-row"><span>Compass swing</span><b id="pfDeviation">—</b></div>
+        <div class="pf-row"><span>Orientation jitter</span><b id="pfJitter">—</b></div>
+        <div class="pf-row"><span>Field of view</span><b id="pfFov">—</b></div>
+        <p class="hint" id="pfSummary"></p>
+        <details><summary>Compass swing by direction</summary><pre id="pfSwing" class="pf-swing"></pre></details>
+      </div>
+      <p class="hint">This never blocks the survey. A bad compass only rotates the whole profile, and the mount corrects that with one number afterwards.</p>
     </div>
 
     <label class="slider">Horizontal field of view <output id="fovOut">66.0°</output>

@@ -359,3 +359,10 @@ details[open] > *:not(summary) { margin-top: 14px; }
 .calib-block { margin: 14px 0; padding: 12px; border: 1px solid var(--hairline, #23303a); border-radius: 10px; }
 .calib-block .chip { margin-left: 10px; }
 .calib-block .hint { margin-top: 8px; }
+
+/* pre-flight results */
+.preflight-result { margin-top: 12px; }
+.pf-row { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px solid var(--hairline, #23303a); font-size: 13px; }
+.pf-row span { color: var(--muted, #8496a3); letter-spacing: .04em; text-transform: uppercase; font-size: 11px; }
+.pf-row b { font-variant-numeric: tabular-nums; }
+.pf-swing { font-size: 11px; line-height: 1.5; overflow-x: auto; color: var(--muted, #8496a3); }

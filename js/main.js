@@ -9,6 +9,7 @@ import { OrientationSource } from './orientation.js';
 import { Survey, RULES, BIN_COUNT, BIN_STEP, STATUS } from './survey.js';
 import { ScanDirector, PHASE } from './guide.js';
 import { Pipeline } from './pipeline.js';
+import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
 import { drawRing, drawProfile, drawOverlay } from './render.js';
 import * as store from './storage.js';
 import * as out from './exporters.js';
@@ -23,9 +24,13 @@ const director = new ScanDirector(survey);
 const orientation = new OrientationSource(log);
 const camera = new CameraSource($('video'), log);
 const pipeline = new Pipeline(log);
+const preflight = new PreflightSweep();
 
 const state = {
-  fovCal: null,
+  sceneLuma: null,
+  frameCount: 0,
+  calFirstTry: 0,
+  calGaveUp: false,
   running: false,
   paused: false,
   processing: false,
@@ -106,6 +111,7 @@ async function processFrame() {
     const rawYaw = orientation.rawYaw();
     const quat = screenQuat(orientation.quat, orientation.screenAngle);
     const t = performance.now();
+    state.frameCount++;
 
     // Predict the pixel shift from the orientation stream so the visual search
     // starts in the right neighbourhood. Withheld until the sign convention is
@@ -159,12 +165,31 @@ async function processFrame() {
     state.fusedYaw += dFused;
     if (director.phase === PHASE.PASS1) director.notePass1Travel(dFused);
 
+    // The pre-flight sweep rides on the same fused rotation the survey uses as
+    // its reference, so it is measuring the compass against exactly what the
+    // scan will trust rather than against a separate estimate.
+    if (preflight.active) {
+      preflight.add({
+        compass: orientation.compassHeading,
+        integrated: state.fusedYaw,
+        jitter: orientation.jitterDeg,
+        quality: state.visualQuality ?? 0
+      });
+    }
+
     // ---- frame quality gates --------------------------------------------
     if (seg && !seg.error) {
       state.frame = seg;
       let clippedTop = 0;
       for (let i = 0; i < seg.flags.length; i++) if (seg.flags[i] === 1) clippedTop++;
-      state.frameStatus = seg.noSky ? 'noSky'
+      // A sky boundary can only be measured if there is light to measure it
+      // by. At night the whole premise inverts — the sky is the dark region and
+      // the ground carries the bright lights — so every cue the segmenter uses
+      // points the wrong way, and what it draws is a trace of sensor noise in
+      // black pixels. Refuse rather than produce a confident-looking wrong line.
+      if (state.frameCount % 15 === 0) state.sceneLuma = camera.meanLuma();
+      state.frameStatus = (state.sceneLuma !== null && state.sceneLuma < 26) ? 'tooDark'
+        : seg.noSky ? 'noSky'
         : seg.allSky ? 'allSky'
           : (clippedTop / seg.flags.length > 0.22) ? 'clippedTop' : 'ok';
     }
@@ -270,6 +295,22 @@ function tickCalibration(now) {
   const att = orientation.attitude();
   const level = Math.abs(att.roll) <= 12;
   const still = orientation.stillness > 0.6;
+
+  // Calibration exists only to fix the compass yaw datum, and the compass is
+  // the input this design already treats as suspect — the mount supplies the
+  // real azimuth later. A phone clamped to a steel mount head will sometimes
+  // never produce a quiet magnetometer, so refusing to start the survey over it
+  // blocks the whole tool on the one number that does not have to be right.
+  // After 12 s of trying, proceed on a relative datum and say so.
+  if (!state.calibGaveUp && now - (state.calibFirstTry || now) > 12000 && level && orientation.lastEventAt) {
+    state.calibGaveUp = true;
+    log('warn', `Sensor never settled — orientation jitter ±${(orientation.jitterDeg / 2).toFixed(1)}°, turn rate ${orientation.rotationRate.toFixed(1)}°/s. Continuing on a relative azimuth datum; set the offset from mount calibration after export.`);
+    orientation.compassReliability = 'poor';
+    finishCalibration();
+    return;
+  }
+  if (!state.calibFirstTry) state.calibFirstTry = now;
+
   if (!level || !still || !orientation.lastEventAt) {
     director.calibrationProgress = Math.max(0, director.calibrationProgress - 0.02);
     state.calibStart = now;
@@ -392,6 +433,8 @@ function resetSurvey() {
   director.target = null;
   state.fusedYaw = 0;
   state.prevRawYaw = null;
+  state.calibFirstTry = 0;
+  state.calibGaveUp = false;
   state.visualSign = null;
   state.signSamples = [];
   state.frame = null;
@@ -418,6 +461,8 @@ function renderLive() {
     overlap: state.overlap,
     frameStatus: state.frameStatus,
     visualQuality: state.visualQuality,
+    jitterDeg: orientation.jitterDeg,
+    calStalledMs: director.phase === 'calibrating' ? performance.now() - (state.calibStart || performance.now()) : 0,
     hfovDeg: camera.hfovDeg
   };
   const d = director.directive(ctx);
@@ -463,11 +508,12 @@ function renderLive() {
 }
 
 function updateFovCal() {
-  if (!state.fovCal?.active) return;
+  if (!preflight.active) return;
+  const swept = preflight.sweepDeg;
   const st = survey.focalStats();
-  $('fovCalState').textContent = st.median === null
-    ? `collecting ${st.n}`
-    : `${st.n} samples, spread ${st.iqrPct.toFixed(1)}%${st.converged ? ' — ready' : ''}`;
+  $('preflightState').textContent = swept < MIN_SWEEP_DEG
+    ? `${swept.toFixed(0)}° of ${MIN_SWEEP_DEG}° swept`
+    : `${swept.toFixed(0)}° swept, FOV ${st.converged ? 'ready' : `${st.n} samples`}`;
 }
 
 function updateStats() {
@@ -826,7 +872,8 @@ function wire() {
       await camera.switchTo(e.target.value || null);
       survey.focalSamples.length = 0;
       survey.focalPx = null;
-      $('fovCalState').textContent = 'not run';
+      $('preflightState').textContent = 'not run';
+      $('preflightResult').hidden = true;
       log('info', 'Lens switched. Focal length reset — calibrate the field of view for this lens before surveying.');
     } catch (err) {
       log('error', 'Could not open that lens:', err.message || err);
@@ -834,30 +881,68 @@ function wire() {
   });
 
   /* ---- explicit field-of-view calibration ------------------------------ */
-  $('fovCalBtn').addEventListener('click', () => {
-    if (!camera.ready) { log('warn', 'Start the camera first.'); return; }
-    state.fovCal = { active: !state.fovCal?.active };
-    if (state.fovCal.active) {
-      survey.focalSamples.length = 0;
-      survey.focalPx = null;
-      $('fovCalBtn').textContent = 'Stop calibration';
-      $('fovCalState').textContent = 'collecting';
-      log('info', 'FOV calibration started. Pan slowly left and right across a textured scene.');
-    } else {
-      $('fovCalBtn').textContent = 'Calibrate field of view';
-      const st = survey.focalStats();
-      if (st.converged) {
-        const workFocal = st.median * (WORK_W / LUMA_W);
-        camera.adoptFocal(workFocal);
-        $('fovRange').value = camera.hfovDeg.toFixed(1);
-        $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
-        $('fovCalState').textContent = `${camera.hfovDeg.toFixed(1)}° ±${(st.iqrPct / 2).toFixed(1)}%`;
-        log('info', `Field of view calibrated to ${camera.hfovDeg.toFixed(2)}° from ${st.n} samples, spread ${st.iqrPct.toFixed(1)}%.`);
-      } else {
-        $('fovCalState').textContent = 'not converged';
-        log('warn', `Calibration rejected: ${st.n} sample(s)${st.iqrPct !== null ? `, spread ${st.iqrPct.toFixed(1)}% (needs under 8%)` : ''}. Pan more slowly across a scene with more texture, and keep the phone level.`);
-      }
+  /* ---- pre-flight sweep: compass swing + focal length ------------------ */
+  function finishPreflight() {
+    preflight.stop();
+    $('preflightBtn').textContent = 'Run pre-flight sweep';
+    const r = preflight.result();
+    $('preflightResult').hidden = false;
+    $('pfSweep').textContent = `${r.sweepDeg.toFixed(0)}° over ${r.n} samples`;
+    $('pfDeviation').textContent = r.deviationDeg === null ? '—' : `±${(r.deviationDeg / 2).toFixed(1)}°`;
+    $('pfJitter').textContent = `±${(r.meanJitter / 2).toFixed(2)}°`;
+    $('pfSummary').textContent = r.summary;
+
+    // The compass verdict changes what the survey trusts, not whether it runs.
+    if (r.verdict === VERDICT.DEAD || r.verdict === VERDICT.ABSENT) {
+      orientation.compassReliability = 'poor';
+      orientation.datumLocked = false;
+      orientation.yawDatum = 0;
+    } else if (r.verdict === VERDICT.FAIR) {
+      orientation.compassReliability = 'fair';
+    } else if (r.verdict === VERDICT.GOOD) {
+      orientation.compassReliability = 'good';
     }
+    log(r.verdict === VERDICT.GOOD ? 'info' : 'warn', `Pre-flight: compass ${r.verdict}. ${r.summary}`);
+
+    if (r.swingTable) {
+      $('pfSwing').textContent = r.swingTable
+        .map(b => `${String(b.fromDeg).padStart(3)}°-${String(b.fromDeg + 30).padStart(3)}°  ` +
+          (b.n ? `${b.residualDeg >= 0 ? '+' : ''}${b.residualDeg.toFixed(1)}°  (${b.n})` : 'not swept'))
+        .join('\n');
+    }
+
+    // Same gesture, second measurement.
+    const st = survey.focalStats();
+    if (st.converged) {
+      const workFocal = st.median * (WORK_W / LUMA_W);
+      camera.adoptFocal(workFocal);
+      $('fovRange').value = camera.hfovDeg.toFixed(1);
+      $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+      $('pfFov').textContent = `${camera.hfovDeg.toFixed(1)}° ±${(st.iqrPct / 2).toFixed(1)}%`;
+      log('info', `Field of view measured at ${camera.hfovDeg.toFixed(2)}° from ${st.n} samples, spread ${st.iqrPct.toFixed(1)}%.`);
+    } else {
+      $('pfFov').textContent = st.n < 4 ? 'no samples' : `not converged (${st.n}, ±${(st.iqrPct / 2).toFixed(1)}%)`;
+      log('warn', `Field of view not solved: ${st.n} sample(s)${st.iqrPct !== null ? `, spread ${st.iqrPct.toFixed(1)}% (needs under 8%)` : ''}. Turn more steadily across a scene with more texture, keeping the phone level.`);
+    }
+
+    const chip = $('preflightState');
+    chip.textContent = r.verdict === VERDICT.GOOD ? 'compass good'
+      : r.verdict === VERDICT.FAIR ? 'compass fair'
+        : r.verdict === VERDICT.INCONCLUSIVE ? 'sweep too short' : 'relative azimuth';
+    chip.className = `chip ${r.verdict === VERDICT.GOOD ? 'ok' : r.verdict === VERDICT.INCONCLUSIVE ? '' : 'warn'}`;
+  }
+
+  $('preflightBtn').addEventListener('click', () => {
+    if (!camera.ready) { log('warn', 'Start the camera first — the sweep needs visual registration as its reference.'); return; }
+    if (preflight.active) { finishPreflight(); return; }
+    preflight.start();
+    survey.focalSamples.length = 0;
+    survey.focalPx = null;
+    $('preflightResult').hidden = true;
+    $('preflightBtn').textContent = 'Finish sweep';
+    $('preflightState').textContent = 'sweeping';
+    $('preflightState').className = 'chip';
+    log('info', `Pre-flight started. Turn steadily through at least ${MIN_SWEEP_DEG}°, then back, keeping a textured scene in frame.`);
   });
 
   $('modeSelect').addEventListener('change', e => {

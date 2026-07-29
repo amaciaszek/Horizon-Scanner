@@ -260,6 +260,13 @@ export function drawProfile(canvas, survey, view) {
 /* ------------------------------------------------------- live camera overlay */
 
 export function drawOverlay(canvas, frame, directive) {
+  // When the director has declared the frame unusable, draw nothing. A traced
+  // line on screen reads as a measurement whatever the confidence chip says.
+  if (directive && directive.headline === 'Too dark to survey') {
+    const c = canvas.getContext('2d');
+    c.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
