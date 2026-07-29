@@ -85,11 +85,24 @@ export class OrientationSource {
     this.gyroYaw = 0;             // integrated, unwrapped, arbitrary datum
     this.gyroYawRate = 0;         // deg/s about world vertical
     this.gyroSamples = 0;
+    this.gyroBias = [0, 0, 0];   // device x/y/z bias, deg/s
+    this.gyroScale = 1;           // conservative scale from a declared full turn
+    this.lastGravity = null;
     this._lastMotionAt = 0;
     this._onMotion = this._onMotion.bind(this);
     this.eventDt = 0;
     this._prevAt = 0;
     this.stillness = 0;
+
+    // Reproducible startup diagnostics. Raw samples are retained only for the
+    // short calibration window; summaries remain available to logs/archives.
+    this.stationaryDiagnostic = null;
+    this.spinDiagnostic = null;
+    this._stationarySamples = [];
+    this._stationaryActive = false;
+    this._spinActive = false;
+    this._spinStart = null;
+    this._spinFlat = [];
 
     this._onOrientation = this._onOrientation.bind(this);
     this._onScreen = this._onScreen.bind(this);
@@ -104,10 +117,20 @@ export class OrientationSource {
     if (typeof DeviceOrientationEvent === 'undefined') {
       throw new Error('This browser does not report device orientation. Use a phone over HTTPS.');
     }
+    // Invoke both permission requests synchronously inside the original button
+    // gesture. Awaiting one before asking for the other can consume iOS's user
+    // activation and leave devicemotion silently unavailable.
+    const permissionRequests = [];
     if (OrientationSource.needsPermission()) {
-      const result = await DeviceOrientationEvent.requestPermission();
-      if (result !== 'granted') throw new Error('Motion and orientation access was declined. Enable it in Settings > Safari > Motion & Orientation Access, then reload.');
+      permissionRequests.push(DeviceOrientationEvent.requestPermission().then(result => ['orientation', result]));
     }
+    if (typeof DeviceMotionEvent !== 'undefined'
+        && typeof DeviceMotionEvent.requestPermission === 'function') {
+      permissionRequests.push(DeviceMotionEvent.requestPermission().then(result => ['motion', result]));
+    }
+    const permissions = await Promise.all(permissionRequests);
+    const declined = permissions.find(([, result]) => result !== 'granted');
+    if (declined) throw new Error(`${declined[0] === 'motion' ? 'Gyroscope' : 'Motion and orientation'} access was declined. Enable Motion & Orientation Access, then reload.`);
     window.addEventListener('devicemotion', this._onMotion, true);
     window.addEventListener('deviceorientationabsolute', this._onOrientation, true);
     window.addEventListener('deviceorientation', this._onOrientation, true);
@@ -119,6 +142,7 @@ export class OrientationSource {
   }
 
   stop() {
+    window.removeEventListener('devicemotion', this._onMotion, true);
     window.removeEventListener('deviceorientationabsolute', this._onOrientation, true);
     window.removeEventListener('deviceorientation', this._onOrientation, true);
     if (screen.orientation) screen.orientation.removeEventListener('change', this._onScreen);
@@ -224,17 +248,137 @@ export class OrientationSource {
     this._lastMotionAt = now;
     if (!(dt > 0 && dt < 0.5)) return;
 
-    // Angular velocity in the device frame, deg/s.
-    const w = [r.beta || 0, r.gamma || 0, r.alpha || 0];
+    // Angular velocity in the device frame, deg/s. Keep the uncorrected values
+    // for stationary noise measurement, then remove the measured device-frame
+    // bias before projecting onto world vertical.
+    const rawW = [r.beta || 0, r.gamma || 0, r.alpha || 0];
+    const g = e.accelerationIncludingGravity;
+    const gravity = g ? [g.x || 0, g.y || 0, g.z || 0] : null;
+    if (gravity) this.lastGravity = gravity;
+    if (this._stationaryActive && this._stationarySamples.length < 1200) {
+      const att = this.attitude();
+      this._stationarySamples.push({
+        t: now, w: rawW.slice(), g: gravity,
+        alpha: this.alpha, beta: this.beta, gamma: this.gamma,
+        elevation: att.elevation, roll: att.roll
+      });
+    }
+    const w = rawW.map((v, i) => v - this.gyroBias[i]);
     // World up, expressed in the device frame.
     const up = quatRotate(quatConj(this.quat), [0, 0, 1]);
-    this.gyroYawRate = -(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]);
+    this.gyroYawRate = -(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]) * this.gyroScale;
     this.gyroYaw += this.gyroYawRate * dt;
     this.gyroSamples++;
+    if (this._spinActive && gravity) {
+      const mag = Math.hypot(...gravity);
+      if (mag > 1) this._spinFlat.push(Math.acos(clamp(Math.abs(gravity[2]) / mag, -1, 1)) * RAD);
+    }
     if (this.gyroSamples > 20 && !this.gyroAvailable) {
       this.gyroAvailable = true;
       if (this.log) this.log('info', 'Gyroscope live via devicemotion. Azimuth is now metric — a wrong field of view can no longer stretch or shrink the circle.');
     }
+  }
+
+  beginStationaryDiagnostic() {
+    this._stationarySamples = [];
+    this._stationaryActive = true;
+    this.stationaryDiagnostic = null;
+    // Do not carry an old correction into a new measurement.
+    this.gyroBias = [0, 0, 0];
+    this.gyroScale = 1;
+  }
+
+  screenFlatnessDeg() {
+    if (!this.lastGravity) return null;
+    const mag = Math.hypot(...this.lastGravity);
+    return mag > 1 ? Math.acos(clamp(Math.abs(this.lastGravity[2]) / mag, -1, 1)) * RAD : null;
+  }
+
+  finishStationaryDiagnostic() {
+    this._stationaryActive = false;
+    const samples = this._stationarySamples;
+    const stats = values => {
+      const finite = values.filter(Number.isFinite);
+      if (!finite.length) return { mean: null, std: null, p2p: null };
+      const mean = finite.reduce((a, v) => a + v, 0) / finite.length;
+      const variance = finite.reduce((a, v) => a + (v - mean) ** 2, 0) / finite.length;
+      return { mean, std: Math.sqrt(variance), p2p: Math.max(...finite) - Math.min(...finite) };
+    };
+    const axes = [0, 1, 2].map(i => stats(samples.map(s => s.w[i])));
+    const gravityAxes = [0, 1, 2].map(i => stats(samples.map(s => s.g?.[i])));
+    const gravityMagnitude = stats(samples.map(s => s.g ? Math.hypot(...s.g) : null));
+    const flatness = stats(samples.map(s => {
+      if (!s.g) return null;
+      const mag = Math.hypot(...s.g);
+      return mag > 1 ? Math.acos(clamp(Math.abs(s.g[2]) / mag, -1, 1)) * RAD : null;
+    }));
+    const elevation = stats(samples.map(s => s.elevation));
+    const roll = stats(samples.map(s => s.roll));
+    const durationMs = samples.length > 1 ? samples[samples.length - 1].t - samples[0].t : 0;
+    const enough = samples.length >= 40 && durationMs >= 2000;
+    if (enough) this.gyroBias = axes.map(a => a.mean || 0);
+    this.stationaryDiagnostic = {
+      samples: samples.length,
+      durationMs,
+      sampleRateHz: durationMs > 0 ? (samples.length - 1) * 1000 / durationMs : 0,
+      gyroAxes: { x: axes[0], y: axes[1], z: axes[2] },
+      gravityAxes: { x: gravityAxes[0], y: gravityAxes[1], z: gravityAxes[2] },
+      gravityMagnitude,
+      screenFlatnessDeg: flatness,
+      orientationElevationDeg: elevation,
+      orientationRollDeg: roll,
+      biasApplied: enough
+    };
+    return this.stationaryDiagnostic;
+  }
+
+  beginSpinDiagnostic() {
+    this._spinActive = true;
+    this._spinFlat = [];
+    this._spinStart = {
+      t: performance.now(),
+      gyroYaw: this.gyroYaw,
+      compass: this.compassHeading,
+      orientationYaw: this.rawYaw()
+    };
+    this.spinDiagnostic = null;
+  }
+
+  spinProgress() {
+    return this._spinStart ? this.gyroYaw - this._spinStart.gyroYaw : 0;
+  }
+
+  finishSpinDiagnostic() {
+    this._spinActive = false;
+    if (!this._spinStart) return null;
+    const measuredDeg = this.spinProgress();
+    const absMeasured = Math.abs(measuredDeg);
+    const proposedScale = absMeasured > 1 ? 360 / absMeasured : null;
+    // A modest scale error is plausibly a sensor calibration error. A large
+    // one more likely means the pose, axis mapping, or gesture was wrong; log
+    // it prominently instead of teaching the survey a dangerous correction.
+    const scaleApplied = Number.isFinite(proposedScale) && proposedScale >= 0.8 && proposedScale <= 1.2;
+    if (scaleApplied) this.gyroScale *= proposedScale;
+    const flat = this._spinFlat.length
+      ? { mean: this._spinFlat.reduce((a, v) => a + v, 0) / this._spinFlat.length,
+          max: Math.max(...this._spinFlat) }
+      : { mean: null, max: null };
+    this.spinDiagnostic = {
+      durationMs: performance.now() - this._spinStart.t,
+      measuredDeg,
+      direction: measuredDeg >= 0 ? 'clockwise-positive' : 'clockwise-negative',
+      proposedScale,
+      scaleApplied,
+      resultingScale: this.gyroScale,
+      compassClosureDeg: Number.isFinite(this.compassHeading) && Number.isFinite(this._spinStart.compass)
+        ? angDiff(this.compassHeading, this._spinStart.compass) : null,
+      orientationClosureDeg: angDiff(this.rawYaw(), this._spinStart.orientationYaw),
+      flatnessMeanDeg: flat.mean,
+      flatnessMaxDeg: flat.max,
+      samples: this._spinFlat.length
+    };
+    this._spinStart = null;
+    return this.spinDiagnostic;
   }
 
   /**
@@ -360,6 +504,10 @@ export class OrientationSource {
       gyro: this.gyroAvailable ? 'available' : 'absent',
       motionSource: this.motionSource,
       gyroSamples: this.gyroSamples,
+      gyroBiasDegPerSec: this.gyroBias.map(v => Number(v.toFixed(4))),
+      gyroScale: Number(this.gyroScale.toFixed(6)),
+      stationaryDiagnostic: this.stationaryDiagnostic,
+      spinDiagnostic: this.spinDiagnostic,
       sampleIntervalMs: Math.round(this.eventDt * 1000)
     };
   }

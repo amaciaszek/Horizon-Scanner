@@ -256,6 +256,30 @@ workers/vision.worker.js    visual registration
 
 ## Field fix log
 
+### 2026-07-29 — startup stationary and physical-turn diagnostics
+
+Startup now measures the sensors before any survey keyframes can be accepted.
+The phone first rests screen-up and untouched for four seconds. The app records
+raw x/y/z gyroscope mean, standard deviation and peak-to-peak noise, gravity on
+all three device axes, gravity magnitude, sampling rate, orientation scatter,
+and the measured angle between the screen plane and horizontal. A sufficiently
+sampled stationary mean is removed as device-frame gyro bias.
+
+The operator then rotates the still-flat phone clockwise through one physical
+lap and presses Finish when it returns approximately to its starting direction.
+The log records integrated gyro degrees, direction/sign, duration, compass and
+orientation closure, flatness throughout the gesture, and the implied gyro
+scale. Only an implied correction between 0.8 and 1.2 is applied; a larger
+disagreement is evidence of an axis/pose/browser problem and is reported rather
+than silently hidden. The phone is then lifted upright and held still to set the
+normal survey datum.
+
+`Copy log + sensor snapshot` now appends a complete current sensor, camera,
+pipeline, capture, pre-flight, and platform snapshot before copying. The field
+log retains 5,000 entries and renders its latest 1,000.
+
+The deterministic regression is `tests/sensor-calibration.test.mjs`.
+
 ### 2026-07-28 — calibration never completed
 
 Symptom: turn rate read 371–2586°/s with the phone held still, so stillness never

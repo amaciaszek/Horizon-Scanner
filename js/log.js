@@ -1,7 +1,7 @@
 'use strict';
 
 const entries = [];
-const MAX = 1500;
+const MAX = 5000;
 let outputEl = null, countEl = null;
 
 function format(value) {
@@ -14,7 +14,7 @@ function format(value) {
 
 function render() {
   if (outputEl) {
-    outputEl.textContent = entries.slice(-400).join('\n');
+    outputEl.textContent = entries.slice(-1000).join('\n');
     outputEl.scrollTop = outputEl.scrollHeight;
   }
   if (countEl) countEl.textContent = `${entries.length}`;

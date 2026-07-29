@@ -57,7 +57,8 @@ const state = {
   editing: false,
   maxAlt: 60,
   thumbs: {},
-  targetLuma: null
+  targetLuma: null,
+  sensorCal: { stage: 'idle', startedAt: 0 }
 };
 
 const PROCESS_INTERVAL_MS = 110;
@@ -367,6 +368,34 @@ function currentHeading() {
 /* ------------------------------------------------------------- calibration */
 
 function tickCalibration(now) {
+  if (state.sensorCal.stage === 'stationary') {
+    const elapsed = now - state.sensorCal.startedAt;
+    const flat = orientation.screenFlatnessDeg();
+    const flatEnough = flat === null || flat <= 12;
+    const quietEnough = Math.abs(orientation.gyroYawRate) <= 5;
+    director.calibrationProgress = clamp(elapsed / 4000, 0, 1);
+    if ((elapsed >= 4000 && flatEnough && quietEnough) || elapsed >= 12000) {
+      const r = orientation.finishStationaryDiagnostic();
+      log(r.biasApplied ? 'info' : 'warn', 'SENSOR_STATIONARY', JSON.stringify(r));
+      log(r.biasApplied ? 'info' : 'warn',
+        `Stationary test: ${r.samples} samples at ${r.sampleRateHz.toFixed(1)} Hz; `
+        + `gyro bias x/y/z ${['x', 'y', 'z'].map(k => (r.gyroAxes[k].mean ?? 0).toFixed(4)).join('/')}°/s; `
+        + `noise σ ${['x', 'y', 'z'].map(k => (r.gyroAxes[k].std ?? 0).toFixed(4)).join('/')}°/s; `
+        + `gravity ${(r.gravityMagnitude.mean ?? 0).toFixed(3)} m/s²; `
+        + `screen ${(r.screenFlatnessDeg.mean ?? 0).toFixed(2)}° from horizontal.`);
+      orientation.beginSpinDiagnostic();
+      state.sensorCal = { stage: 'spin', startedAt: now };
+      director.calibrationProgress = 0;
+      syncControls();
+    }
+    return;
+  }
+
+  if (state.sensorCal.stage === 'spin') {
+    director.calibrationProgress = clamp(Math.abs(orientation.spinProgress()) / 360, 0, 1);
+    return;
+  }
+
   const att = orientation.attitude();
   const level = Math.abs(att.roll) <= 12;
   const still = orientation.stillness > 0.6;
@@ -418,6 +447,26 @@ function finishCalibration() {
     }
   }, 4000);
   log('info', `Pass 1 started at azimuth ${currentHeading().toFixed(1)}°.`);
+  state.sensorCal = { stage: 'complete', startedAt: performance.now() };
+  syncControls();
+}
+
+function finishSpinDiagnostic() {
+  if (state.sensorCal.stage !== 'spin') return;
+  const r = orientation.finishSpinDiagnostic();
+  if (!r) return;
+  log(r.scaleApplied ? 'info' : 'warn', 'SENSOR_360', JSON.stringify(r));
+  log(r.scaleApplied ? 'info' : 'warn',
+    `360 test: gyroscope measured ${r.measuredDeg.toFixed(2)}° in ${(r.durationMs / 1000).toFixed(1)} s; `
+    + `proposed scale ${Number.isFinite(r.proposedScale) ? r.proposedScale.toFixed(5) : 'unavailable'}`
+    + `${r.scaleApplied ? ' (applied)' : ' (not applied — outside conservative 0.8–1.2 range)'}; `
+    + `compass closure ${Number.isFinite(r.compassClosureDeg) ? r.compassClosureDeg.toFixed(2) + '°' : 'unavailable'}; `
+    + `flatness mean/max ${Number.isFinite(r.flatnessMeanDeg) ? r.flatnessMeanDeg.toFixed(2) : '—'}/`
+    + `${Number.isFinite(r.flatnessMaxDeg) ? r.flatnessMaxDeg.toFixed(2) : '—'}°.`);
+  state.sensorCal = { stage: 'settle', startedAt: performance.now() };
+  state.calibStart = performance.now();
+  state.calibFirstTry = 0;
+  director.calibrationProgress = 0;
   syncControls();
 }
 
@@ -435,6 +484,8 @@ async function startCapture() {
     store.requestPersistence().then(ok => ok && log('info', 'Storage marked persistent.'));
     state.sessionId = state.sessionId || `s${Date.now().toString(36)}`;
     director.beginCalibration();
+    orientation.beginStationaryDiagnostic();
+    state.sensorCal = { stage: 'stationary', startedAt: performance.now() };
     state.calibStart = performance.now();
     setChip($('contextChip'), `${camera.settings.width}×${camera.settings.height}`, '');
     syncControls();
@@ -541,10 +592,16 @@ function resetSurvey() {
   state.calibGaveUp = false;
   state.visualSign = null;
   state.signSamples = [];
+  state.sensorCal = { stage: 'idle', startedAt: 0 };
   state.frame = null;
   state.thumbs = {};
   pipeline.resetRegistration();
-  if (state.running) { director.beginCalibration(); state.calibStart = performance.now(); }
+  if (state.running) {
+    director.beginCalibration();
+    orientation.beginStationaryDiagnostic();
+    state.sensorCal = { stage: 'stationary', startedAt: performance.now() };
+    state.calibStart = performance.now();
+  }
   updateReport();
   syncControls();
   log('info', 'Survey reset.');
@@ -569,7 +626,30 @@ function renderLive() {
     calStalledMs: director.phase === 'calibrating' ? performance.now() - (state.calibStart || performance.now()) : 0,
     hfovDeg: camera.hfovDeg
   };
-  const d = director.directive(ctx);
+  let d = director.directive(ctx);
+  if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
+    const flat = orientation.screenFlatnessDeg();
+    d = {
+      tone: flat !== null && flat > 12 ? 'fix' : 'work',
+      headline: flat !== null && flat > 12 ? 'Lay the phone flat' : 'Do not touch the phone',
+      detail: `Screen face up on a stable surface. Measuring gyro noise, bias, gravity, and horizontal${flat === null ? '' : ` — currently ${flat.toFixed(1)}° from flat`}.`,
+      progress: director.calibrationProgress,
+      arrow: null
+    };
+  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') {
+    const travelled = Math.abs(orientation.spinProgress());
+    d = {
+      tone: travelled >= 270 ? 'good' : 'work',
+      headline: 'Rotate once clockwise',
+      detail: `${travelled.toFixed(0)}° measured. Keep the screen face up and turn the phone on the table until it approximately returns to its starting direction, then press Finish.`,
+      progress: clamp(travelled / 360, 0, 1),
+      arrow: +1
+    };
+    $('primaryBtn').textContent = `Finish 360° test — ${travelled.toFixed(0)}°`;
+    $('primaryBtn').disabled = travelled < 270 && orientation.gyroSamples > 20;
+  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'settle') {
+    d.detail = 'Now lift the phone into its normal upright scanning position and hold it still. This final step establishes the survey datum.';
+  }
 
   $('directive').dataset.tone = d.tone;
   $('directiveHead').textContent = d.headline;
@@ -719,6 +799,16 @@ function syncControls() {
   sec.textContent = state.paused ? 'Resume' : 'Pause';
 
   if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') {
+    btn.textContent = 'Finish 360° test';
+    btn.disabled = orientation.gyroSamples > 20;
+    return;
+  }
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
+    btn.textContent = 'Measuring stationary sensors…';
+    btn.disabled = true;
+    return;
+  }
   if (p === PHASE.CALIBRATING) { btn.textContent = 'Calibrating…'; btn.disabled = true; return; }
   if (p === PHASE.PASS1) {
     const enough = Math.abs(director.pass1Travel) >= 300 || survey.coverage().observedBins >= 700;
@@ -740,6 +830,7 @@ function syncControls() {
 function onPrimary() {
   const p = director.phase;
   if (!state.running) return startCapture();
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') return finishSpinDiagnostic();
   if (p === PHASE.PASS1) return finishPass1();
   if (p === PHASE.PASS2) return finishSurvey();
   if (p === PHASE.COMPLETE) return resetSurvey();
@@ -772,6 +863,52 @@ function currentProject(includeThumbs = false) {
     thumbs: includeThumbs ? state.thumbs : null,
     generator: 'Horizon Survey 2.0 (browser)'
   });
+}
+
+function debugSnapshot() {
+  return {
+    generatedAt: new Date().toISOString(),
+    phase: director.phase,
+    sensorCalibrationStage: state.sensorCal.stage,
+    orientation: orientation.health(),
+    attitude: orientation.attitude(),
+    rawOrientation: {
+      alpha: orientation.alpha,
+      beta: orientation.beta,
+      gamma: orientation.gamma,
+      rawYaw: orientation.rawYaw(),
+      compassHeading: orientation.compassHeading,
+      gyroYaw: orientation.gyroYaw,
+      gyroYawRate: orientation.gyroYawRate
+    },
+    camera: {
+      ready: camera.ready,
+      settings: camera.settings,
+      intrinsics: camera.intrinsics(),
+      frameRotation: camera.frameRotation,
+      activeDeviceId: camera.activeDeviceId
+    },
+    pipeline: pipeline.stats(),
+    capture: {
+      frameCount: state.frameCount,
+      frameStatus: state.frameStatus,
+      sceneLuma: state.sceneLuma,
+      visualQuality: state.visualQuality,
+      visualScale: state.visualScale,
+      trackingLost: state.trackingLost,
+      fusedYaw: state.fusedYaw,
+      pass1Travel: director.pass1Travel,
+      keyframes: survey.keyframes.length,
+      coverage: survey.coverage()
+    },
+    preflight: preflight.result(),
+    platform: {
+      userAgent: navigator.userAgent,
+      screen: `${screen.width}x${screen.height}`,
+      devicePixelRatio: window.devicePixelRatio || 1,
+      secureContext: window.isSecureContext
+    }
+  };
 }
 
 async function saveSession() {
@@ -1105,7 +1242,14 @@ function wire() {
   });
 
   $('selfTestBtn').addEventListener('click', selfTest);
-  $('copyLogBtn').addEventListener('click', async () => { const ok = await L.copy(); log('info', ok ? 'Log copied.' : 'Copy refused.'); });
+  $('copyLogBtn').addEventListener('click', async () => {
+    // Capture state at the moment the operator asks for support. This makes the
+    // copied log self-contained instead of relying on a value having happened
+    // to cross a warning threshold earlier.
+    log('info', 'DEBUG_SNAPSHOT', JSON.stringify(debugSnapshot()));
+    const ok = await L.copy();
+    log('info', ok ? 'Log copied with diagnostic snapshot.' : 'Copy refused.');
+  });
   $('clearLogBtn').addEventListener('click', () => L.clear());
 
   window.addEventListener('orientationchange', () => setTimeout(() => camera.detectRotation(orientation.screenAngle), 250));

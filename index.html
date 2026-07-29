@@ -61,7 +61,7 @@
     <button id="secondaryBtn" class="btn" hidden>Pause</button>
     <button id="abortBtn" class="btn ghost" hidden>Reset survey</button>
   </div>
-  <p class="hint" id="captureHint">Camera and motion access both need HTTPS. On iOS you will be asked for Motion &amp; Orientation permission.</p>
+  <p class="hint" id="captureHint">Startup has three short sensor checks: first leave the phone untouched with its screen face up, then rotate it once clockwise while it stays flat, then lift it into the normal upright scanning position. Camera and motion access both need HTTPS.</p>
 </section>
 
 <!-- --------------------------------------------------------------- survey -->
@@ -262,7 +262,7 @@
   <details>
     <summary><span class="kicker">DIAGNOSTICS</span> Field log <span class="count" id="logCount">0</span></summary>
     <div class="row">
-      <button id="copyLogBtn" class="btn small">Copy log</button>
+      <button id="copyLogBtn" class="btn small">Copy log + sensor snapshot</button>
       <button id="clearLogBtn" class="btn small">Clear</button>
     </div>
     <pre id="logOutput" tabindex="0"></pre>
