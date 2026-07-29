@@ -1,35 +1,251 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b1115" />
-  <title>Horizon Profile Scanner</title>
-  <link rel="stylesheet" href="styles.css" />
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="theme-color" content="#060d11" />
+<meta name="description" content="Guided multi-pass horizon survey for the OnStep Advanced Telescope Controller." />
+<title>Horizon Survey</title>
+<link rel="stylesheet" href="styles.css" />
 </head>
 <body>
-<main class="app-shell">
-  <header class="topbar"><div><p class="eyebrow">ONSTEP ADVANCED</p><h1>Horizon Scanner</h1></div><span id="secureBadge" class="badge">Checking browser…</span></header>
-  <section class="panel intro">
-    <p>Stand at the telescope position and hold the phone upright near the telescope’s optical height. The cyan line should automatically follow the highest visible obstruction. Slowly rotate through a full circle.</p>
-    <div class="button-row"><button id="startButton" class="primary">Start camera</button><button id="scanButton" class="primary" disabled>Begin automatic scan</button><button id="demoButton" class="secondary">Load demo</button></div>
-  </section>
-  <section class="capture-layout">
-    <div class="camera-card">
-      <div id="cameraStage" class="camera-stage"><video id="video" playsinline muted></video><canvas id="traceCanvas"></canvas><div class="reticle" aria-hidden="true"><span></span><span></span></div><div id="cameraMessage" class="camera-message">Camera not started</div><div id="scanPill" class="scan-pill">NOT SCANNING</div></div>
-      <div class="sensor-grid"><div><span>Direction</span><strong id="headingValue">—</strong></div><div><span>Camera altitude</span><strong id="altitudeValue">—</strong></div><div><span>Skyline confidence</span><strong id="confidenceValue">—</strong></div><div><span>Frames accepted</span><strong id="framesValue">0</strong></div></div>
-      <div class="controls">
-        <label>Approx. horizontal camera FOV<input id="fovInput" type="range" min="45" max="90" step="0.5" value="66.5" /></label>
-        <label>Detection sensitivity<input id="sensitivityInput" type="range" min="0" max="100" step="1" value="48" /></label>
-        <p id="liveAdvice" class="live-advice">Start the camera. A cyan detected skyline should appear automatically.</p>
-        <details class="manual-fallback"><summary>Manual correction fallback</summary><p>Only use this when the cyan line is wrong. Drag a replacement line over the camera, then add it once.</p><div class="button-row"><button id="clearTraceButton" class="secondary">Clear manual line</button><button id="captureFrameButton" class="secondary" disabled>Add manual frame</button></div></details>
-      </div>
+
+<header class="bar">
+  <div class="bar-id">
+    <span class="mark" aria-hidden="true"></span>
+    <div>
+      <p class="kicker">ONSTEP ADVANCED</p>
+      <h1>Horizon Survey</h1>
     </div>
-    <aside class="panel instructions"><h2>Automatic scan</h2><ol><li>Start the camera and confirm the cyan line follows the roof, trees, or ridge.</li><li>Tap <strong>Begin automatic scan</strong>.</li><li>Rotate slowly in place. The page records frames automatically as direction changes.</li><li>If the obstruction fills the whole image, tilt upward until some sky is visible.</li></ol><p class="note">The compass establishes a provisional direction only. The finished profile can later be rotated against an OnStep azimuth reading.</p></aside>
-  </section>
-  <section class="panel profile-panel"><div class="section-heading"><div><p class="eyebrow">360° PROFILE</p><h2>Practical horizon</h2></div><div class="coverage"><span id="coverageValue">0%</span> covered</div></div><canvas id="profileCanvas" width="1080" height="360"></canvas><p class="chart-help">Automatic results appear here while you rotate. Drag on the chart afterward to fix isolated mistakes.</p></section>
-  <section class="panel export-panel"><div class="form-grid"><label>Site name<input id="siteName" maxlength="23" value="Home — back yard" /></label><label>Latitude<input id="latitude" inputmode="decimal" placeholder="42.000000" /></label><label>Longitude<input id="longitude" inputmode="decimal" placeholder="-72.000000" /></label><label>Azimuth offset<input id="azOffset" type="number" step="0.1" value="0.0" /></label></div><div class="button-row export-actions"><button id="locationButton" class="secondary">Use phone location</button><button id="resetButton" class="secondary">Reset profile</button><button id="exportButton" class="primary">Download .hzn</button></div><p id="statusLine" class="status-line">Camera has not started.</p></section>
-  <section id="debugConsole" class="debug-console" aria-label="Debug console"><details><summary>Debug console <span id="debugCount">0 entries</span></summary><div class="debug-toolbar"><button id="copyDebugButton" class="secondary" type="button">Copy all</button><button id="clearDebugButton" class="secondary" type="button">Clear</button></div><pre id="debugOutput" tabindex="0"></pre></details></section>
+  </div>
+  <div class="bar-state">
+    <span id="phaseChip" class="chip">Idle</span>
+    <span id="contextChip" class="chip quiet">Checking…</span>
+  </div>
+</header>
+
+<main>
+
+<!-- ------------------------------------------------------------- capture -->
+<section class="card stage-card" id="captureCard">
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay" class="overlay"></canvas>
+
+    <div class="directive" id="directive" data-tone="idle">
+      <p class="directive-head" id="directiveHead">Ready to survey</p>
+      <p class="directive-detail" id="directiveDetail">Stand where the telescope sits. Rotate your body around the phone, not the phone around you.</p>
+      <div class="directive-bar"><i id="directiveBar"></i></div>
+    </div>
+
+    <div class="turn-cue" id="turnCue" hidden><span id="turnCueText"></span></div>
+
+    <canvas id="miniRing" class="mini-ring" width="180" height="180"></canvas>
+
+    <div class="stage-blocker" id="stageBlocker">
+      <p id="stageBlockerText">Camera off</p>
+    </div>
+  </div>
+
+  <div class="telemetry" id="telemetry">
+    <div><span>Azimuth</span><strong id="tAz">—</strong></div>
+    <div><span>Elevation</span><strong id="tEl">—</strong></div>
+    <div><span>Roll</span><strong id="tRoll">—</strong></div>
+    <div><span>Turn rate</span><strong id="tRate">—</strong></div>
+    <div><span>Keyframes</span><strong id="tKf">0</strong></div>
+    <div><span>Sky match</span><strong id="tMatch">—</strong></div>
+  </div>
+
+  <div class="actions">
+    <button id="primaryBtn" class="btn primary">Start camera and sensors</button>
+    <button id="secondaryBtn" class="btn" hidden>Pause</button>
+    <button id="abortBtn" class="btn ghost" hidden>Reset survey</button>
+  </div>
+  <p class="hint" id="captureHint">Camera and motion access both need HTTPS. On iOS you will be asked for Motion &amp; Orientation permission.</p>
+</section>
+
+<!-- --------------------------------------------------------------- survey -->
+<section class="card">
+  <div class="card-head">
+    <div>
+      <p class="kicker">COVERAGE</p>
+      <h2>Survey ring</h2>
+    </div>
+    <div class="grade" id="ringGrade">—</div>
+  </div>
+
+  <div class="ring-wrap">
+    <canvas id="ring" class="ring"></canvas>
+  </div>
+
+  <ul class="legend">
+    <li><i class="sw verified"></i>Verified</li>
+    <li><i class="sw weak"></i>Needs more evidence</li>
+    <li><i class="sw thin"></i>Single observation</li>
+    <li><i class="sw manual"></i>Edited or filled</li>
+    <li><i class="sw empty"></i>Not surveyed</li>
+  </ul>
+
+  <dl class="stats" id="stats">
+    <div><dt>Observed</dt><dd id="sObserved">0.0°</dd></div>
+    <div><dt>Verified</dt><dd id="sVerified">0 / 720</dd></div>
+    <div><dt>Median obs.</dt><dd id="sMedian">0</dd></div>
+    <div><dt>Max spread</dt><dd id="sSpread">—</dd></div>
+    <div><dt>Loop error</dt><dd id="sLoop">not measured</dd></div>
+    <div><dt>Focal length</dt><dd id="sFocal">default</dd></div>
+  </dl>
+</section>
+
+<!-- -------------------------------------------------------------- profile -->
+<section class="card">
+  <div class="card-head">
+    <div>
+      <p class="kicker">360° PROFILE</p>
+      <h2>Practical horizon</h2>
+    </div>
+    <label class="zoom">Top of scale
+      <select id="maxAltSelect">
+        <option value="30">30°</option>
+        <option value="45">45°</option>
+        <option value="60" selected>60°</option>
+        <option value="90">90°</option>
+      </select>
+    </label>
+  </div>
+
+  <canvas id="profile" class="profile"></canvas>
+
+  <div class="row">
+    <label class="toggle"><input type="checkbox" id="editToggle" /> <span>Edit by dragging</span></label>
+    <button id="fillGapsBtn" class="btn small">Fill gaps under 3°</button>
+    <button id="recomputeBtn" class="btn small">Recompute from keyframes</button>
+  </div>
+  <p class="hint">Editing marks the affected bins as manual. Manual bins never count as verified and are recorded in the archive.</p>
+</section>
+
+<!-- --------------------------------------------------------------- report -->
+<section class="card">
+  <div class="card-head">
+    <div>
+      <p class="kicker">ACCEPTANCE</p>
+      <h2>Survey report</h2>
+    </div>
+    <button id="copyReportBtn" class="btn small">Copy</button>
+  </div>
+  <ul class="checks" id="checks"></ul>
+  <pre class="report" id="reportText">Run a survey to generate a report.</pre>
+</section>
+
+<!-- --------------------------------------------------------------- export -->
+<section class="card">
+  <div class="card-head">
+    <div>
+      <p class="kicker">OUTPUT</p>
+      <h2>Export</h2>
+    </div>
+  </div>
+
+  <div class="fields">
+    <label class="wide">Site name<input id="siteName" maxlength="23" value="Home — back yard" /></label>
+    <label>Latitude<input id="latitude" inputmode="decimal" placeholder="42.0000000" /></label>
+    <label>Longitude<input id="longitude" inputmode="decimal" placeholder="-72.0000000" /></label>
+    <label>Elevation (m)<input id="elevation" inputmode="decimal" placeholder="0" /></label>
+    <label>Azimuth offset<input id="azOffset" type="number" step="0.1" value="0.0" /></label>
+  </div>
+
+  <div class="row">
+    <button id="locationBtn" class="btn small">Use phone location</button>
+    <label class="toggle"><input type="checkbox" id="embedThumbs" /> <span>Embed keyframe images in archive</span></label>
+  </div>
+
+  <div class="row export-row">
+    <button id="exportHznBtn" class="btn primary">Download .hzn</button>
+    <button id="exportHzn2Btn" class="btn">Download .hzn2</button>
+    <button id="exportProjectBtn" class="btn">Save .horizon-project</button>
+  </div>
+
+  <label class="toggle danger"><input type="checkbox" id="forceExport" /> <span>Export unverified profile</span></label>
+  <p class="hint" id="exportHint">The controller format cannot represent a missing sample, so an incomplete survey would silently become a 0° horizon. Finish the survey or tick the override.</p>
+</section>
+
+<!-- ------------------------------------------------------------- sessions -->
+<section class="card">
+  <div class="card-head">
+    <div>
+      <p class="kicker">ARCHIVE</p>
+      <h2>Sessions</h2>
+    </div>
+    <button id="refreshSessionsBtn" class="btn small">Refresh</button>
+  </div>
+  <div class="row">
+    <button id="saveSessionBtn" class="btn small">Save to this device</button>
+    <label class="file-btn btn small">Open project<input type="file" id="openProjectInput" accept=".horizon-project,.json,application/json" hidden /></label>
+  </div>
+  <ul class="sessions" id="sessionList"><li class="muted">No saved sessions.</li></ul>
+  <p class="hint" id="storageHint"></p>
+</section>
+
+<!-- ------------------------------------------------------------- advanced -->
+<section class="card">
+  <details>
+    <summary><span class="kicker">ADVANCED</span> Capture geometry and thresholds</summary>
+
+    <label class="slider">Capture mode
+      <select id="modeSelect">
+        <option value="handheld" selected>Handheld — pivot around the phone</option>
+        <option value="tripod">Tripod / mount — fixed optical centre</option>
+      </select>
+    </label>
+    <p class="hint" id="modeHint">Tripod mode holds the optical centre still, so there is no parallax on nearby structures. It tightens the roll, rate, and overlap gates to match. Choose it before starting the survey.</p>
+
+    <label class="slider">Horizontal field of view <output id="fovOut">66.0°</output>
+      <input type="range" id="fovRange" min="40" max="100" step="0.5" value="66" />
+    </label>
+    <p class="hint">This is only a starting value. Once the scan produces enough motion, the app measures the focal length from the imagery itself and replaces it.</p>
+
+    <label class="slider">Frame rotation
+      <select id="rotSelect">
+        <option value="auto" selected>Auto-detect</option>
+        <option value="0">0°</option>
+        <option value="90">90°</option>
+        <option value="180">180°</option>
+        <option value="270">270°</option>
+      </select>
+    </label>
+    <p class="hint">If the detected skyline overlay is sideways relative to the live view, set this manually.</p>
+
+    <div class="fields">
+      <label>Min observations<input type="number" id="ruleObs" min="1" max="40" step="1" /></label>
+      <label>Min passes<input type="number" id="rulePasses" min="1" max="5" step="1" /></label>
+      <label>Max spread (°)<input type="number" id="ruleSpread" min="0.2" max="10" step="0.1" /></label>
+      <label>Min confidence<input type="number" id="ruleConf" min="0.05" max="0.95" step="0.01" /></label>
+    </div>
+    <button id="applyRulesBtn" class="btn small">Apply acceptance rules</button>
+
+    <div class="row">
+      <button id="selfTestBtn" class="btn small">Run projection self-test</button>
+    </div>
+  </details>
+</section>
+
+<!-- ---------------------------------------------------------------- debug -->
+<section class="card debug">
+  <details>
+    <summary><span class="kicker">DIAGNOSTICS</span> Field log <span class="count" id="logCount">0</span></summary>
+    <div class="row">
+      <button id="copyLogBtn" class="btn small">Copy log</button>
+      <button id="clearLogBtn" class="btn small">Clear</button>
+    </div>
+    <pre id="logOutput" tabindex="0"></pre>
+  </details>
+</section>
+
+<footer class="foot">
+  <p>Runs entirely on the device. No imagery leaves the phone.</p>
+</footer>
+
 </main>
-<script src="app.js" defer></script>
-</body></html>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
