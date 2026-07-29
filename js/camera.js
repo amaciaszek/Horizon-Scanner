@@ -173,10 +173,12 @@ export class CameraSource {
     const caps = track.getCapabilities();
     const advanced = [];
     if (caps.zoom && caps.zoom.min <= 1 && caps.zoom.max >= 1) advanced.push({ zoom: 1 });
-    if (Array.isArray(caps.focusMode) && caps.focusMode.includes('manual') && caps.focusDistance) {
-      // Largest focus distance the lens offers is its infinity stop.
-      advanced.push({ focusMode: 'manual', focusDistance: caps.focusDistance.max });
-    } else if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
+    // Deliberately NOT forcing manual focus to the infinity stop. Asking for
+    // the lens that focuses furthest is very likely what made the Pixel hand
+    // over its ultra-wide in the 2026-07-29 run — a 106 degree field where the
+    // app expected 66, which halved every logged rotation. Continuous focus
+    // leaves the lens choice alone.
+    if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
       advanced.push({ focusMode: 'continuous' });
     }
     if (!advanced.length) return;

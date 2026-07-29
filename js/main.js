@@ -31,6 +31,9 @@ const state = {
   frameCount: 0,
   prevGyroYaw: null,
   trackingLost: false,
+  visualScale: null,
+  warnedVisualOnly: false,
+  announcedSource: false,
   calFirstTry: 0,
   calGaveUp: false,
   running: false,
@@ -174,28 +177,57 @@ async function processFrame() {
         log('warn', `Lens changed mid-scan: field of view ${oldFov.toFixed(1)}° -> ${camera.hfovDeg.toFixed(1)}° (focal ratio ${lensChange.ratio.toFixed(2)}). Frames already captured keep their own geometry; new frames use the new lens.`);
       }
 
-      if (state.visualSign !== null && r.quality > 0.45 && Math.abs(dVis) < 25) {
-        dFused = gyroTrusted ? 0.75 * dVis + 0.25 * dGyro : dVis;
-        if (gyroTrusted && Math.abs(dVis - dGyro) > Math.max(3, Math.abs(dGyro) * 0.5)) {
-          log('warn', `Rotation disagreement: visual ${dVis.toFixed(2)}° vs inertial ${dGyro.toFixed(2)}°. Visual accepted.`);
-        }
-      } else if (gyroTrusted) {
+      // ---- ROTATION SOURCE PRIORITY -----------------------------------
+      // The gyroscope is metrically correct: it reports real degrees per second
+      // with only a slow bias, and no unknown scale factor. Visual registration
+      // measures pixels, and converting pixels to degrees needs the focal
+      // length — which is exactly the quantity nobody knows at the start. Using
+      // visual as the primary source therefore multiplies every azimuth by an
+      // unknown constant: a full physical circle logged as 176 degrees.
+      //
+      // So the gyroscope leads, and vision does the two jobs it is actually
+      // better at: measuring the focal length (pixel shift against a known
+      // rotation) and holding the gyro's slow bias in check.
+      if (!state.announcedSource) {
+        state.announcedSource = true;
+        log('info', gyroTrusted
+          ? `Rotation source: ${orientation.gyroAvailable ? 'gyroscope (devicemotion)' : 'orientation stream'}. Azimuth is metric — the field of view no longer scales it.`
+          : 'Rotation source: visual registration only. Azimuth is scaled by the field-of-view estimate.');
+      }
+      if (gyroTrusted) {
+        // The gyroscope sets the magnitude, full stop. Blending in even 15% of
+        // a pixel-derived angle reintroduces the focal-length scale error it
+        // was the whole point of avoiding: with the field of view overstated at
+        // 107 degrees, a 15% visual term still stretched a lap to 455 degrees.
+        // Vision gets a veto, not a vote.
         dFused = dGyro;
+        if (state.visualSign !== null && r.quality > 0.6 && Math.abs(dGyro) > 0.5) {
+          const ratio = dVis / dGyro;
+          if (ratio > 0.2 && ratio < 5) {
+            state.visualScale = state.visualScale === null
+              ? ratio : 0.98 * state.visualScale + 0.02 * ratio;
+          }
+          // Opposed signs on a confident match means one of them is wrong;
+          // trust neither for this frame rather than averaging them.
+          if (dVis * dGyro < 0 && Math.abs(dVis) > 1) dFused = 0;
+        }
+      } else if (state.visualSign !== null && r.quality > 0.25 && Math.abs(dVis) < 25) {
+        // No usable gyroscope. Vision alone, and the scale is only as good as
+        // the focal length, so say so once rather than pretending otherwise.
+        dFused = dVis;
+        if (!state.warnedVisualOnly) {
+          state.warnedVisualOnly = true;
+          log('warn', 'No gyroscope available — azimuth is being scaled by the field-of-view estimate, so a wrong field of view becomes a wrong azimuth. Run the pre-flight sweep before trusting the result.');
+        }
+      } else if (state.visualSign !== null && Math.abs(dVis) < 25) {
+        // Weak but not absent. Advancing on a poor match is far better than
+        // discarding real rotation: dropping frames is what turned a physical
+        // 360 degree lap into a logged 176.
+        dFused = dVis;
       } else {
-        // Visual registration failed and there is no inertial source worth
-        // integrating. Advancing azimuth on a condemned magnetometer is how a
-        // survey ends up with 360 degrees of "coverage" assembled from a random
-        // walk: every bin filled, none of them pointing where it claims.
-        // Stop accumulating and say so.
         dFused = 0;
         state.trackingLost = true;
       }
-    } else if (gyroTrusted) {
-      dFused = dGyro;
-    } else {
-      dFused = 0;
-      state.trackingLost = true;
-    }
     state.prevRawYaw = rawYaw;
     state.fusedYaw += dFused;
     if (director.phase === PHASE.PASS1) director.notePass1Travel(dFused);
@@ -380,6 +412,11 @@ function finishCalibration() {
   }
   pipeline.resetRegistration();
   director.beginPass1(currentHeading());
+  setTimeout(() => {
+    if (!orientation.gyroAvailable) {
+      log('warn', `No gyroscope after ${orientation.gyroSamples} devicemotion sample(s). Azimuth will be scaled by the field-of-view estimate, so complete a full lap and let loop closure calibrate the scale — that is what makes the result usable without a gyro.`);
+    }
+  }, 4000);
   log('info', `Pass 1 started at azimuth ${currentHeading().toFixed(1)}°.`);
   syncControls();
 }
@@ -414,7 +451,7 @@ async function finishPass1() {
   syncControls();
   await new Promise(r => setTimeout(r, 30));
 
-  const accumulated = director.pass1Travel;
+  let accumulated = director.pass1Travel;
   let residual = null;
   const luma = camera.grabLuma();
   if (luma && state.targetLuma) {
@@ -425,6 +462,27 @@ async function finishPass1() {
       log('info', `Loop closure match quality ${match.quality.toFixed(2)}, residual offset ${residual.toFixed(2)}°.`);
     } else {
       log('warn', 'Loop closure could not match the starting view. Ending azimuth is unverified.');
+    }
+  }
+
+  // Before any additive correction: is the SCALE right? A physical lap is 360
+  // degrees, so a lap logged as 176 is not off by an offset, it is off by a
+  // factor — and no amount of additive closure will fix that. Rescale first,
+  // and take the true field of view out of the same ratio.
+  const laps = Math.max(1, Math.round(Math.abs(accumulated) / 360));
+  const offBy = Math.abs(accumulated) / (360 * laps);
+  if (offBy < 0.8 || offBy > 1.25) {
+    const cal = survey.calibrateScaleFromLoop(accumulated, camera.hfovDeg, laps);
+    if (cal) {
+      log('warn', `A full lap was logged as ${Math.abs(accumulated).toFixed(0)}° instead of ${360 * laps}° — the rotation scale was off by ${cal.scale.toFixed(2)}x. Rescaled.`);
+      log('info', `That ratio measures the optics: true horizontal field of view is ${cal.hfovDeg.toFixed(1)}°, not the ${camera.hfovDeg.toFixed(1)}° assumed. Adopting it.`);
+      camera.setHfov(cal.hfovDeg);
+      camera.focalSource = 'loop closure';
+      $('fovRange').value = camera.hfovDeg.toFixed(1);
+      $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+      accumulated *= cal.scale;
+    } else {
+      log('warn', `A lap was logged as ${Math.abs(accumulated).toFixed(0)}° instead of ${360 * laps}°, which is too far off to correct automatically. Check the lens and field of view.`);
     }
   }
 
@@ -477,6 +535,8 @@ function resetSurvey() {
   state.fusedYaw = 0;
   state.prevRawYaw = null;
   state.prevGyroYaw = null;
+  state.announcedSource = false;
+  state.visualScale = null;
   state.calibFirstTry = 0;
   state.calibGaveUp = false;
   state.visualSign = null;
@@ -620,6 +680,11 @@ function reportText(r) {
   lines.push(`Mean segmentation conf ${(c.meanConfidence * 100).toFixed(1)}%`);
   lines.push(`Visual loop error      ${survey.loopClosed ? survey.loopError.toFixed(2) + '°' : 'not measured'}`);
   lines.push('');
+  const h = orientation.health();
+  lines.push(`Rotation source        ${h.gyro === 'available' ? 'gyroscope (metric)' : 'visual only (scaled by field of view)'}`);
+  if (state.visualScale !== null) {
+    lines.push(`Visual/gyro scale      ${state.visualScale.toFixed(3)} — field of view is ${state.visualScale > 1 ? 'under' : 'over'}stated by ${Math.abs(1 - state.visualScale) * 100 < 200 ? (Math.abs(1 - state.visualScale) * 100).toFixed(0) + '%' : 'a lot'}`);
+  }
   lines.push(`Capture mode           ${director.mode.label}`);
   if (survey.lensChanges.length) {
     lines.push(`Lens changes mid-scan  ${survey.lensChanges.length} (${survey.lensChanges.map(c => c.ratio.toFixed(2) + 'x').join(', ')})`);
@@ -640,6 +705,7 @@ function reportText(r) {
     lines.push('');
   }
   lines.push(`PROFILE QUALITY: ${r.grade}`);
+  if (r.note) lines.push(`  ${r.note}`);
   return lines.join('\n');
 }
 
@@ -655,8 +721,13 @@ function syncControls() {
   if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
   if (p === PHASE.CALIBRATING) { btn.textContent = 'Calibrating…'; btn.disabled = true; return; }
   if (p === PHASE.PASS1) {
-    const enough = Math.abs(director.pass1Travel) >= 340;
-    btn.textContent = enough ? 'Close the loop and plan verification' : `Keep turning — ${Math.abs(director.pass1Travel).toFixed(0)}° of 360°`;
+    const enough = Math.abs(director.pass1Travel) >= 300 || survey.coverage().observedBins >= 700;
+    btn.textContent = enough
+      ? 'Close the loop and plan verification'
+      : `Keep turning — ${Math.abs(director.pass1Travel).toFixed(0)}° of 360° (${survey.coverage().observedBins} of 720 bins seen)`;
+    // Never trap the operator behind a counter. If the ring shows the circle is
+    // covered, the lap happened, whatever the accumulator says.
+    btn.disabled = false;
     btn.disabled = !enough;
     return;
   }

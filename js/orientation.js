@@ -73,6 +73,7 @@ export class OrientationSource {
     this._yawUnwrapped = null;
     this._prevWrapped = 0;
     this.jitterDeg = 0;           // residual sensor scatter, deg
+    this.motionSource = 'orientation';
 
     // Raw gyroscope, from devicemotion. Separate from everything above,
     // because deviceorientationabsolute fuses the magnetometer and is therefore
@@ -230,7 +231,10 @@ export class OrientationSource {
     this.gyroYawRate = -(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]);
     this.gyroYaw += this.gyroYawRate * dt;
     this.gyroSamples++;
-    if (this.gyroSamples > 20) this.gyroAvailable = true;
+    if (this.gyroSamples > 20 && !this.gyroAvailable) {
+      this.gyroAvailable = true;
+      if (this.log) this.log('info', 'Gyroscope live via devicemotion. Azimuth is now metric — a wrong field of view can no longer stretch or shrink the circle.');
+    }
   }
 
   /**
@@ -251,13 +255,22 @@ export class OrientationSource {
    * not their hands.
    */
   _trackMotion(now) {
-    const yaw = this.rawYaw();
     const pitch = this.attitude().elevation;
 
-    // Unwrap into a continuous track so the window can be fitted across 0/360.
-    if (this._yawUnwrapped === null) this._yawUnwrapped = yaw;
-    else this._yawUnwrapped += angDiff(yaw, this._prevWrapped);
-    this._prevWrapped = yaw;
+    // Measure motion with the gyroscope where there is one. Judging stillness
+    // from the magnetometer-fused yaw was reporting jitter of tens of degrees
+    // on a phone that was not moving, and then telling the operator to hold
+    // still — about a signal the survey does not even use for rotation any more.
+    if (this.gyroAvailable) {
+      this._yawUnwrapped = this.gyroYaw;
+      this.motionSource = 'gyroscope';
+    } else {
+      const yaw = this.rawYaw();
+      if (this._yawUnwrapped === null) this._yawUnwrapped = yaw;
+      else this._yawUnwrapped += angDiff(yaw, this._prevWrapped);
+      this._prevWrapped = yaw;
+      this.motionSource = 'orientation';
+    }
 
     this._motion.push({ t: now, y: this._yawUnwrapped, p: pitch });
     while (this._motion.length > 2 && now - this._motion[0].t > MOTION_WINDOW_MS) this._motion.shift();
@@ -345,6 +358,7 @@ export class OrientationSource {
       screenAngle: this.screenAngle,
       jitterDeg: Number(this.jitterDeg.toFixed(2)),
       gyro: this.gyroAvailable ? 'available' : 'absent',
+      motionSource: this.motionSource,
       gyroSamples: this.gyroSamples,
       sampleIntervalMs: Math.round(this.eventDt * 1000)
     };

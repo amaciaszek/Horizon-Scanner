@@ -452,3 +452,68 @@ and ratio of any swaps appear in the report.
 The FOV presets (Pixel main 82°, ultra-wide 107°) are seeds only. The pre-flight
 sweep still measures the real value, and 82° versus the old 66° default is a 24%
 error in every altitude — worth setting even before the sweep runs.
+
+
+### 2026-07-29, 21:27 — a physical lap logged as 176°, and constant "sensor noise"
+
+Four faults, three of them mine and one of them mine twice.
+
+**1. The lens was the ultra-wide, and the app was told 66°.** Invert the ratio:
+176/360 = 0.489, which against an assumed 66° field implies a true field of about
+**106°**. That is not the main camera. The `_lockOptics` call added the day before
+asked for manual focus at the lens's *furthest* focus distance — and the Pixel
+answered with the lens that focuses closest to infinity. My own "reduce the
+chance of a lens swap" change caused a lens swap. It now requests continuous
+focus only and leaves lens choice alone.
+
+**2. My FOV preset button was wrong.** A camera advertised at 82° is quoting the
+**long** sensor axis. Held portrait — which is correct, and what the app assumes —
+the horizontal axis of the frame is the **short** one, about 52°. Neither 66 nor
+82 belonged in that slot. The presets now read 52° and 76° and say which axis
+they mean.
+
+**3. Vision was setting the scale, which it cannot do.** The gyroscope reports
+real degrees per second with no unknown scale. Vision reports *pixels*, and
+pixels become degrees only through the focal length — the one quantity nobody
+knows at the start. Running vision at 75% weight multiplied every azimuth by an
+unknown constant. The gyroscope now sets the magnitude outright and vision gets a
+veto, not a vote: `tests/sim11.mjs` shows a lap holding at exactly 360° across
+assumed fields from 40° to 107°, where the old scheme ranged from 291° to 834°.
+An intermediate version of this fix that blended in 15% of the visual term still
+stretched a lap to 455°, which is why the weight is now zero rather than small.
+
+**4. "Sensor noise" the whole time.** Stillness and jitter were still being
+measured from the magnetometer-fused yaw — a signal the survey had stopped using
+for rotation entirely. It reported ±46° of jitter on a phone standing still and
+then told the operator to hold still about it. Motion is now measured from the
+gyroscope where there is one.
+
+**The speed limit was invented, and it was wrong by most of an order of
+magnitude.** The real constraints are frame-to-frame overlap and motion blur. At
+~10 Hz processing through a 52° field, even 90°/s leaves 83% overlap, and daylight
+exposure of ~1/500 s smears a feature by half a pixel in the 160 px registration
+frame. Neither is remotely threatened at 7°/s. Ideal is now 25°/s — a lap in about
+fifteen seconds — with a hard stop at 70°/s, and the actual gate is measured
+registration quality rather than a number.
+
+**A finished lap is now a result.** Two acceptance checks cannot pass until a
+second pass has been walked, so a complete first lap was being graded
+INSUFFICIENT — telling the operator their work was worthless when it was usable
+and merely unconfirmed. A full circle that passes every structural check now
+grades **PROVISIONAL**. The "close the loop" button also unlocks on bins observed
+as well as on the travel counter, so a covered ring is never trapped behind an
+accumulator.
+
+**And the fix that makes the field of view stop mattering: one physical lap is
+360° by definition.** So a lap logged as 176° is not off by an offset, it is off
+by a *factor* of 2.045 — and since the only thing that scales a visually derived
+rotation is the focal length, that ratio hands back the true focal length for
+free. Loop closure now rescales the survey and adopts the derived field of view,
+recovering 106.1° from exactly the numbers your run produced. Implausible ratios
+are refused rather than baked in.
+
+On the suggestion of laying the phone flat and turning a circle to calibrate: that
+is a sound instinct, and it is what the pre-flight sweep does — but it calibrates
+the *compass*, and the compass no longer sets rotation. With the gyroscope
+leading, the magnetic environment stops mattering for anything except the
+starting azimuth, which the mount supplies anyway.

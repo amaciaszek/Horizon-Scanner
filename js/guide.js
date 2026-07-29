@@ -12,8 +12,24 @@ export const PHASE = {
   COMPLETE: 'complete'
 };
 
-const IDEAL_RATE = 7;      // deg/s
-const MAX_RATE = 14;       // above this, frames blur and overlap collapses
+/*
+ * Speed limits, derived rather than guessed.
+ *
+ * The old 7 deg/s target was invented, and it was wrong by most of an order of
+ * magnitude. Two things actually bind. Frame-to-frame overlap: at ~10 Hz
+ * processing through a 52 deg horizontal field, even 90 deg/s leaves 83% overlap
+ * between consecutive frames. Motion blur: in daylight the exposure is around
+ * 1/500 s, so 90 deg/s smears a feature by about half a pixel in the 160 px
+ * registration frame. Neither is remotely threatened at 7 deg/s, and a limit
+ * that forces a five-minute lap for no measurable benefit is a limit that makes
+ * the tool unusable.
+ *
+ * The honest gate is measured registration quality, which the pipeline already
+ * reports per frame. Rate is only a hint now, and the hard stop sits where
+ * blur genuinely begins to matter.
+ */
+const IDEAL_RATE = 25;     // deg/s — a lap in about 15 s
+const MAX_RATE = 70;       // beyond this, blur starts to cost real precision
 
 /**
  * Capture modes.
@@ -44,8 +60,8 @@ export const MODES = {
   tripod: {
     id: 'tripod',
     label: 'Tripod / mount',
-    idealRate: 4,
-    maxRate: 9,
+    idealRate: 15,
+    maxRate: 45,
     rollLimitCal: 5,
     rollLimitScan: 8,
     minOverlap: 0.45,
@@ -170,7 +186,14 @@ export class ScanDirector {
         const back = Math.max(4, Math.round((M.targetOverlap - ctx.overlap) * ctx.hfovDeg));
         return say('fix', `Return ${back}° counter-clockwise`, 'Insufficient overlap with the last accepted frame.', -back);
       }
-      if (ctx.rotationRate > M.maxRate) return say('fix', 'Slow down', `${ctx.rotationRate.toFixed(0)}°/s is too fast to keep frames sharp. Aim for ${M.idealRate}°/s.`, +1);
+      // Only complain about speed when registration is actually suffering. A
+      // number on its own is not evidence that anything went wrong.
+      if (ctx.rotationRate > M.maxRate) {
+        return say('fix', 'Slow down', `${ctx.rotationRate.toFixed(0)}°/s will start to blur frames. Anything under ${M.idealRate}°/s is comfortable.`, +1);
+      }
+      if (ctx.visualQuality !== null && ctx.visualQuality < 0.35 && ctx.rotationRate > 20) {
+        return say('fix', 'Ease off a little', `Frame matching is struggling at ${ctx.rotationRate.toFixed(0)}°/s. Slow to about ${M.idealRate}°/s until it locks.`, +1);
+      }
       if (ctx.visualQuality != null && ctx.visualQuality < 0.25 && ctx.stillness > 0.7) {
         return say('warn', 'Not enough texture here', 'Tilt down slightly to include more of the skyline edge, or pause while more frames are collected.');
       }

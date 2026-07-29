@@ -1,7 +1,7 @@
 'use strict';
 import {
   clamp, wrap360, angDiff, quatRotate, cameraRay, vecToAzAlt,
-  weightedMedian, mad, screenQuat, quatMul, quatFromAxisAngle, yawQuat, DEG
+  weightedMedian, mad, screenQuat, quatMul, quatFromAxisAngle, yawQuat, DEG, RAD
 } from './math3d.js';
 
 export const BIN_COUNT = 720;
@@ -30,6 +30,7 @@ export class Survey {
     this.loopClosed = false;
     this.focalPx = null;          // self-calibrated horizontal focal length, in working-frame pixels
     this.focalSamples = [];
+    this.scaleCalibration = null;
     this.focalRecent = [];
     this.focalEstablished = null;
     this.lensChanges = [];
@@ -70,6 +71,40 @@ export class Survey {
    * how far each frame is along the accumulated rotation. Same idea as closing
    * a traverse in survey work.
    */
+  /**
+   * Calibrate the optics from the closed loop.
+   *
+   * One physical circuit is 360 degrees by definition. So if the scan logged
+   * 176, the scale is wrong by 360/176 = 2.05 — and since the only thing that
+   * scales a visually derived rotation is the focal length, that ratio hands
+   * back the true focal length directly. This turns the unknown field of view
+   * from something the operator has to look up into something the survey
+   * measures on its own, from the one datum that is exact and free.
+   *
+   * A worked example: the 2026-07-29 run logged 176 degrees for one lap while
+   * assuming 66 degrees of horizontal field. That implies a true field of about
+   * 106 degrees — the ultra-wide, not the main camera, which is what the phone
+   * had actually handed over.
+   *
+   * Returns { scale, hfovDeg } or null if the ratio is implausible.
+   */
+  calibrateScaleFromLoop(measuredDeg, assumedHfovDeg, laps = 1) {
+    if (!measuredDeg) return null;
+    const trueDeg = 360 * laps * Math.sign(measuredDeg);
+    const scale = trueDeg / measuredDeg;
+    // Outside this band the operator did not walk the laps they said they did,
+    // and rescaling would bake a mistake into the profile permanently.
+    if (!(scale > 0.35 && scale < 3.5)) return null;
+
+    for (const kf of this.keyframes) kf.yawBase *= scale;
+    this.scaleCalibration = scale;
+
+    const fAssumed = 0.5 / Math.tan(assumedHfovDeg / 2 * DEG);   // per unit width
+    const fTrue = fAssumed / scale;
+    const hfovDeg = 2 * Math.atan(0.5 / fTrue) * RAD;
+    return { scale, hfovDeg };
+  }
+
   applyLoopClosure(residualDeg) {
     this.loopError = residualDeg;
     const total = this.accumulatedYaw();
@@ -340,11 +375,30 @@ export class Survey {
       { name: 'No unresolved sectors', pass: weak.length === 0, detail: weak.length ? `${weak.length} sector${weak.length > 1 ? 's' : ''}` : 'none' }
     ];
     const passed = checks.filter(c2 => c2.pass).length;
+
+    // A finished single lap is a real result and must not be graded the same as
+    // a scan that fell apart. Two of these checks — every bin verified, and two
+    // passes per bin — cannot pass until a second pass has been walked, so
+    // grading a complete first lap INSUFFICIENT tells the operator their work
+    // was worthless when in fact it is usable and merely unconfirmed.
+    const singlePassChecks = ['Every bin verified', 'Two passes per bin'];
+    const structural = checks.filter(c2 => !singlePassChecks.includes(c2.name));
+    const structuralPassed = structural.filter(c2 => c2.pass).length;
+    const fullCircle = c.observedBins === BIN_COUNT;
+
     let grade = 'INSUFFICIENT';
     if (passed === checks.length) grade = 'EXCELLENT';
     else if (passed >= checks.length - 1) grade = 'GOOD';
+    else if (fullCircle && structuralPassed === structural.length) grade = 'PROVISIONAL';
     else if (passed >= checks.length - 3) grade = 'MARGINAL';
-    return { checks, grade, passed, total: checks.length, coverage: c, weak };
+
+    return {
+      checks, grade, passed, total: checks.length, coverage: c, weak,
+      singlePass: fullCircle && structuralPassed === structural.length,
+      note: grade === 'PROVISIONAL'
+        ? 'One complete lap, every structural check passed. Usable now; walk a second lap to confirm it and reach VERIFIED.'
+        : null
+    };
   }
 
   /* ---------------------------------------------------------------- editing */

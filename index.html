@@ -226,9 +226,10 @@
       <input type="range" id="fovRange" min="40" max="120" step="0.5" value="66" />
     </label>
     <div class="row">
-      <button class="btn small fov-preset" data-fov="82">Pixel main 82°</button>
-      <button class="btn small fov-preset" data-fov="107">Pixel ultra-wide 107°</button>
+      <button class="btn small fov-preset" data-fov="52">Pixel main, portrait 52°</button>
+      <button class="btn small fov-preset" data-fov="76">Pixel ultra-wide, portrait 76°</button>
     </label>
+    <p class="hint"><b>This is the horizontal field of view of the frame as held.</b> Held portrait, that is the phone's <i>short</i> sensor axis — so a camera advertised as 82° spans about 52° across a portrait frame. The advertised number is the long axis and does not belong here. Since the gyroscope now sets azimuth, this value only affects altitudes, not directions.</p>
     <p class="hint">This is only a starting value. Once the scan produces enough motion, the app measures the focal length from the imagery itself and replaces it.</p>
 
     <label class="slider">Frame rotation
