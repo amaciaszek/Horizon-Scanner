@@ -98,11 +98,15 @@ export class OrientationSource {
     // short calibration window; summaries remain available to logs/archives.
     this.stationaryDiagnostic = null;
     this.spinDiagnostic = null;
+    this.flatSpinDiagnostic = null;
+    this.tumbleDiagnostic = null;
     this._stationarySamples = [];
     this._stationaryActive = false;
     this._spinActive = false;
     this._spinStart = null;
     this._spinFlat = [];
+    this._spinTrace = null;
+    this._spinKind = 'flat';
     this.sensorSource = 'none';
     this._genericSensors = [];
 
@@ -280,6 +284,13 @@ export class OrientationSource {
     this.sensorSource = 'legacy-events';
     this.quat = quatNormalize(quatFromEuler(this.alpha || 0, this.beta, this.gamma));
 
+    if (this._spinActive && this._spinTrace && Number.isFinite(e.alpha)) {
+      if (this._spinTrace.lastAlpha !== null) {
+        this._spinTrace.orientationAlphaTravel += angDiff(e.alpha, this._spinTrace.lastAlpha);
+      }
+      this._spinTrace.lastAlpha = e.alpha;
+    }
+
     if (Number.isFinite(e.webkitCompassHeading)) {
       this.hasCompass = true;
       this.compassHeading = e.webkitCompassHeading;
@@ -357,7 +368,10 @@ export class OrientationSource {
     const now = e.timeStamp || performance.now();
     const dt = this._lastMotionAt ? (now - this._lastMotionAt) / 1000 : 0;
     this._lastMotionAt = now;
-    if (!(dt > 0 && dt < 0.5)) return;
+    if (!(dt > 0 && dt < 0.5)) {
+      if (this._spinActive && this._spinTrace) this._spinTrace.rejectedDt++;
+      return;
+    }
 
     // Angular velocity in the device frame, deg/s. Keep the uncorrected values
     // for stationary noise measurement, then remove the measured device-frame
@@ -380,13 +394,29 @@ export class OrientationSource {
     this.gyroYawRate = -(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]) * this.gyroScale;
     this.gyroYaw += this.gyroYawRate * dt;
     this.gyroSamples++;
+    if (this._spinActive && this._spinTrace) {
+      const tr = this._spinTrace;
+      const delta = this.gyroYawRate * dt;
+      tr.acceptedDt++;
+      tr.elapsedIntegratedSec += dt;
+      tr.projectedSignedDeg += delta;
+      tr.projectedAbsoluteDeg += Math.abs(delta);
+      if (delta >= 0) tr.projectedPositiveDeg += delta;
+      else tr.projectedNegativeDeg += delta;
+      for (let i = 0; i < 3; i++) {
+        tr.rawAxisSignedDeg[i] += w[i] * dt;
+        tr.rawAxisAbsoluteDeg[i] += Math.abs(w[i] * dt);
+      }
+      tr.rateMin = Math.min(tr.rateMin, this.gyroYawRate);
+      tr.rateMax = Math.max(tr.rateMax, this.gyroYawRate);
+    }
     if (this._spinActive && gravity) {
       const mag = Math.hypot(...gravity);
       if (mag > 1) this._spinFlat.push(Math.acos(clamp(Math.abs(gravity[2]) / mag, -1, 1)) * RAD);
     }
     if (this.gyroSamples > 20 && !this.gyroAvailable) {
       this.gyroAvailable = true;
-      if (this.log) this.log('info', 'Gyroscope live via devicemotion. Azimuth is now metric — a wrong field of view can no longer stretch or shrink the circle.');
+      if (this.log) this.log('info', 'Gyroscope samples are arriving via devicemotion. Rotation scale and sign are not trusted until the physical 360° test passes.');
     }
   }
 
@@ -447,8 +477,9 @@ export class OrientationSource {
     return this.stationaryDiagnostic;
   }
 
-  beginSpinDiagnostic() {
+  beginSpinDiagnostic(kind = 'flat') {
     this._spinActive = true;
+    this._spinKind = kind;
     this._spinFlat = [];
     this._spinStart = {
       t: performance.now(),
@@ -456,29 +487,54 @@ export class OrientationSource {
       compass: this.compassHeading,
       orientationYaw: this.rawYaw()
     };
+    this._spinTrace = {
+      acceptedDt: 0,
+      rejectedDt: 0,
+      elapsedIntegratedSec: 0,
+      projectedSignedDeg: 0,
+      projectedAbsoluteDeg: 0,
+      projectedPositiveDeg: 0,
+      projectedNegativeDeg: 0,
+      rawAxisSignedDeg: [0, 0, 0],
+      rawAxisAbsoluteDeg: [0, 0, 0],
+      orientationAlphaTravel: 0,
+      lastAlpha: Number.isFinite(this.alpha) ? this.alpha : null,
+      rateMin: Infinity,
+      rateMax: -Infinity
+    };
     this.spinDiagnostic = null;
   }
 
   spinProgress() {
-    return this._spinStart ? this.gyroYaw - this._spinStart.gyroYaw : 0;
+    if (!this._spinStart) return 0;
+    const gyro = Math.abs(this.gyroYaw - this._spinStart.gyroYaw);
+    const orientation = Math.abs(this._spinTrace?.orientationAlphaTravel || 0);
+    const rawAxis = this._spinTrace
+      ? Math.max(...this._spinTrace.rawAxisSignedDeg.map(Math.abs))
+      : 0;
+    return this._spinKind === 'flat'
+      ? Math.max(gyro, orientation, rawAxis)
+      : rawAxis;
   }
 
   finishSpinDiagnostic() {
     this._spinActive = false;
     if (!this._spinStart) return null;
-    const measuredDeg = this.spinProgress();
+    const measuredDeg = this.gyroYaw - this._spinStart.gyroYaw;
     const absMeasured = Math.abs(measuredDeg);
     const proposedScale = absMeasured > 1 ? 360 / absMeasured : null;
     // A modest scale error is plausibly a sensor calibration error. A large
     // one more likely means the pose, axis mapping, or gesture was wrong; log
     // it prominently instead of teaching the survey a dangerous correction.
-    const scaleApplied = Number.isFinite(proposedScale) && proposedScale >= 0.8 && proposedScale <= 1.2;
+    const scaleApplied = this._spinKind === 'flat'
+      && Number.isFinite(proposedScale) && proposedScale >= 0.8 && proposedScale <= 1.2;
     if (scaleApplied) this.gyroScale *= proposedScale;
     const flat = this._spinFlat.length
       ? { mean: this._spinFlat.reduce((a, v) => a + v, 0) / this._spinFlat.length,
           max: Math.max(...this._spinFlat) }
       : { mean: null, max: null };
-    this.spinDiagnostic = {
+    const result = {
+      kind: this._spinKind,
       durationMs: performance.now() - this._spinStart.t,
       measuredDeg,
       direction: measuredDeg >= 0 ? 'clockwise-positive' : 'clockwise-negative',
@@ -490,9 +546,18 @@ export class OrientationSource {
       orientationClosureDeg: angDiff(this.rawYaw(), this._spinStart.orientationYaw),
       flatnessMeanDeg: flat.mean,
       flatnessMaxDeg: flat.max,
-      samples: this._spinFlat.length
+      samples: this._spinFlat.length,
+      trace: this._spinTrace ? {
+        ...this._spinTrace,
+        rateMin: Number.isFinite(this._spinTrace.rateMin) ? this._spinTrace.rateMin : null,
+        rateMax: Number.isFinite(this._spinTrace.rateMax) ? this._spinTrace.rateMax : null
+      } : null
     };
+    this.spinDiagnostic = result;
+    if (this._spinKind === 'flat') this.flatSpinDiagnostic = result;
+    else this.tumbleDiagnostic = result;
     this._spinStart = null;
+    this._spinTrace = null;
     return this.spinDiagnostic;
   }
 
@@ -624,6 +689,8 @@ export class OrientationSource {
       gyroScale: Number(this.gyroScale.toFixed(6)),
       stationaryDiagnostic: this.stationaryDiagnostic,
       spinDiagnostic: this.spinDiagnostic,
+      flatSpinDiagnostic: this.flatSpinDiagnostic,
+      tumbleDiagnostic: this.tumbleDiagnostic,
       sampleIntervalMs: Math.round(this.eventDt * 1000)
     };
   }

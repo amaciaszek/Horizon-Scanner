@@ -380,7 +380,7 @@ function tickCalibration(now) {
       const r = orientation.finishStationaryDiagnostic();
       log('error', 'SENSOR_STATIONARY_FAILED', JSON.stringify(r),
         'No gyroscope samples arrived. Calibration stopped; no zero-sample result was accepted.');
-      state.sensorCal = { stage: 'failed', startedAt: now };
+      state.sensorCal = { stage: 'failed', reason: 'no-samples', startedAt: now };
       state.paused = true;
       director.calibrationProgress = 0;
       syncControls();
@@ -403,7 +403,7 @@ function tickCalibration(now) {
     return;
   }
 
-  if (state.sensorCal.stage === 'spin') {
+  if (state.sensorCal.stage === 'spin' || state.sensorCal.stage === 'tumble') {
     director.calibrationProgress = clamp(Math.abs(orientation.spinProgress()) / 360, 0, 1);
     return;
   }
@@ -477,6 +477,61 @@ function finishSpinDiagnostic() {
     + `compass closure ${Number.isFinite(r.compassClosureDeg) ? r.compassClosureDeg.toFixed(2) + '°' : 'unavailable'}; `
     + `flatness mean/max ${Number.isFinite(r.flatnessMeanDeg) ? r.flatnessMeanDeg.toFixed(2) : '—'}/`
     + `${Number.isFinite(r.flatnessMaxDeg) ? r.flatnessMaxDeg.toFixed(2) : '—'}°.`);
+  if (r.trace) {
+    log('info', 'SENSOR_360_TRACE',
+      `projected signed/absolute/positive/negative ${r.trace.projectedSignedDeg.toFixed(2)}/`
+      + `${r.trace.projectedAbsoluteDeg.toFixed(2)}/${r.trace.projectedPositiveDeg.toFixed(2)}/`
+      + `${r.trace.projectedNegativeDeg.toFixed(2)}°; raw XYZ signed `
+      + `${r.trace.rawAxisSignedDeg.map(v => v.toFixed(2)).join('/') }°; raw XYZ absolute `
+      + `${r.trace.rawAxisAbsoluteDeg.map(v => v.toFixed(2)).join('/') }°; orientation alpha travel `
+      + `${r.trace.orientationAlphaTravel.toFixed(2)}°; dt accepted/rejected `
+      + `${r.trace.acceptedDt}/${r.trace.rejectedDt}; rate min/max `
+      + `${r.trace.rateMin?.toFixed(2) ?? '—'}/${r.trace.rateMax?.toFixed(2) ?? '—'}°/s.`);
+  }
+  orientation.beginSpinDiagnostic('tumble');
+  state.sensorCal = { stage: 'tumble', startedAt: performance.now() };
+  director.calibrationProgress = 0;
+  syncControls();
+}
+
+function finishTumbleDiagnostic() {
+  if (state.sensorCal.stage !== 'tumble') return;
+  const r = orientation.finishSpinDiagnostic();
+  if (!r) return;
+  log('info', 'SENSOR_TUMBLE', JSON.stringify(r));
+  if (r.trace) {
+    log('info', 'SENSOR_TUMBLE_TRACE',
+      `raw XYZ signed ${r.trace.rawAxisSignedDeg.map(v => v.toFixed(2)).join('/')}°; `
+      + `raw XYZ absolute ${r.trace.rawAxisAbsoluteDeg.map(v => v.toFixed(2)).join('/')}°; `
+      + `projected signed/absolute ${r.trace.projectedSignedDeg.toFixed(2)}/${r.trace.projectedAbsoluteDeg.toFixed(2)}°; `
+      + `dt accepted/rejected ${r.trace.acceptedDt}/${r.trace.rejectedDt}; `
+      + `rate min/max ${r.trace.rateMin?.toFixed(2) ?? '—'}/${r.trace.rateMax?.toFixed(2) ?? '—'}°/s.`);
+  }
+
+  const flat = orientation.flatSpinDiagnostic;
+  const dominant = result => {
+    const axes = result?.trace?.rawAxisSignedDeg || [0, 0, 0];
+    let index = 0;
+    for (let i = 1; i < axes.length; i++) if (Math.abs(axes[i]) > Math.abs(axes[index])) index = i;
+    return { index, axis: ['x', 'y', 'z'][index], degrees: axes[index] };
+  };
+  const flatAxis = dominant(flat);
+  const tumbleAxis = dominant(r);
+  const flatValid = Math.abs(flatAxis.degrees) >= 270 && Math.abs(flatAxis.degrees) <= 450;
+  const tumbleValid = Math.abs(tumbleAxis.degrees) >= 270 && Math.abs(tumbleAxis.degrees) <= 450;
+  const uniqueAxes = flatAxis.index !== tumbleAxis.index;
+  log(flatValid && tumbleValid && uniqueAxes ? 'info' : 'error', 'SENSOR_AXIS_MAP',
+    JSON.stringify({ flat: flatAxis, tumble: tumbleAxis, uniqueAxes, flatValid, tumbleValid }));
+
+  if (!flatValid || !tumbleValid || !uniqueAxes) {
+    log('error', 'SENSOR_AXIS_TEST_FAILED',
+      'The two physical rotations did not produce two distinct, approximately 360° raw gyro axes. Survey capture is blocked until the browser/device mapping is understood.');
+    state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', startedAt: performance.now() };
+    state.paused = true;
+    director.calibrationProgress = 0;
+    syncControls();
+    return;
+  }
   state.sensorCal = { stage: 'settle', startedAt: performance.now() };
   state.calibStart = performance.now();
   state.calibFirstTry = 0;
@@ -660,14 +715,28 @@ function renderLive() {
       arrow: +1
     };
     $('primaryBtn').textContent = `Finish 360° test — ${travelled.toFixed(0)}°`;
-    $('primaryBtn').disabled = travelled < 270 && orientation.gyroSamples > 20;
+    $('primaryBtn').disabled = travelled < 270 && performance.now() - state.sensorCal.startedAt < 8000;
+  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'tumble') {
+    const travelled = Math.abs(orientation.spinProgress());
+    d = {
+      tone: travelled >= 270 ? 'good' : 'work',
+      headline: 'Rotate end-over-end once',
+      detail: `${travelled.toFixed(0)}° measured. Keep the phone's top edge initially pointing away from you. Turn the screen toward you, continue through screen-down and screen-away, then return to screen-up and press Finish.`,
+      progress: clamp(travelled / 360, 0, 1),
+      arrow: null
+    };
+    $('primaryBtn').textContent = `Finish end-over-end test — ${travelled.toFixed(0)}°`;
+    $('primaryBtn').disabled = travelled < 270 && performance.now() - state.sensorCal.startedAt < 8000;
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'settle') {
     d.detail = 'Now lift the phone into its normal upright scanning position and hold it still. This final step establishes the survey datum.';
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
+    const badLap = state.sensorCal.reason === 'bad-lap' || state.sensorCal.reason === 'bad-axis-map';
     d = {
       tone: 'fix',
-      headline: 'Motion sensors unavailable',
-      detail: 'Chrome returned no orientation or gyroscope samples. Enable Motion sensors for this site in Chrome settings, check Android sensor privacy, then press Reload and retry. No survey data was recorded.',
+      headline: badLap ? '360° sensor test failed' : 'Motion sensors unavailable',
+      detail: badLap
+        ? 'The gyroscope produced samples but did not integrate one physical turn correctly. Survey capture is blocked to prevent a false horizon. Copy the diagnostic log, then reload to retry.'
+        : 'Chrome returned no orientation or gyroscope samples. Enable Motion sensors for this site in Chrome settings, check Android sensor privacy, then press Reload and retry. No survey data was recorded.',
       progress: 0,
       arrow: null
     };
@@ -825,6 +894,11 @@ function syncControls() {
     btn.disabled = orientation.gyroSamples > 20;
     return;
   }
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'tumble') {
+    btn.textContent = 'Finish end-over-end test';
+    btn.disabled = orientation.gyroSamples > 20;
+    return;
+  }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
     btn.textContent = 'Measuring stationary sensors…';
     btn.disabled = true;
@@ -859,6 +933,7 @@ function onPrimary() {
   if (!state.running) return startCapture();
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') return location.reload();
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') return finishSpinDiagnostic();
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'tumble') return finishTumbleDiagnostic();
   if (p === PHASE.PASS1) return finishPass1();
   if (p === PHASE.PASS2) return finishSurvey();
   if (p === PHASE.COMPLETE) return resetSurvey();
