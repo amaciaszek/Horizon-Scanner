@@ -13,9 +13,39 @@ import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
 import { drawRing, drawProfile, drawOverlay } from './render.js';
 import * as store from './storage.js';
 import * as out from './exporters.js';
+import {
+  buildMosaic, skylineTracks, drawPanorama, disagreementByBin,
+  pixelToAzAlt, landmarkResiduals
+} from './panorama.js';
 
 const $ = id => document.getElementById(id);
 const log = (level, ...a) => L.log(level, ...a);
+
+/**
+ * Keep the field-of-view slider and readout in step with the camera.
+ *
+ * The slider is a SENSOR control — the number a spec sheet quotes — while
+ * camera.hfovDeg is the WORKING FRAME's field of view, which is narrower
+ * because the 16:9 stream is centre-cropped into a 4:3 analysis frame. Every
+ * other path (self-calibration, loop closure, the pre-flight sweep) measures
+ * the working frame directly, so those values have to be mapped back up to
+ * sensor terms before they can be shown on the slider.
+ */
+function syncFovReadout() {
+  const i = camera.intrinsics();
+  const cropped = i.cropKnown && i.cropW < 0.995;
+  const sensor = cropped
+    ? 2 * Math.atan(Math.tan(i.hfovDeg / 2 * DEG) / i.cropW) * RAD
+    : i.hfovDeg;
+  const range = $('fovRange');
+  if (range) range.value = clamp(sensor, Number(range.min), Number(range.max)).toFixed(1);
+  const out = $('fovOut');
+  if (out) {
+    out.textContent = cropped
+      ? `${sensor.toFixed(1)}\u00b0 sensor \u2192 ${i.hfovDeg.toFixed(1)}\u00b0 frame`
+      : `${i.hfovDeg.toFixed(1)}\u00b0`;
+  }
+}
 
 /* --------------------------------------------------------------- app state */
 
@@ -58,11 +88,18 @@ const state = {
   maxAlt: 60,
   thumbs: {},
   targetLuma: null,
-  sensorCal: { stage: 'idle', startedAt: 0 }
+  sensorCal: { stage: 'idle', startedAt: 0 },
+  obstructionProbe: {
+    active: false, anchorYaw: null, startedAt: 0, frames: 0,
+    lastCaptureAt: 0, parallax: false
+  }
 };
 
 const PROCESS_INTERVAL_MS = 110;
 const RENDER_INTERVAL_MS = 55;
+const VISUAL_YAW_MAX_ELEVATION = 65;
+const ELEVATION_WARN_DEG = 70;
+const ELEVATION_HARD_LIMIT_DEG = 78;
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -117,6 +154,8 @@ async function processFrame() {
     const rawYaw = orientation.rawYaw();
     const quat = screenQuat(orientation.quat, orientation.screenAngle);
     const t = performance.now();
+    const highElevation = Math.abs(att.elevation) > VISUAL_YAW_MAX_ELEVATION ||
+      state.obstructionProbe.active;
     state.frameCount++;
 
     // Predict the pixel shift from the orientation stream so the visual search
@@ -124,7 +163,7 @@ async function processFrame() {
     // known, because an inverted hint is the one error the matcher cannot undo.
     const dGyroPredict = state.prevRawYaw === null ? 0 : angDiff(rawYaw, state.prevRawYaw);
     let hintX;
-    if (state.visualSign !== null) {
+    if (state.visualSign !== null && !highElevation) {
       const cosElP = Math.max(0.30, Math.cos(att.elevation * DEG));
       hintX = focalLumaPx() * Math.tan(dGyroPredict * cosElP * DEG) * state.visualSign;
     }
@@ -158,7 +197,7 @@ async function processFrame() {
       const dVisMag = Math.atan(r.dx / focalLumaPx()) * RAD / cosEl;
 
       // Learn the sign convention from the data instead of assuming it.
-      if (state.visualSign === null) {
+      if (!highElevation && state.visualSign === null) {
         if (r.quality > 0.5 && Math.abs(dGyro) > 1.2 && Math.abs(dVisMag) > 0.4) {
           state.signSamples.push(Math.sign(dVisMag) === Math.sign(dGyro) ? 1 : -1);
           if (state.signSamples.length >= 9) {
@@ -169,12 +208,13 @@ async function processFrame() {
         }
       }
       const dVis = dVisMag * (state.visualSign ?? -1);
-      const lensChange = survey.addFocalSample(r.dx, dGyro, att.elevation, r.quality);
+      const lensChange = highElevation
+        ? null
+        : survey.addFocalSample(r.dx, dGyro, att.elevation, r.quality);
       if (lensChange) {
         const oldFov = camera.hfovDeg;
         camera.adoptFocal(lensChange.to * (WORK_W / LUMA_W));
-        $('fovRange').value = camera.hfovDeg.toFixed(1);
-        $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+        syncFovReadout();
         log('warn', `Lens changed mid-scan: field of view ${oldFov.toFixed(1)}° -> ${camera.hfovDeg.toFixed(1)}° (focal ratio ${lensChange.ratio.toFixed(2)}). Frames already captured keep their own geometry; new frames use the new lens.`);
       }
 
@@ -202,7 +242,7 @@ async function processFrame() {
         // 107 degrees, a 15% visual term still stretched a lap to 455 degrees.
         // Vision gets a veto, not a vote.
         dFused = dGyro;
-        if (state.visualSign !== null && r.quality > 0.6 && Math.abs(dGyro) > 0.5) {
+        if (!highElevation && state.visualSign !== null && r.quality > 0.6 && Math.abs(dGyro) > 0.5) {
           const ratio = dVis / dGyro;
           if (ratio > 0.2 && ratio < 5) {
             state.visualScale = state.visualScale === null
@@ -212,7 +252,7 @@ async function processFrame() {
           // trust neither for this frame rather than averaging them.
           if (dVis * dGyro < 0 && Math.abs(dVis) > 1) dFused = 0;
         }
-      } else if (state.visualSign !== null && r.quality > 0.25 && Math.abs(dVis) < 25) {
+      } else if (!highElevation && state.visualSign !== null && r.quality > 0.25 && Math.abs(dVis) < 25) {
         // No usable gyroscope. Vision alone, and the scale is only as good as
         // the focal length, so say so once rather than pretending otherwise.
         dFused = dVis;
@@ -220,7 +260,7 @@ async function processFrame() {
           state.warnedVisualOnly = true;
           log('warn', 'No gyroscope available — azimuth is being scaled by the field-of-view estimate, so a wrong field of view becomes a wrong azimuth. Run the pre-flight sweep before trusting the result.');
         }
-      } else if (state.visualSign !== null && Math.abs(dVis) < 25) {
+      } else if (!highElevation && state.visualSign !== null && Math.abs(dVis) < 25) {
         // Weak but not absent. Advancing on a poor match is far better than
         // discarding real rotation: dropping frames is what turned a physical
         // 360 degree lap into a logged 176.
@@ -229,6 +269,25 @@ async function processFrame() {
         dFused = 0;
         state.trackingLost = true;
       }
+
+      // A high-obstruction probe intentionally tilts the view, so the image's
+      // horizontal translation is no longer a trustworthy yaw measurement.
+      // While the phone is supposed to be still, however, a large residual
+      // image shift is useful evidence that the operator translated the phone
+      // and introduced parallax.
+      if (state.obstructionProbe.active && orientation.stillness > 0.65 &&
+          r.quality > 0.45 && Math.abs(dGyro) < 0.5 &&
+          Math.hypot(r.dx, r.dy) > 3.5) {
+        state.obstructionProbe.parallax = true;
+      }
+    } else if (gyroTrusted) {
+      // A blank, blurred, or near-zenith view may give vision nothing useful.
+      // The gyroscope remains a valid metric rotation source, so do not erase
+      // real travel merely because the optional image matcher missed a frame.
+      dFused = dGyro;
+      state.visualQuality = null;
+    } else {
+      state.trackingLost = true;
     }
     state.prevRawYaw = rawYaw;
     state.fusedYaw += dFused;
@@ -257,7 +316,9 @@ async function processFrame() {
       // points the wrong way, and what it draws is a trace of sensor noise in
       // black pixels. Refuse rather than produce a confident-looking wrong line.
       if (state.frameCount % 15 === 0) state.sceneLuma = camera.meanLuma();
-      state.frameStatus = state.trackingLost ? 'trackingLost'
+      state.frameStatus = Math.abs(att.elevation) > ELEVATION_HARD_LIMIT_DEG ? 'tooHigh'
+      : state.obstructionProbe.parallax ? 'parallax'
+      : state.trackingLost ? 'trackingLost'
       : (state.sceneLuma !== null && state.sceneLuma < 26) ? 'tooDark'
         : seg.noSky ? 'noSky'
         : seg.allSky ? 'allSky'
@@ -280,8 +341,7 @@ async function processFrame() {
       const workFocal = survey.focalPx * (WORK_W / LUMA_W);
       if (camera.adoptFocal(workFocal)) {
         log('info', `Focal length self-calibrated: ${workFocal.toFixed(1)} px at ${WORK_W} px wide, giving ${camera.hfovDeg.toFixed(1)}° horizontal FOV.`);
-        $('fovRange').value = camera.hfovDeg.toFixed(1);
-        $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+        syncFovReadout();
       }
     }
 
@@ -297,14 +357,20 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
   if (!seg || seg.error) return;
   if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
   if (state.frameStatus !== 'ok') return;
-  if (Math.abs(att.roll) > 20) return;
-  if (Math.abs(orientation.rotationRate) > 18) return;
+  const probe = state.obstructionProbe;
+  if (!probe.active && Math.abs(att.roll) > 20) return;
+  if (Math.abs(orientation.rotationRate) > (probe.active ? 3 : 18)) return;
 
   const stepDeg = Math.max(4, camera.hfovDeg * 0.35);
   const last = survey.keyframes[survey.keyframes.length - 1];
   let accept = false;
 
-  if (!last) accept = true;
+  if (probe.active) {
+    accept = Math.abs(att.elevation) >= 20 &&
+      Math.abs(att.elevation) <= ELEVATION_WARN_DEG &&
+      orientation.stillness > 0.65 &&
+      (t - probe.lastCaptureAt) > 500;
+  } else if (!last) accept = true;
   else if (director.phase === PHASE.PASS1) {
     accept = Math.abs(angDiff(state.fusedYaw, state.fusedYawAtKeyframe)) >= stepDeg;
   } else {
@@ -316,6 +382,7 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
   if (!accept) return;
 
   const intr = camera.intrinsics();
+  const captureYaw = probe.active ? probe.anchorYaw : state.fusedYaw;
   const kf = survey.addKeyframe({
     t: Date.now(),
     pass: director.phase === PHASE.PASS2 ? 2 : 1,
@@ -328,8 +395,9 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
     quat,
     screenAngle: orientation.screenAngle,
     yawRaw: rawYaw,
-    yawFused: state.fusedYaw,
-    yawBase: angDiff(state.fusedYaw, rawYaw),
+    yawFused: captureYaw,
+    yawBase: angDiff(captureYaw, rawYaw),
+    captureKind: probe.active ? 'obstruction-probe' : 'sweep',
     elevation: att.elevation,
     roll: att.roll,
     compass: orientation.compassHeading,
@@ -341,20 +409,24 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
     flags: Uint8Array.from(seg.flags)
   });
 
-  state.fusedYawAtKeyframe = state.fusedYaw;
+  if (probe.active) {
+    probe.frames++;
+    probe.lastCaptureAt = t;
+  } else {
+    state.fusedYawAtKeyframe = state.fusedYaw;
+  }
   state.lastKeyframeAt = t;
 
   survey._projectKeyframe(kf, camera.intrinsics());
   survey.recompute();
 
-  // Thumbnails are only captured when the archive will embed them, to keep
-  // memory sane across a long survey.
-  if ($('embedThumbs').checked) {
-    camera.grabKeyframeThumb().then(blob => {
-      if (!blob || !state.sessionId) return;
-      store.putKeyframeThumb(state.sessionId, kf.index, blob).catch(() => {});
-    });
-  }
+  // Thumbnails are captured for EVERY keyframe, regardless of the archive
+  // setting. They used to be gated on "Embed keyframe images in archive",
+  // which is a decision about export size — with the result that a survey run
+  // with the box unticked could not be diagnosed afterwards at all. Storage and
+  // export are now separate concerns: this always records, and the checkbox
+  // only decides whether the images travel inside the .horizon-project file.
+  captureThumb(kf);
 
   if (director.phase === PHASE.PASS2) {
     director.refreshTargets();
@@ -403,7 +475,7 @@ function tickCalibration(now) {
     return;
   }
 
-  if (state.sensorCal.stage === 'spin' || state.sensorCal.stage === 'tumble') {
+  if (state.sensorCal.stage === 'spin' || state.sensorCal.stage === 'upright-spin') {
     director.calibrationProgress = clamp(Math.abs(orientation.spinProgress()) / 360, 0, 1);
     return;
   }
@@ -488,19 +560,19 @@ function finishSpinDiagnostic() {
       + `${r.trace.acceptedDt}/${r.trace.rejectedDt}; rate min/max `
       + `${r.trace.rateMin?.toFixed(2) ?? '—'}/${r.trace.rateMax?.toFixed(2) ?? '—'}°/s.`);
   }
-  orientation.beginSpinDiagnostic('tumble');
-  state.sensorCal = { stage: 'tumble', startedAt: performance.now() };
+  orientation.beginSpinDiagnostic('upright');
+  state.sensorCal = { stage: 'upright-spin', startedAt: performance.now() };
   director.calibrationProgress = 0;
   syncControls();
 }
 
-function finishTumbleDiagnostic() {
-  if (state.sensorCal.stage !== 'tumble') return;
+function finishUprightSpinDiagnostic() {
+  if (state.sensorCal.stage !== 'upright-spin') return;
   const r = orientation.finishSpinDiagnostic();
   if (!r) return;
-  log('info', 'SENSOR_TUMBLE', JSON.stringify(r));
+  log('info', 'SENSOR_UPRIGHT_360', JSON.stringify(r));
   if (r.trace) {
-    log('info', 'SENSOR_TUMBLE_TRACE',
+    log('info', 'SENSOR_UPRIGHT_360_TRACE',
       `raw XYZ signed ${r.trace.rawAxisSignedDeg.map(v => v.toFixed(2)).join('/')}°; `
       + `raw XYZ absolute ${r.trace.rawAxisAbsoluteDeg.map(v => v.toFixed(2)).join('/')}°; `
       + `projected signed/absolute ${r.trace.projectedSignedDeg.toFixed(2)}/${r.trace.projectedAbsoluteDeg.toFixed(2)}°; `
@@ -516,16 +588,27 @@ function finishTumbleDiagnostic() {
     return { index, axis: ['x', 'y', 'z'][index], degrees: axes[index] };
   };
   const flatAxis = dominant(flat);
-  const tumbleAxis = dominant(r);
+  const uprightAxis = dominant(r);
   const flatValid = Math.abs(flatAxis.degrees) >= 270 && Math.abs(flatAxis.degrees) <= 450;
-  const tumbleValid = Math.abs(tumbleAxis.degrees) >= 270 && Math.abs(tumbleAxis.degrees) <= 450;
-  const uniqueAxes = flatAxis.index !== tumbleAxis.index;
-  log(flatValid && tumbleValid && uniqueAxes ? 'info' : 'error', 'SENSOR_AXIS_MAP',
-    JSON.stringify({ flat: flatAxis, tumble: tumbleAxis, uniqueAxes, flatValid, tumbleValid }));
+  const uprightRawValid = Math.abs(uprightAxis.degrees) >= 270 && Math.abs(uprightAxis.degrees) <= 450;
+  const uprightProjectedValid = Math.abs(r.measuredDeg) >= 270 && Math.abs(r.measuredDeg) <= 450;
+  const uprightClosureValid = !Number.isFinite(r.orientationClosureDeg) || Math.abs(r.orientationClosureDeg) <= 30;
+  const counterClockwiseSignValid = r.measuredDeg <= -270;
+  const uprightValid = uprightRawValid && uprightProjectedValid && uprightClosureValid && counterClockwiseSignValid;
+  const uniqueAxes = flatAxis.index !== uprightAxis.index;
+  log(uprightValid ? (flatValid && uniqueAxes ? 'info' : 'warn') : 'error', 'SENSOR_AXIS_MAP',
+    JSON.stringify({
+      flat: flatAxis, upright: uprightAxis, uniqueAxes, flatValid,
+      uprightRawValid, uprightProjectedValid, uprightClosureValid, counterClockwiseSignValid, uprightValid
+    }));
 
-  if (!flatValid || !tumbleValid || !uniqueAxes) {
+  // The upright turn is the operational test: it exercises exactly the pose
+  // and world-vertical projection used during a horizon survey. A failed flat
+  // test remains valuable diagnostic evidence, but must not veto a proven-good
+  // upright survey axis.
+  if (!uprightValid) {
     log('error', 'SENSOR_AXIS_TEST_FAILED',
-      'The two physical rotations did not produce two distinct, approximately 360° raw gyro axes. Survey capture is blocked until the browser/device mapping is understood.');
+      'The upright counter-clockwise rotation did not produce about -360° in projected survey yaw, a matching raw-axis turn, and closure near its starting orientation. Survey capture is blocked.');
     state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', startedAt: performance.now() };
     state.paused = true;
     director.calibrationProgress = 0;
@@ -598,8 +681,7 @@ async function finishPass1() {
       log('info', `That ratio measures the optics: true horizontal field of view is ${cal.hfovDeg.toFixed(1)}°, not the ${camera.hfovDeg.toFixed(1)}° assumed. Adopting it.`);
       camera.setHfov(cal.hfovDeg);
       camera.focalSource = 'loop closure';
-      $('fovRange').value = camera.hfovDeg.toFixed(1);
-      $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+      syncFovReadout();
       accumulated *= cal.scale;
     } else {
       log('warn', `A lap was logged as ${Math.abs(accumulated).toFixed(0)}° instead of ${360 * laps}°, which is too far off to correct automatically. Check the lens and field of view.`);
@@ -662,8 +744,14 @@ function resetSurvey() {
   state.visualSign = null;
   state.signSamples = [];
   state.sensorCal = { stage: 'idle', startedAt: 0 };
+  state.obstructionProbe = {
+    active: false, anchorYaw: null, startedAt: 0, frames: 0,
+    lastCaptureAt: 0, parallax: false
+  };
   state.frame = null;
   state.thumbs = {};
+  state.thumbBudget = newThumbBudget();
+  state.pano = { landmarks: [], geomKey: null, stale: false };
   pipeline.resetRegistration();
   if (state.running) {
     director.beginCalibration();
@@ -709,23 +797,23 @@ function renderLive() {
     const travelled = Math.abs(orientation.spinProgress());
     d = {
       tone: travelled >= 270 ? 'good' : 'work',
-      headline: 'Rotate once clockwise',
-      detail: `${travelled.toFixed(0)}° measured. Keep the screen face up and turn the phone on the table until it approximately returns to its starting direction, then press Finish.`,
+      headline: 'Rotate once counter-clockwise',
+      detail: `${travelled.toFixed(0)}° measured. Keep the screen face up and turn the phone counter-clockwise on the table until it approximately returns to its starting direction, then press Finish.`,
       progress: clamp(travelled / 360, 0, 1),
-      arrow: +1
+      arrow: -1
     };
     $('primaryBtn').textContent = `Finish 360° test — ${travelled.toFixed(0)}°`;
     $('primaryBtn').disabled = travelled < 270 && performance.now() - state.sensorCal.startedAt < 8000;
-  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'tumble') {
+  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'upright-spin') {
     const travelled = Math.abs(orientation.spinProgress());
     d = {
       tone: travelled >= 270 ? 'good' : 'work',
-      headline: 'Rotate end-over-end once',
-      detail: `${travelled.toFixed(0)}° measured. Keep the phone's top edge initially pointing away from you. Turn the screen toward you, continue through screen-down and screen-away, then return to screen-up and press Finish.`,
+      headline: 'Sweep upright counter-clockwise',
+      detail: `${travelled.toFixed(0)}° measured. Hold the phone upright as you will during the survey, rotate counter-clockwise through one complete horizon sweep, return to the starting view, then press Finish.`,
       progress: clamp(travelled / 360, 0, 1),
-      arrow: null
+      arrow: -1
     };
-    $('primaryBtn').textContent = `Finish end-over-end test — ${travelled.toFixed(0)}°`;
+    $('primaryBtn').textContent = `Finish upright test — ${travelled.toFixed(0)}°`;
     $('primaryBtn').disabled = travelled < 270 && performance.now() - state.sensorCal.startedAt < 8000;
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'settle') {
     d.detail = 'Now lift the phone into its normal upright scanning position and hold it still. This final step establishes the survey datum.';
@@ -738,6 +826,51 @@ function renderLive() {
         ? 'The gyroscope produced samples but did not integrate one physical turn correctly. Survey capture is blocked to prevent a false horizon. Copy the diagnostic log, then reload to retry.'
         : 'Chrome returned no orientation or gyroscope samples. Enable Motion sensors for this site in Chrome settings, check Android sensor privacy, then press Reload and retry. No survey data was recorded.',
       progress: 0,
+      arrow: null
+    };
+  } else if (state.obstructionProbe.active) {
+    const probe = state.obstructionProbe;
+    const elevation = Math.abs(att.elevation);
+    if (probe.parallax) {
+      d = {
+        tone: 'fix',
+        headline: 'Phone position moved',
+        detail: 'Finish this probe and retry from the original spot. For a nearby roof, even a small sideways movement changes the measured direction.',
+        progress: 0,
+        arrow: null
+      };
+    } else if (elevation > ELEVATION_WARN_DEG) {
+      d = {
+        tone: 'fix',
+        headline: 'Tilt down below 70°',
+        detail: `Currently ${elevation.toFixed(1)}°. Do not point near the zenith; yaw becomes inaccurate there and frames above ${ELEVATION_HARD_LIMIT_DEG}° are rejected.`,
+        progress: clamp(probe.frames / 4, 0, 1),
+        arrow: null
+      };
+    } else if (Math.abs(orientation.rotationRate) > 3 || orientation.stillness < 0.65) {
+      d = {
+        tone: 'work',
+        headline: 'Hold the phone still',
+        detail: 'Keep it in the same physical spot and aim at the roof/sky boundary. Capturing begins automatically once the motion settles.',
+        progress: clamp(probe.frames / 4, 0, 1),
+        arrow: null
+      };
+    } else {
+      d = {
+        tone: probe.frames >= 4 ? 'good' : 'work',
+        headline: probe.frames >= 4 ? 'High obstruction captured' : 'Capturing high obstruction',
+        detail: `${probe.frames} still frame${probe.frames === 1 ? '' : 's'} captured at this azimuth. Press Finish probe, tilt back down, and continue counter-clockwise.`,
+        progress: clamp(probe.frames / 4, 0, 1),
+        arrow: null
+      };
+    }
+  } else if ((director.phase === PHASE.PASS1 || director.phase === PHASE.PASS2) &&
+             Math.abs(att.elevation) > ELEVATION_WARN_DEG) {
+    d = {
+      tone: 'fix',
+      headline: 'Tilt down — use the obstruction probe',
+      detail: `Continuous rotation this high is inaccurate. Tilt below ${ELEVATION_WARN_DEG}°, keep the phone in one spot, then press Capture high obstruction for the nearby roof.`,
+      progress: d.progress,
       arrow: null
     };
   }
@@ -860,6 +993,9 @@ function reportText(r) {
     lines.push(`Lens changes mid-scan  ${survey.lensChanges.length} (${survey.lensChanges.map(c => c.ratio.toFixed(2) + 'x').join(', ')})`);
   }
   lines.push(`Keyframes              ${survey.keyframes.length}`);
+  lines.push(`  normal sweep         ${survey.keyframes.filter(k => k.captureKind !== 'obstruction-probe').length}`);
+  lines.push(`  high obstruction     ${survey.keyframes.filter(k => k.captureKind === 'obstruction-probe').length}`);
+  lines.push('Profile provenance     measured / interpolated / uncertain');
   lines.push(`Field of view          ${camera.hfovDeg.toFixed(2)}° horizontal (${camera.focalSource})`);
   lines.push(`Compass reliability    ${h.compassReliability}${h.compassChecks ? ` (${h.compassRejects}/${h.compassChecks} rejected)` : ''}`);
   lines.push(`Orientation stream     ${h.gyroReliability} at ${h.eventRate} Hz${h.absolute ? ', absolute' : ', relative'}`);
@@ -883,9 +1019,13 @@ function reportText(r) {
 
 function syncControls() {
   const p = director.phase;
-  const btn = $('primaryBtn'), sec = $('secondaryBtn'), abort = $('abortBtn');
+  const btn = $('primaryBtn'), probeBtn = $('probeBtn'), sec = $('secondaryBtn'), abort = $('abortBtn');
   sec.hidden = !state.running;
   abort.hidden = !state.running;
+  probeBtn.hidden = !state.running || (p !== PHASE.PASS1 && p !== PHASE.PASS2);
+  probeBtn.textContent = state.obstructionProbe.active
+    ? `Finish probe (${state.obstructionProbe.frames} frames)`
+    : 'Capture high obstruction';
   sec.textContent = state.paused ? 'Resume' : 'Pause';
 
   if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
@@ -894,8 +1034,8 @@ function syncControls() {
     btn.disabled = orientation.gyroSamples > 20;
     return;
   }
-  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'tumble') {
-    btn.textContent = 'Finish end-over-end test';
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'upright-spin') {
+    btn.textContent = 'Finish upright test';
     btn.disabled = orientation.gyroSamples > 20;
     return;
   }
@@ -933,10 +1073,454 @@ function onPrimary() {
   if (!state.running) return startCapture();
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') return location.reload();
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') return finishSpinDiagnostic();
-  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'tumble') return finishTumbleDiagnostic();
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'upright-spin') return finishUprightSpinDiagnostic();
   if (p === PHASE.PASS1) return finishPass1();
   if (p === PHASE.PASS2) return finishSurvey();
   if (p === PHASE.COMPLETE) return resetSurvey();
+}
+
+function toggleObstructionProbe() {
+  if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
+  const probe = state.obstructionProbe;
+  if (!probe.active) {
+    probe.active = true;
+    probe.anchorYaw = state.fusedYaw;
+    probe.startedAt = performance.now();
+    probe.frames = 0;
+    probe.lastCaptureAt = 0;
+    probe.parallax = false;
+    pipeline.resetRegistration();
+    log('info', 'HIGH_OBSTRUCTION_PROBE started', {
+      anchorYaw: probe.anchorYaw,
+      heading: currentHeading(),
+      recommendedMaxElevationDeg: ELEVATION_WARN_DEG,
+      hardLimitDeg: ELEVATION_HARD_LIMIT_DEG
+    });
+  } else {
+    log(probe.parallax || probe.frames < 2 ? 'warn' : 'info', 'HIGH_OBSTRUCTION_PROBE finished', {
+      anchorYaw: probe.anchorYaw,
+      frames: probe.frames,
+      parallaxRejected: probe.parallax,
+      durationMs: Math.round(performance.now() - probe.startedAt)
+    });
+    probe.active = false;
+    probe.anchorYaw = null;
+    state.fusedYawAtKeyframe = state.fusedYaw;
+    pipeline.resetRegistration();
+  }
+  syncControls();
+}
+
+/* -------------------------------------------------- true-bearing landmarks */
+
+/**
+ * Landmarks tie the survey to the outside world.
+ *
+ * The panorama, the ring and the profile are all rendered from the same azimuth
+ * estimate, so they agree with each other no matter how wrong that estimate is.
+ * A landmark with a bearing taken off a map is an independent datum, and two of
+ * them far apart are enough to separate the two failure modes: a residual that
+ * is the same at both is a datum offset the mount cancels with one number, while
+ * a residual that differs between them is drift, which rotates parts of the
+ * profile relative to others and cannot be corrected by any single value.
+ */
+function panoLandmarkTap(ev) {
+  const pano = state.pano;
+  if (!pano || !pano.layout) return;
+  const canvas = $('pano');
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height) return;
+  // The canvas is scrolled and may be scaled by CSS, so go through its box.
+  const px = (ev.clientX - r.left) * (canvas.width / r.width);
+  const py = (ev.clientY - r.top) * (canvas.height / r.height);
+  const { az, alt } = pixelToAzAlt(px, py, pano.opts, pano.layout.rulerHeight);
+  if (!Number.isFinite(az)) return;
+  pano.landmarks.push({
+    id: `lm${Date.now().toString(36)}`,
+    name: `Landmark ${pano.landmarks.length + 1}`,
+    measuredAz: az, measuredAlt: alt, trueAz: NaN
+  });
+  renderLandmarks();
+  log('info', `Landmark placed at graphed azimuth ${az.toFixed(1)}°, altitude ${alt.toFixed(1)}°. Enter its true bearing to get a residual.`);
+}
+
+function renderLandmarks() {
+  const pano = state.pano;
+  const body = $('lmBody');
+  if (!body) return;
+  const list = pano ? pano.landmarks : [];
+  if (!list.length) {
+    body.innerHTML = '<tr class="lm-empty"><td colspan="6">No landmarks yet. Tap the image above.</td></tr>';
+    $('lmSummary').textContent = 'Add two or more landmarks spread around the circle to separate a datum offset from drift.';
+    return;
+  }
+  const res = landmarkResiduals(list);
+  const byId = new Map(res.rows.map(r => [r.id, r.residual]));
+
+  body.textContent = '';
+  for (const lm of list) {
+    const tr = document.createElement('tr');
+
+    const name = document.createElement('td');
+    name.textContent = lm.name;
+    tr.appendChild(name);
+
+    const maz = document.createElement('td');
+    maz.textContent = `${lm.measuredAz.toFixed(1)}\u00b0`;
+    tr.appendChild(maz);
+
+    const alt = document.createElement('td');
+    alt.textContent = `${lm.measuredAlt.toFixed(1)}\u00b0`;
+    tr.appendChild(alt);
+
+    const trueTd = document.createElement('td');
+    const input = document.createElement('input');
+    input.type = 'number'; input.step = '0.1'; input.min = '0'; input.max = '360';
+    input.placeholder = '—';
+    input.setAttribute('aria-label', `True bearing for ${lm.name}`);
+    if (Number.isFinite(lm.trueAz)) input.value = String(lm.trueAz);
+    input.addEventListener('input', e => {
+      const v = Number(e.target.value);
+      lm.trueAz = e.target.value === '' || !Number.isFinite(v) ? NaN : ((v % 360) + 360) % 360;
+      updateLandmarkSummary();
+      const cell = tr.querySelector('.lm-res');
+      const rr = Number.isFinite(lm.trueAz) ? angDiff(lm.trueAz, lm.measuredAz) : NaN;
+      paintResidual(cell, rr);
+    });
+    trueTd.appendChild(input);
+    tr.appendChild(trueTd);
+
+    const resTd = document.createElement('td');
+    resTd.className = 'lm-res';
+    paintResidual(resTd, byId.has(lm.id) ? byId.get(lm.id) : NaN);
+    tr.appendChild(resTd);
+
+    const delTd = document.createElement('td');
+    const del = document.createElement('button');
+    del.className = 'lm-del'; del.textContent = '\u00d7';
+    del.setAttribute('aria-label', `Remove ${lm.name}`);
+    del.addEventListener('click', () => {
+      pano.landmarks = pano.landmarks.filter(x => x.id !== lm.id);
+      renderLandmarks();
+    });
+    delTd.appendChild(del);
+    tr.appendChild(delTd);
+
+    body.appendChild(tr);
+  }
+  updateLandmarkSummary();
+}
+
+function paintResidual(cell, r) {
+  if (!cell) return;
+  if (!Number.isFinite(r)) { cell.textContent = '—'; cell.className = 'lm-res'; return; }
+  const a = Math.abs(r);
+  cell.textContent = `${r >= 0 ? '+' : ''}${r.toFixed(1)}\u00b0`;
+  cell.className = `lm-res ${a < 2 ? 'ok' : a < 6 ? 'warn' : 'bad'}`;
+}
+
+function updateLandmarkSummary() {
+  const pano = state.pano;
+  const el = $('lmSummary');
+  if (!el) return;
+  const res = landmarkResiduals(pano ? pano.landmarks : []);
+  if (!res.n) {
+    el.textContent = 'Enter a true bearing for at least one landmark.';
+    return;
+  }
+  const lines = [];
+  if (pano && pano.stale) {
+    lines.push('STALE — the survey geometry changed after these were placed.');
+    lines.push('Re-tap each landmark; the residuals below describe the old build.');
+    lines.push('');
+  }
+  lines.push(`landmarks with a true bearing   ${res.n}`);
+  lines.push(`mean residual (datum offset)    ${res.mean >= 0 ? '+' : ''}${res.mean.toFixed(2)}\u00b0`);
+  if (res.n < 2) {
+    lines.push('');
+    lines.push('One landmark cannot tell an offset from drift: any single residual');
+    lines.push('is explained equally well by either. Add a second at least 90°');
+    lines.push('away before reading anything into this.');
+    el.textContent = lines.join('\n');
+    return;
+  }
+  lines.push(`residual spread across bearings  ${res.span.toFixed(2)}\u00b0`);
+  if (Number.isFinite(res.robustSpan)) lines.push(`  5th–95th percentile span       ${res.robustSpan.toFixed(2)}\u00b0`);
+  lines.push(`worst outlier                    ${res.worst.name} at true ${res.worst.trueAz.toFixed(1)}\u00b0, residual ${res.worst.residual >= 0 ? '+' : ''}${res.worst.residual.toFixed(2)}\u00b0`);
+  lines.push('');
+  // The spread is the diagnosis; the mean is almost always harmless.
+  if (res.span < 2) {
+    lines.push('The residuals agree across bearings, so this is a datum offset and');
+    lines.push(`not a distortion. Rotating the profile by ${(-res.mean).toFixed(2)}° aligns it with`);
+    lines.push('true north; the mount does exactly that with its azimuth offset,');
+    lines.push('so the geometry underneath is sound.');
+  } else if (res.span < 6) {
+    lines.push('The residuals vary with bearing by more than a datum offset can');
+    lines.push('explain. That is drift or magnetic distortion, and it rotates');
+    lines.push('parts of the profile relative to others, so no single correction');
+    lines.push('fixes it. Loop closure distributes gyro drift — check whether the');
+    lines.push('loop was actually closed before exporting.');
+  } else {
+    lines.push('This much variation across bearings means the azimuth estimate did');
+    lines.push('not track the real rotation. The profile is not usable as a');
+    lines.push('pointing limit regardless of how complete it looks. Suspect, in');
+    lines.push('order: no gyroscope available so azimuth came from the compass,');
+    lines.push('an unclosed loop, or a lens change mid-survey.');
+  }
+  lines.push('');
+  lines.push('by bearing:');
+  for (const r of res.rows) {
+    lines.push(`  true ${r.trueAz.toFixed(1).padStart(6)}°   graphed ${r.measuredAz.toFixed(1).padStart(6)}°   ${(r.residual >= 0 ? '+' : '') + r.residual.toFixed(2)}°`);
+  }
+  el.textContent = lines.join('\n');
+}
+
+/* --------------------------------------------------- keyframe thumbnails */
+
+/** Fresh keyframe-image budget. Reset alongside the survey. */
+function newThumbBudget() {
+  return {
+    stored: 0, bytes: 0, pending: 0,
+    maxFrames: 600, maxBytes: 40e6,
+    warned: false, storeWarned: false
+  };
+}
+
+/**
+ * Store a keyframe image for later diagnosis, under an explicit budget.
+ *
+ * A 640x480 JPEG at quality 0.62 runs 40-60 kB, so a 400-keyframe survey costs
+ * roughly 20 MB — acceptable in IndexedDB, but not unbounded, and a survey that
+ * silently filled the origin's quota would take the profile down with it. The
+ * cap is therefore stated and reported rather than discovered.
+ */
+function captureThumb(kf) {
+  if (!state.sessionId) return;
+  const b = state.thumbBudget || (state.thumbBudget = newThumbBudget());
+  if (b.stored + b.pending >= b.maxFrames || b.bytes >= b.maxBytes) {
+    if (!b.warned) {
+      b.warned = true;
+      log('warn', `Keyframe image budget reached at ${b.stored} frames / ${(b.bytes / 1e6).toFixed(1)} MB. Later keyframes keep their geometry and skyline, but have no picture, so the stitched view is imagery-less past this point.`);
+    }
+    return;
+  }
+  b.pending++;
+  camera.grabKeyframeThumb().then(blob => {
+    b.pending--;
+    if (!blob || !state.sessionId) return;
+    b.stored++; b.bytes += blob.size;
+    store.putKeyframeThumb(state.sessionId, kf.index, blob).catch(e => {
+      b.stored--; b.bytes -= blob.size;
+      if (!b.storeWarned) {
+        b.storeWarned = true;
+        log('warn', `Could not store a keyframe image: ${e && e.message || e}. The survey continues; the stitched view will be incomplete.`);
+      }
+    });
+  }).catch(() => { b.pending--; });
+}
+
+/* ------------------------------------------------------ diagnostic panorama */
+
+let panoBuilt = false;
+
+/**
+ * Decode the stored keyframe JPEGs into raw pixel buffers, aligned to the
+ * survey's keyframe array by index. Missing thumbnails become nulls; the
+ * mosaic degrades to geometry-only rather than refusing to draw, because the
+ * skyline tracks and their disagreement are the diagnostic and the imagery is
+ * only what makes it legible.
+ */
+async function loadKeyframeSources(keyframes) {
+  if (!state.sessionId) return { sources: [], found: 0 };
+  let records = [];
+  try {
+    records = await store.getKeyframeThumbs(state.sessionId);
+  } catch (e) {
+    log('warn', `Could not read keyframe thumbnails: ${e && e.message || e}`);
+    return { sources: [], found: 0 };
+  }
+  const byIndex = new Map(records.map(r => [r.index, r.blob]));
+  const scratch = document.createElement('canvas');
+  const sctx = scratch.getContext('2d', { willReadFrequently: true });
+  const sources = [];
+  let found = 0;
+  for (const kf of keyframes) {
+    const blob = byIndex.get(kf.index);
+    if (!blob) { sources.push(null); continue; }
+    try {
+      const bmp = await createImageBitmap(blob);
+      scratch.width = bmp.width; scratch.height = bmp.height;
+      sctx.drawImage(bmp, 0, 0);
+      const d = sctx.getImageData(0, 0, bmp.width, bmp.height);
+      sources.push({ w: bmp.width, h: bmp.height, data: d.data });
+      if (bmp.close) bmp.close();
+      found++;
+    } catch {
+      sources.push(null);
+    }
+  }
+  return { sources, found };
+}
+
+async function buildPanorama() {
+  const btn = $('panoBtn');
+  const status = $('panoStatus');
+  const kfs = survey.keyframes;
+  if (!kfs.length) {
+    status.textContent = 'No keyframes yet. Run a survey, or load a session, then build.';
+    return;
+  }
+  const label = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Building…';
+  status.textContent = `Reprojecting ${kfs.length} keyframes…`;
+  // Yield so the button state paints before the synchronous mosaic pass.
+  await new Promise(r => requestAnimationFrame(() => r()));
+
+  try {
+    const wantImagery = $('panoImagery').checked;
+    const { sources, found } = wantImagery
+      ? await loadKeyframeSources(kfs)
+      : { sources: [], found: 0 };
+
+    const pxPerDeg = Number($('panoScale').value) || 6;
+    const maxAlt = Number($('maxAltSelect').value) || 60;
+    const opts = { pxPerDeg, altMin: -10, altMax: Math.min(89, maxAlt + 2), azStart: 0 };
+
+    const t0 = performance.now();
+    const mosaic = buildMosaic({
+      keyframes: kfs, sources, yawDatum: survey.yawDatum || 0, ...opts
+    });
+    const tracks = skylineTracks(kfs, survey.yawDatum || 0, opts);
+    const dis = disagreementByBin(kfs, survey.yawDatum || 0);
+    const ms = performance.now() - t0;
+
+    const ctx = $('pano').getContext('2d');
+    const layout = drawPanorama(ctx, mosaic, tracks, survey.bins, {});
+    state.pano = state.pano || { landmarks: [], geomKey: null };
+    // A landmark's graphed azimuth was read off a particular rendering. If the
+    // focal length or the yaw datum has moved since — loop closure, a lens
+    // change, a fresh self-calibration — the physical object now sits at a
+    // different azimuth and the stored number is stale. Detect that rather than
+    // letting a quietly-wrong residual drive a conclusion.
+    const geomKey = [
+      (survey.yawDatum || 0).toFixed(4),
+      kfs.length,
+      (kfs[0] && kfs[0].tanHalfH || 0).toFixed(5),
+      (kfs[kfs.length - 1] && kfs[kfs.length - 1].tanHalfH || 0).toFixed(5)
+    ].join('|');
+    if (state.pano.landmarks.length && state.pano.geomKey && state.pano.geomKey !== geomKey) {
+      state.pano.stale = true;
+      log('warn', `The survey geometry changed since these ${state.pano.landmarks.length} landmarks were placed, so their graphed azimuths no longer describe the same objects. Re-tap them before trusting the residuals.`);
+    }
+    state.pano.geomKey = geomKey;
+    state.pano.opts = opts;
+    state.pano.layout = layout;
+    renderLandmarks();
+    panoBuilt = true;
+    $('panoSaveBtn').disabled = false;
+
+    const coverage = mosaic.painted / (mosaic.width * mosaic.height) * 100;
+    status.textContent = found
+      ? `${kfs.length} keyframes, ${found} with imagery, ${coverage.toFixed(0)}% of the sky panel painted, ${ms.toFixed(0)} ms.`
+      : `${kfs.length} keyframes, geometry only — no stored photos for this session. Tick "Embed thumbnails" before the next survey to get imagery here.`;
+
+    $('panoFindings').textContent = panoramaFindings(dis, mosaic, found, kfs);
+    log('info', `Diagnostic panorama built: ${kfs.length} keyframes, imagery for ${found}, ${coverage.toFixed(1)}% painted, ${ms.toFixed(0)} ms.`);
+  } catch (e) {
+    status.textContent = `Could not build the panorama: ${e && e.message || e}`;
+    log('error', 'Panorama build failed', { error: String(e && e.stack || e) });
+  } finally {
+    btn.disabled = false; btn.textContent = label;
+  }
+}
+
+/**
+ * Turn the mosaic into numbers. The picture localises a fault; these lines say
+ * which fault it is, and they are deliberately stated as measurements with
+ * their own caveats rather than as verdicts.
+ */
+function panoramaFindings(dis, mosaic, found, kfs) {
+  const lines = [];
+  const spans = dis.filter(d => d.n >= 2).map(d => d.span).sort((a, b) => a - b);
+  const q = f => spans.length ? spans[Math.min(spans.length - 1, Math.floor(f * (spans.length - 1)))] : NaN;
+  const med = q(0.5), p95 = q(0.95);
+
+  lines.push(`bins with 2+ independent looks   ${spans.length} of ${BIN_COUNT}`);
+  if (spans.length) {
+    lines.push(`inter-frame skyline disagreement median ${med.toFixed(2)}°  p95 ${p95.toFixed(2)}°`);
+    // Calibrated against tests/panorama.test.mjs: correct intrinsics on
+    // synthetic data give ~0.18° median; a 33% focal error gives ~4.3°.
+    if (med > 2.0) {
+      lines.push('');
+      lines.push('That median is far too high for frames looking at the same object.');
+      lines.push('A segmentation mistake moves one frame, not all of them, so a');
+      lines.push('disagreement this broad is geometric: focal length, frame');
+      lines.push('rotation, or rotation scale. Check the field of view first — the');
+      lines.push('16:9 stream is centre-cropped into the 4:3 analysis frame, so the');
+      lines.push('sensor figure is not the frame figure.');
+    } else if (med > 0.6) {
+      lines.push('');
+      lines.push('Mild but real disagreement. Look for steps at frame boundaries in');
+      lines.push('the image above: a step is geometry, a fuzzy band is detection.');
+    }
+  }
+
+  const worst = dis
+    .map((d, i) => ({ az: i * BIN_STEP, ...d }))
+    .filter(d => d.n >= 2)
+    .sort((a, b) => b.span - a.span)
+    .slice(0, 8);
+  if (worst.length && worst[0].span > 1) {
+    lines.push('');
+    lines.push('widest disagreement, by azimuth:');
+    for (const w of worst) {
+      if (w.span < 1) continue;
+      lines.push(`  ${w.az.toFixed(1).padStart(6)}°   ${w.span.toFixed(2).padStart(6)}° across ${String(w.n).padStart(4)} looks   (${w.p5.toFixed(1)}° … ${w.p95.toFixed(1)}°)`);
+    }
+    lines.push('Point the phone at these azimuths and compare what you see against');
+    lines.push('the line drawn above. This is the shortlist worth re-walking.');
+  }
+
+  const gaps = dis.filter(d => d.n === 0).length;
+  if (gaps) lines.push(`\nbins never observed             ${gaps}  (hatched in the image)`);
+  const single = dis.filter(d => d.n === 1).length;
+  if (single) lines.push(`bins seen by one frame only     ${single}  (no cross-check possible)`);
+
+  if (!found) {
+    lines.push('');
+    lines.push('Geometry only — no keyframe photos stored for this session, so the');
+    lines.push('numbers above stand but the picture cannot show you why.');
+  }
+
+  const i = camera.intrinsics();
+  lines.push('');
+  lines.push(`analysis frame FOV  ${i.hfovDeg.toFixed(1)}° × ${i.vfovDeg.toFixed(1)}°   source: ${i.source}`);
+  if (i.cropKnown) {
+    lines.push(`video ${i.videoW}×${i.videoH} → work ${WORK_W}×${WORK_H}, keeping ${(i.cropW * 100).toFixed(1)}% width, ${(i.cropH * 100).toFixed(1)}% height`);
+  } else {
+    lines.push('crop factor unmeasured (camera not running) — FOV may be uncorrected');
+  }
+  const mixed = new Set(kfs.map(k => (k.tanHalfH || 0).toFixed(4)));
+  if (mixed.size > 1) {
+    lines.push(`${mixed.size} distinct focal lengths across keyframes — a lens changed mid-survey; each frame is reprojected with its own.`);
+  }
+  return lines.join('\n');
+}
+
+function savePanorama() {
+  if (!panoBuilt) return;
+  const canvas = $('pano');
+  canvas.toBlob(blob => {
+    if (!blob) { log('warn', 'The browser refused to encode the panorama.'); return; }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const site = (($('siteName') && $('siteName').value) || 'site').trim() || 'site';
+    a.href = url;
+    a.download = `${out.slugify(site)}-panorama.png`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    log('info', 'Diagnostic panorama saved.');
+  }, 'image/png');
 }
 
 /* --------------------------------------------------------- profile editing */
@@ -1002,6 +1586,16 @@ function debugSnapshot() {
       fusedYaw: state.fusedYaw,
       pass1Travel: director.pass1Travel,
       keyframes: survey.keyframes.length,
+      keyframeSources: {
+        sweep: survey.keyframes.filter(k => k.captureKind !== 'obstruction-probe').length,
+        highObstruction: survey.keyframes.filter(k => k.captureKind === 'obstruction-probe').length
+      },
+      obstructionProbe: { ...state.obstructionProbe },
+      elevationPolicyDeg: {
+        visualYawDisabledAbove: VISUAL_YAW_MAX_ELEVATION,
+        warnAbove: ELEVATION_WARN_DEG,
+        rejectAbove: ELEVATION_HARD_LIMIT_DEG
+      },
       coverage: survey.coverage()
     },
     preflight: preflight.result(),
@@ -1101,6 +1695,7 @@ function wire() {
   L.captureConsole();
 
   $('primaryBtn').addEventListener('click', onPrimary);
+  $('probeBtn').addEventListener('click', toggleObstructionProbe);
   $('secondaryBtn').addEventListener('click', () => { state.paused = !state.paused; syncControls(); });
   $('abortBtn').addEventListener('click', resetSurvey);
 
@@ -1188,9 +1783,20 @@ function wire() {
   $('saveSessionBtn').addEventListener('click', saveSession);
   $('refreshSessionsBtn').addEventListener('click', refreshSessions);
 
+  $('panoBtn').addEventListener('click', buildPanorama);
+  $('panoSaveBtn').addEventListener('click', savePanorama);
+  $('pano').addEventListener('click', panoLandmarkTap);
+  $('lmClearBtn').addEventListener('click', () => {
+    if (state.pano) { state.pano.landmarks = []; state.pano.stale = false; }
+    renderLandmarks();
+  });
+
+  // The slider is a SENSOR figure — what the spec sheet says the lens covers.
+  // The working frame is a centre crop of that, so it is converted rather than
+  // used directly; the readout shows both so the difference is never invisible.
   $('fovRange').addEventListener('input', e => {
-    camera.setHfov(Number(e.target.value));
-    $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+    camera.setSensorHfov(Number(e.target.value));
+    syncFovReadout();
   });
   /* ---- lens inventory ------------------------------------------------- */
   async function scanLenses() {
@@ -1275,8 +1881,7 @@ function wire() {
       const workFocal = st.median * (WORK_W / LUMA_W);
       camera.adoptFocal(workFocal);
       survey.establishFocal(st.median);   // arms mid-scan lens-change detection
-      $('fovRange').value = camera.hfovDeg.toFixed(1);
-      $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
+      syncFovReadout();
       $('pfFov').textContent = `${camera.hfovDeg.toFixed(1)}° ±${(st.iqrPct / 2).toFixed(1)}%`;
       log('info', `Field of view measured at ${camera.hfovDeg.toFixed(2)}° from ${st.n} samples, spread ${st.iqrPct.toFixed(1)}%.`);
     } else {
@@ -1293,11 +1898,13 @@ function wire() {
 
   for (const b of document.querySelectorAll('.fov-preset')) {
     b.addEventListener('click', () => {
-      camera.setHfov(Number(b.dataset.fov));
+      const sensorFov = Number(b.dataset.fov);
+      const r = camera.setSensorHfov(sensorFov);
       camera.focalSource = 'preset';
-      $('fovRange').value = camera.hfovDeg.toFixed(1);
-      $('fovOut').textContent = `${camera.hfovDeg.toFixed(1)}°`;
-      log('info', `Field of view seeded to ${camera.hfovDeg}° from a preset. This is still a seed — run the pre-flight sweep to measure it.`);
+      syncFovReadout();
+      log('info', r.crop.known
+        ? `Field of view seeded from a preset: ${sensorFov.toFixed(1)}° across the sensor, which after the ${(r.crop.w * 100).toFixed(1)}% width crop into the ${WORK_W}×${WORK_H} analysis frame is ${camera.hfovDeg.toFixed(1)}°. Still a seed — run the pre-flight sweep to measure it.`
+        : `Field of view seeded to ${sensorFov.toFixed(1)}° from a preset, but the crop factor is unknown until the camera is running, so this is not yet corrected for the 16:9→4:3 crop. Start the camera and re-tap.`);
     });
   }
 

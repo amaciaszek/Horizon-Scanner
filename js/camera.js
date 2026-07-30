@@ -318,8 +318,59 @@ export class CameraSource {
     return true;
   }
 
+  /**
+   * Fraction of the video frame that survives the cover-fit crop into the
+   * working frame, per axis.
+   *
+   * This matters more than it looks. The stream is requested at 1920x1080 —
+   * 16:9 — and _drawRotated scales it to COVER a 4:3 working canvas, so a
+   * quarter of the width is thrown away before anything is measured. Every
+   * angle in this app is derived from the working frame, so the field of view
+   * that belongs in the projection is the working frame's, not the sensor's.
+   * Feeding a sensor spec straight in overstates the horizontal field by
+   * 1/0.75 and — because tanHalfV is derived from tanHalfH — overstates every
+   * altitude by the same 33%.
+   *
+   * Returns { w, h, known }. Exactly one of w/h is 1: the limiting axis.
+   */
+  cropFactor() {
+    const vw = this.video && this.video.videoWidth, vh = this.video && this.video.videoHeight;
+    if (!vw || !vh) return { w: 1, h: 1, known: false };
+    const swapped = this.frameRotation === 90 || this.frameRotation === 270;
+    const srcW = swapped ? vh : vw, srcH = swapped ? vw : vh;
+    const scale = Math.max(WORK_W / srcW, WORK_H / srcH);
+    return {
+      w: clamp((WORK_W / scale) / srcW, 0.05, 1),
+      h: clamp((WORK_H / scale) / srcH, 0.05, 1),
+      known: true
+    };
+  }
+
+  /**
+   * Set the field of view from a SENSOR figure — a spec-sheet number, a preset,
+   * or the FOV slider. Converted to the working frame's field of view before
+   * use. Also record the sensor value so the status panel can show both and the
+   * difference is visible rather than silent.
+   */
+  setSensorHfov(deg) {
+    const sensor = clamp(deg, 30, 160);
+    this.sensorHfovDeg = sensor;
+    const crop = this.cropFactor();
+    const workTan = Math.tan(sensor / 2 * DEG) * crop.w;
+    this.setHfov(2 * Math.atan(workTan) * RAD);
+    this.focalSource = crop.known
+      ? `sensor ${sensor.toFixed(1)}\u00b0 \u00d7 ${crop.w.toFixed(3)} crop`
+      : 'manual (crop unmeasured)';
+    return { workHfovDeg: this.hfovDeg, crop };
+  }
+
+  /**
+   * Set the WORKING-FRAME horizontal field of view directly. This is the value
+   * projection uses. Loop-closure rescaling and adoptFocal both produce
+   * work-frame quantities, so they come through here unmodified.
+   */
   setHfov(deg) {
-    this.hfovDeg = clamp(deg, 35, 120);
+    this.hfovDeg = clamp(deg, 20, 150);
     this.focalPx = (WORK_W / 2) / Math.tan(this.hfovDeg / 2 * DEG);
     this.focalSource = 'manual';
   }
@@ -328,12 +379,18 @@ export class CameraSource {
   intrinsics() {
     const tanHalfH = Math.tan(this.hfovDeg / 2 * DEG);
     const tanHalfV = tanHalfH * (WORK_H / WORK_W);
+    const crop = this.cropFactor();
     return {
       tanHalfH, tanHalfV,
       hfovDeg: this.hfovDeg,
       vfovDeg: 2 * Math.atan(tanHalfV) * RAD,
       focalPx: this.focalPx || (WORK_W / 2) / tanHalfH,
-      source: this.focalSource
+      source: this.focalSource,
+      // Carried into the archive so a stored keyframe can be re-judged later.
+      cropW: crop.w, cropH: crop.h, cropKnown: crop.known,
+      sensorHfovDeg: this.sensorHfovDeg ?? null,
+      videoW: this.video ? this.video.videoWidth : 0,
+      videoH: this.video ? this.video.videoHeight : 0
     };
   }
 }

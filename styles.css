@@ -366,3 +366,45 @@ details[open] > *:not(summary) { margin-top: 14px; }
 .pf-row span { color: var(--muted, #8496a3); letter-spacing: .04em; text-transform: uppercase; font-size: 11px; }
 .pf-row b { font-variant-numeric: tabular-nums; }
 .pf-swing { font-size: 11px; line-height: 1.5; overflow-x: auto; color: var(--muted, #8496a3); }
+
+/* --------------------------------------------------- diagnostic panorama */
+/* The mosaic is 360° wide and never fits a phone screen, so it scrolls
+   horizontally at its native scale rather than being squeezed to fit —
+   a squeezed panorama hides exactly the small vertical steps it exists to
+   reveal. */
+.pano-wrap {
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--chassis);
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  margin-top: var(--gap);
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-x: contain;
+}
+.pano { display: block; height: auto; image-rendering: -webkit-optimize-contrast; }
+.pano:not([width]) { display: none; }
+
+/* ------------------------------------------------ true-bearing landmarks */
+.landmarks { margin-top: var(--gap); border-top: 1px solid var(--rule); padding-top: var(--gap); }
+.lm-table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px;
+            font-variant-numeric: tabular-nums; margin: var(--gap) 0 8px; }
+.lm-table th { text-align: right; font-weight: 500; color: var(--ink-3); font-family: var(--sans);
+               font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase;
+               padding: 0 6px 6px; border-bottom: 1px solid var(--rule); }
+.lm-table th:first-child { text-align: left; }
+.lm-table td { text-align: right; padding: 5px 6px; border-bottom: 1px solid var(--rule); color: var(--ink-2); }
+.lm-table td:first-child { text-align: left; color: var(--ink); }
+.lm-table tr:last-child td { border-bottom: none; }
+.lm-table input { width: 100%; min-width: 62px; background: var(--panel-2); color: var(--ink);
+                  border: 1px solid var(--rule-2); border-radius: 6px; padding: 4px 6px;
+                  font-family: var(--mono); font-size: 12px; text-align: right; }
+.lm-table input:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+.lm-table .lm-res.ok   { color: var(--signal); }
+.lm-table .lm-res.warn { color: var(--amber); }
+.lm-table .lm-res.bad  { color: var(--coral); }
+.lm-table .lm-empty td { text-align: center; color: var(--ink-3); font-family: var(--sans); }
+.lm-del { background: none; border: none; color: var(--ink-3); cursor: pointer; font-size: 16px;
+          line-height: 1; padding: 2px 6px; border-radius: 6px; }
+.lm-del:hover, .lm-del:focus-visible { color: var(--coral); background: var(--panel-2); }
+.pano { cursor: crosshair; }

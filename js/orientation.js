@@ -99,7 +99,7 @@ export class OrientationSource {
     this.stationaryDiagnostic = null;
     this.spinDiagnostic = null;
     this.flatSpinDiagnostic = null;
-    this.tumbleDiagnostic = null;
+    this.uprightSpinDiagnostic = null;
     this._stationarySamples = [];
     this._stationaryActive = false;
     this._spinActive = false;
@@ -555,7 +555,7 @@ export class OrientationSource {
     };
     this.spinDiagnostic = result;
     if (this._spinKind === 'flat') this.flatSpinDiagnostic = result;
-    else this.tumbleDiagnostic = result;
+    else this.uprightSpinDiagnostic = result;
     this._spinStart = null;
     this._spinTrace = null;
     return this.spinDiagnostic;
@@ -690,7 +690,7 @@ export class OrientationSource {
       stationaryDiagnostic: this.stationaryDiagnostic,
       spinDiagnostic: this.spinDiagnostic,
       flatSpinDiagnostic: this.flatSpinDiagnostic,
-      tumbleDiagnostic: this.tumbleDiagnostic,
+      uprightSpinDiagnostic: this.uprightSpinDiagnostic,
       sampleIntervalMs: Math.round(this.eventDt * 1000)
     };
   }

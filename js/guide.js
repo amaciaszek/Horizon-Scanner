@@ -180,11 +180,14 @@ export class ScanDirector {
     if (this.phase === PHASE.PASS1) {
       const blocking = this._frameProblem(ctx);
       if (blocking) return blocking;
+      if (this.pass1Travel > 12) {
+        return say('fix', 'Turn counter-clockwise', 'The survey is accumulating in the clockwise direction. Reverse direction and continue counter-clockwise.', -1);
+      }
       if (Math.abs(ctx.roll) > M.rollLimitScan) return say('fix', 'Level the phone', `Roll ${ctx.roll.toFixed(0)}°. Keep the horizon square in the frame.`);
 
       if (ctx.overlap != null && ctx.overlap < M.minOverlap) {
         const back = Math.max(4, Math.round((M.targetOverlap - ctx.overlap) * ctx.hfovDeg));
-        return say('fix', `Return ${back}° counter-clockwise`, 'Insufficient overlap with the last accepted frame.', -back);
+        return say('fix', `Return ${back}° clockwise`, 'Insufficient overlap with the last accepted frame.', +back);
       }
       // Only complain about speed when registration is actually suffering. A
       // number on its own is not evidence that anything went wrong.
@@ -199,12 +202,12 @@ export class ScanDirector {
       }
       const progress = clamp(Math.abs(this.pass1Travel) / 360, 0, 1);
       if (Math.abs(this.pass1Travel) >= 358) {
-        return say('good', 'Loop nearly closed', 'Keep turning until the view matches where you started.', +1, progress);
+        return say('good', 'Loop nearly closed', 'Keep turning counter-clockwise until the view matches where you started.', -1, progress);
       }
       if (Math.abs(ctx.rotationRate) < 1.5) {
-        return say('work', 'Rotate slowly clockwise', `${Math.abs(this.pass1Travel).toFixed(0)}° of 360° covered.`, +1, progress);
+        return say('work', 'Rotate slowly counter-clockwise', `${Math.abs(this.pass1Travel).toFixed(0)}° of 360° covered.`, -1, progress);
       }
-      return say('good', 'Collecting', `${Math.abs(this.pass1Travel).toFixed(0)}° of 360° covered at ${Math.abs(ctx.rotationRate).toFixed(0)}°/s.`, +1, progress);
+      return say('good', 'Collecting counter-clockwise', `${Math.abs(this.pass1Travel).toFixed(0)}° of 360° covered at ${Math.abs(ctx.rotationRate).toFixed(0)}°/s.`, -1, progress);
     }
 
     if (this.phase === PHASE.ANALYSING) {
@@ -239,6 +242,12 @@ export class ScanDirector {
 
   /** Frame-level problems that make the current view unusable. */
   _frameProblem(ctx) {
+    if (ctx.frameStatus === 'tooHigh') {
+      return { tone: 'fix', headline: 'Tilt down — too close to straight up', detail: 'Measurements above 78° elevation are rejected because yaw becomes unstable near the zenith. Tilt down below 70°, then use the high-obstruction probe while keeping the phone in the same place.', arrow: null, tilt: -1, phase: this.phase };
+    }
+    if (ctx.frameStatus === 'parallax') {
+      return { tone: 'fix', headline: 'Phone position moved', detail: 'Return the phone to the same spot and hold it still. Moving sideways while viewing a nearby roof changes its apparent direction and cannot be corrected as rotation.', arrow: null, tilt: null, phase: this.phase };
+    }
     if (ctx.frameStatus === 'trackingLost') {
       return { tone: 'fix', headline: 'Tracking lost — stop turning', detail: 'Visual registration failed and the inertial sensors cannot be trusted here, so azimuth cannot be advanced. Stop, hold still until the view locks, then turn much more slowly. Nothing is being recorded until it does.', arrow: null, tilt: null, phase: this.phase };
     }

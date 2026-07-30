@@ -236,7 +236,13 @@ export class Survey {
       // Down-weight the outer edge of the frame where lens distortion and the
       // focal estimate are least trustworthy.
       const edgeWeight = 1 - 0.45 * Math.pow(Math.abs(u), 3);
-      this.bins[idx].obs.push({ value: clamp(alt, 0, 90), weight: conf * edgeWeight, frame: kf.index, pass: kf.pass });
+      this.bins[idx].obs.push({
+        value: clamp(alt, 0, 90),
+        weight: conf * edgeWeight,
+        frame: kf.index,
+        pass: kf.pass,
+        source: kf.captureKind || 'sweep'
+      });
       this.bins[idx].passes.add(kf.pass);
     }
   }

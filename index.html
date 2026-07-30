@@ -58,10 +58,11 @@
 
   <div class="actions">
     <button id="primaryBtn" class="btn primary">Start camera and sensors</button>
+    <button id="probeBtn" class="btn" hidden>Capture high obstruction</button>
     <button id="secondaryBtn" class="btn" hidden>Pause</button>
     <button id="abortBtn" class="btn ghost" hidden>Reset survey</button>
   </div>
-  <p class="hint" id="captureHint">Startup checks the sensor axes before scanning: leave the phone untouched screen-up; rotate it once clockwise while flat; then, with its top edge pointing away from you, rotate it end-over-end toward you through screen-down and back to screen-up. Finally lift it upright and hold still.</p>
+  <p class="hint" id="captureHint">Startup checks the sensor axes before scanning: leave the phone untouched screen-up; rotate it once counter-clockwise while flat; then hold it upright and make one complete counter-clockwise horizon sweep. Return to the starting view after each turn.</p>
 </section>
 
 <!-- --------------------------------------------------------------- survey -->
@@ -121,6 +122,48 @@
     <button id="recomputeBtn" class="btn small">Recompute from keyframes</button>
   </div>
   <p class="hint">Editing marks the affected bins as manual. Manual bins never count as verified and are recorded in the archive.</p>
+</section>
+
+<!-- ------------------------------------------------------------- panorama -->
+<section class="card">
+  <div class="card-head">
+    <div>
+      <p class="kicker">DIAGNOSTIC</p>
+      <h2>Stitched view</h2>
+    </div>
+    <button id="panoBtn" class="btn small">Build</button>
+  </div>
+
+  <div class="row">
+    <label class="toggle"><input type="checkbox" id="panoImagery" checked /> <span>Use keyframe photos</span></label>
+    <label class="zoom">Detail
+      <select id="panoScale">
+        <option value="4">4 px/°</option>
+        <option value="6" selected>6 px/°</option>
+        <option value="9">9 px/°</option>
+      </select>
+    </label>
+    <button id="panoSaveBtn" class="btn small" disabled>Save PNG</button>
+  </div>
+
+  <div class="pano-wrap"><canvas id="pano" class="pano"></canvas></div>
+
+  <p class="hint" id="panoStatus">Build this after a survey to see the profile drawn over the imagery it came from. Scroll sideways; the ruler is azimuth.</p>
+
+  <div class="landmarks">
+    <div class="row">
+      <p class="kicker">TRUE BEARING CHECK</p>
+      <button id="lmClearBtn" class="btn small">Clear</button>
+    </div>
+    <p class="hint">Tap a landmark you can identify in the stitched view — a chimney, a pole, a distinct treetop — then type its true bearing taken from a map. Everything else on this page is self-consistent: the imagery is painted at the azimuth the app believes, so an azimuth that is uniformly offset or slowly drifting produces a picture that looks perfectly correct while pointing the wrong way. This is the only check here that reaches outside the survey.</p>
+    <table class="lm-table" id="lmTable">
+      <thead><tr><th>Landmark</th><th>Graphed az</th><th>Alt</th><th>True az</th><th>Residual</th><th></th></tr></thead>
+      <tbody id="lmBody"><tr class="lm-empty"><td colspan="6">No landmarks yet. Tap the image above.</td></tr></tbody>
+    </table>
+    <pre class="report" id="lmSummary">Add two or more landmarks spread around the circle to separate a datum offset from drift.</pre>
+  </div>
+  <pre class="report" id="panoFindings">No panorama built yet.</pre>
+  <p class="hint">Each pixel comes from the one keyframe that saw it closest to its optical axis, not from a blend of several. Blending averages a geometry error into a smooth surface that looks correct; leaving the frames unblended turns the same error into a visible step whose size you can read off the azimuth scale. A thin skyline means the frames agree. A fanned band means they do not.</p>
 </section>
 
 <!-- --------------------------------------------------------------- report -->
@@ -222,13 +265,13 @@
       <p class="hint">This never blocks the survey. A bad compass only rotates the whole profile, and the mount corrects that with one number afterwards.</p>
     </div>
 
-    <label class="slider">Horizontal field of view <output id="fovOut">66.0°</output>
+    <label class="slider">Horizontal field of view, sensor <output id="fovOut">66.0°</output>
       <input type="range" id="fovRange" min="40" max="120" step="0.5" value="66" />
     </label>
     <div class="row">
       <button class="btn small fov-preset" data-fov="52">Pixel main, portrait 52°</button>
       <button class="btn small fov-preset" data-fov="76">Pixel ultra-wide, portrait 76°</button>
-    </label>
+    </div>
     <p class="hint"><b>This is the horizontal field of view of the frame as held.</b> Held portrait, that is the phone's <i>short</i> sensor axis — so a camera advertised as 82° spans about 52° across a portrait frame. The advertised number is the long axis and does not belong here. Since the gyroscope now sets azimuth, this value only affects altitudes, not directions.</p>
     <p class="hint">This is only a starting value. Once the scan produces enough motion, the app measures the focal length from the imagery itself and replaces it.</p>
 
