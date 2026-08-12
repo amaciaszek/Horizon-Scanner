@@ -1,6 +1,7 @@
 import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 const require = createRequire(import.meta.url);
-const ROOT = new URL('../', import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const fs = require('fs');
 
 /* ---- where are the errors? (rerun the reconstruction quickly) ---- */

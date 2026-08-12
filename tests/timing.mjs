@@ -1,6 +1,7 @@
 import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 const require=createRequire(import.meta.url);
-const ROOT = new URL('../', import.meta.url).pathname; const fs=require('fs');
+const ROOT = fileURLToPath(new URL('../', import.meta.url)); const fs=require('fs');
 let onmsg=null; const fake={set onmessage(f){onmsg=f;},postMessage:m=>fake._l=m};
 new Function('self',fs.readFileSync(ROOT + 'workers/segment.worker.js','utf8'))(fake);
 const W=384,H=288; let seed=3; const rnd=()=>{seed=(seed*1103515245+12345)&0x7fffffff;return seed/0x7fffffff;};

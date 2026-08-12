@@ -4,6 +4,7 @@
  * reconstructed profile against ground truth. */
 
 import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 import {
   quatFromEuler, screenQuat, quatRotate, cameraRay, vecToAzAlt, wrap360, DEG, angDiff
 } from '../js/math3d.js';
@@ -18,7 +19,7 @@ const intrinsics = { tanHalfH: tanH, tanHalfV: tanV };
 
 /* ---- load the segmentation worker with a fake self ---------------------- */
 const require = createRequire(import.meta.url);
-const ROOT = new URL('../', import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const fs = require('fs');
 let workerOnMessage = null;
 const fakeSelf = {

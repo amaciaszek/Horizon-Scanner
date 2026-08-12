@@ -676,3 +676,51 @@ Not verified on hardware: the true bearings are only as good as what a map gives
 you, and a landmark a few metres away has its own parallax between the map
 position and the phone position. Distant landmarks are worth much more here than
 close ones.
+
+### 2026-08-12 — the skyline gets a continuity prior, and calibration stops dead-ending
+
+The headline open problem (each image column solved independently) is closed.
+`segment.worker.js` now runs a dynamic-programming minimum-cost path across all
+384 columns: unary cost from edge strength plus a sky-above/ground-below region
+term, transition cost linear in the jump but capped. The cap is the spike/step
+distinction expressed as geometry — a real wall edge pays the cap once and
+follows the wall; a one-column excursion to a cloud pays it twice and loses.
+The old 7-tap median veto, which replaced any column deviating more than ~23 px
+from its neighbours (i.e. flattened real building edges at the frame level,
+before survey.js ever got to judge them), is gone; the DP prior replaces it.
+
+The independent cross-check estimator (`colEdge`) now takes the *strongest*
+vertical gradient per column instead of the *topmost* one over a threshold.
+The topmost rule fired on any cloud edge, wire or branch above the true
+horizon, which collapsed `cAgree` and with it every column's confidence — the
+suspected cause of "0 of 720 verified" on partly cloudy days.
+
+`tests/sim12.mjs` is the ground-truth stress test: bright cloud with a hard
+under-edge, tall wall, dark storm cloud, and the compound scene. The dark
+cloud is the decisive case — it breaks the top-connected sky component, so the
+old detector put the horizon at the cloud top, 126 px (~40°) above truth; the
+DP path holds to 0.7 px. Verified both ways: the old worker fails this test,
+the new one passes, and all pre-existing sims still pass (sim.mjs: 720/720
+verified, p95 error 0.123°; segmentation 10.5 ms/frame, was 5.6).
+
+Calibration no longer dead-ends into a page reload, which in the field cost
+the camera grant, the lens pin, and any preflight work. A failed rotation test
+now offers Retry in place; a full *clockwise* upright turn (magnitude, raw
+axis and closure all valid, sign positive) is recognised as a wrong-way turn
+and redoes only that step with a "turn LEFT" prompt. The escape hatch from the
+handoff (§4.7) is restored as a secondary "Continue anyway — azimuth
+unverified" button, offered only while the gyro is producing samples, logged
+loudly as SENSOR_TEST_SKIPPED.
+
+Diagnostics: a "Share debug bundle" button in the field-log card builds one
+plain-text file — state snapshot, lens inventory, acceptance report, complete
+field log — and hands it to the Android share sheet (`navigator.share` with
+files), falling back to a download. This is the one-tap path from a failed
+field run to a file another engineer can actually diagnose.
+
+Also: the five sim tests that loaded workers via `new URL(...).pathname` broke
+on Windows (`C:\C:\...`); they use `fileURLToPath` now.
+
+Not verified on hardware: the DP path on real imagery (synthetic scenes have
+cleaner statistics than a real sensor at dusk), and the share sheet on the
+target phone.

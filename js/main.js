@@ -607,15 +607,62 @@ function finishUprightSpinDiagnostic() {
   // test remains valuable diagnostic evidence, but must not veto a proven-good
   // upright survey axis.
   if (!uprightValid) {
-    log('error', 'SENSOR_AXIS_TEST_FAILED',
-      'The upright counter-clockwise rotation did not produce about -360° in projected survey yaw, a matching raw-axis turn, and closure near its starting orientation. Survey capture is blocked.');
-    state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', startedAt: performance.now() };
+    // The single most common way this test "fails" is the operator turning
+    // clockwise. Magnitude, raw axis and closure all check out, only the sign
+    // is positive — that is a wrong-way turn, not a broken sensor, and it
+    // deserves a one-tap redo of just this step rather than a dead end.
+    const wrongDirection = uprightRawValid && uprightProjectedValid && uprightClosureValid
+      && r.measuredDeg >= 270;
+    if (wrongDirection) {
+      log('warn', 'SENSOR_AXIS_TEST_WRONG_DIRECTION',
+        `The upright rotation measured +${r.measuredDeg.toFixed(0)}° — a full clockwise turn where counter-clockwise was needed. The sensor looks fine; redo just this step turning the other way (to your left).`);
+      state.sensorCal = { stage: 'failed', reason: 'wrong-direction', startedAt: performance.now() };
+    } else {
+      log('error', 'SENSOR_AXIS_TEST_FAILED',
+        'The upright counter-clockwise rotation did not produce about -360° in projected survey yaw, a matching raw-axis turn, and closure near its starting orientation. Survey capture is blocked.');
+      state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', startedAt: performance.now() };
+    }
     state.paused = true;
     director.calibrationProgress = 0;
     syncControls();
     return;
   }
   state.sensorCal = { stage: 'settle', startedAt: performance.now() };
+  state.calibStart = performance.now();
+  state.calibFirstTry = 0;
+  director.calibrationProgress = 0;
+  syncControls();
+}
+
+/** Re-run a failed rotation test in place. A field reload costs the camera
+ *  grant, the lens pin, and any preflight work — never require one while the
+ *  sensors are demonstrably producing samples. */
+function retrySensorTest() {
+  const reason = state.sensorCal.reason;
+  state.paused = false;
+  director.calibrationProgress = 0;
+  if (reason === 'wrong-direction') {
+    orientation.beginSpinDiagnostic('upright');
+    state.sensorCal = { stage: 'upright-spin', startedAt: performance.now() };
+    log('info', 'Retrying the upright test only. Rotate counter-clockwise — to your LEFT.');
+  } else {
+    orientation.beginSpinDiagnostic();
+    state.sensorCal = { stage: 'spin', startedAt: performance.now() };
+    log('info', 'Retrying the rotation tests from the flat spin.');
+  }
+  syncControls();
+}
+
+/** Proceed past a failed rotation test without pretending it passed.
+ *  Altitudes come from camera geometry and gravity, which this test does not
+ *  touch; azimuth is what is unverified, and the landmark check can judge it
+ *  after the fact. The skip is logged loudly so it survives into the report
+ *  and the debug bundle. */
+function skipSensorTest() {
+  log('warn', 'SENSOR_TEST_SKIPPED',
+    'Proceeding despite a failed rotation test. Altitudes are unaffected (camera geometry + gravity). Azimuth is UNVERIFIED — verify with two landmarks at least 90° apart before trusting the profile as a pointing limit.');
+  state.sensorCal = { stage: 'settle', startedAt: performance.now(), skipped: true };
+  state.paused = false;
   state.calibStart = performance.now();
   state.calibFirstTry = 0;
   director.calibrationProgress = 0;
@@ -818,13 +865,22 @@ function renderLive() {
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'settle') {
     d.detail = 'Now lift the phone into its normal upright scanning position and hold it still. This final step establishes the survey datum.';
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
-    const badLap = state.sensorCal.reason === 'bad-lap' || state.sensorCal.reason === 'bad-axis-map';
+    const reason = state.sensorCal.reason;
+    const texts = {
+      'wrong-direction': ['Turned the wrong way',
+        'That was a full clockwise turn — the sensor looks fine. Press Retry and rotate the other way: counter-clockwise, to your LEFT.'],
+      'bad-axis-map': ['360° sensor test failed',
+        'The gyroscope produced samples but did not integrate one physical turn correctly. Retry the rotation tests (turn smoothly, keep the pose steady), or continue with azimuth unverified and check it against landmarks afterwards.'],
+      'bad-lap': ['360° sensor test failed',
+        'The gyroscope produced samples but did not integrate one physical turn correctly. Retry the rotation tests (turn smoothly, keep the pose steady), or continue with azimuth unverified and check it against landmarks afterwards.'],
+      'no-samples': ['Motion sensors unavailable',
+        'Chrome returned no orientation or gyroscope samples. Enable Motion sensors for this site in Chrome settings, check Android sensor privacy, then press Reload and retry. No survey data was recorded.']
+    };
+    const [headline, detail] = texts[reason] || texts['bad-axis-map'];
     d = {
       tone: 'fix',
-      headline: badLap ? '360° sensor test failed' : 'Motion sensors unavailable',
-      detail: badLap
-        ? 'The gyroscope produced samples but did not integrate one physical turn correctly. Survey capture is blocked to prevent a false horizon. Copy the diagnostic log, then reload to retry.'
-        : 'Chrome returned no orientation or gyroscope samples. Enable Motion sensors for this site in Chrome settings, check Android sensor privacy, then press Reload and retry. No survey data was recorded.',
+      headline,
+      detail,
       progress: 0,
       arrow: null
     };
@@ -1045,9 +1101,18 @@ function syncControls() {
     return;
   }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
-    btn.textContent = 'Reload and retry sensors';
+    const reason = state.sensorCal.reason;
+    if (reason === 'no-samples') {
+      btn.textContent = 'Reload and retry sensors';
+      sec.hidden = true;
+    } else {
+      btn.textContent = reason === 'wrong-direction' ? 'Retry upright test (turn LEFT)' : 'Retry rotation tests';
+      // The escape hatch: only offered while the gyro is producing samples —
+      // with no sensors there is nothing to proceed with.
+      sec.hidden = false;
+      sec.textContent = 'Continue anyway — azimuth unverified';
+    }
     btn.disabled = false;
-    sec.hidden = true;
     return;
   }
   if (p === PHASE.CALIBRATING) { btn.textContent = 'Calibrating…'; btn.disabled = true; return; }
@@ -1071,7 +1136,9 @@ function syncControls() {
 function onPrimary() {
   const p = director.phase;
   if (!state.running) return startCapture();
-  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') return location.reload();
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
+    return state.sensorCal.reason === 'no-samples' ? location.reload() : retrySensorTest();
+  }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') return finishSpinDiagnostic();
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'upright-spin') return finishUprightSpinDiagnostic();
   if (p === PHASE.PASS1) return finishPass1();
@@ -1552,6 +1619,58 @@ function currentProject(includeThumbs = false) {
   });
 }
 
+/**
+ * Everything a remote diagnosis needs, in one file: the state snapshot, the
+ * lens inventory, the acceptance report, and the complete field log. Built as
+ * plain text so it survives any messenger, mail client, or issue tracker.
+ */
+function buildDebugBundle() {
+  const bar = '='.repeat(68);
+  const lines = [
+    'HORIZON SCANNER DEBUG BUNDLE',
+    `generated ${new Date().toISOString()}`,
+    bar, 'STATE SNAPSHOT', bar,
+    JSON.stringify(debugSnapshot(), null, 2),
+    bar, 'LENS INVENTORY', bar,
+    camera.devices.length
+      ? JSON.stringify(camera.devices, null, 2)
+      : '(not scanned — Advanced > Scan lenses)',
+    `pinned: ${camera.pinned}, lens swaps observed: ${camera.lensSwaps}`,
+    bar, 'ACCEPTANCE REPORT', bar,
+    reportText(survey.report()),
+    bar, `FIELD LOG (${$('logCount').textContent} entries)`, bar,
+    L.dump() || '(empty)'
+  ];
+  return lines.join('\n');
+}
+
+async function shareDebugBundle() {
+  log('info', 'DEBUG_SNAPSHOT', JSON.stringify(debugSnapshot()));
+  const text = buildDebugBundle();
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+  const file = new File([text], `horizon-debug-${stamp}.txt`, { type: 'text/plain' });
+  // The Android share sheet is the one-tap path to mail, Drive, or a chat.
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: 'Horizon Scanner debug bundle' });
+      log('info', 'Debug bundle handed to the share sheet.');
+      return;
+    } catch (err) {
+      if (err.name === 'AbortError') return;   // operator closed the sheet
+      log('warn', `Share failed (${err.name}); downloading instead.`);
+    }
+  }
+  const url = URL.createObjectURL(file);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = file.name;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  log('info', `Sharing unavailable here — bundle downloaded as ${file.name}.`);
+}
+
 function debugSnapshot() {
   return {
     generatedAt: new Date().toISOString(),
@@ -1696,7 +1815,12 @@ function wire() {
 
   $('primaryBtn').addEventListener('click', onPrimary);
   $('probeBtn').addEventListener('click', toggleObstructionProbe);
-  $('secondaryBtn').addEventListener('click', () => { state.paused = !state.paused; syncControls(); });
+  $('secondaryBtn').addEventListener('click', () => {
+    if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'failed'
+      && state.sensorCal.reason !== 'no-samples') return skipSensorTest();
+    state.paused = !state.paused;
+    syncControls();
+  });
   $('abortBtn').addEventListener('click', resetSurvey);
 
   $('maxAltSelect').addEventListener('change', e => { state.maxAlt = Number(e.target.value); });
@@ -1952,6 +2076,7 @@ function wire() {
   });
 
   $('selfTestBtn').addEventListener('click', selfTest);
+  $('shareLogBtn').addEventListener('click', shareDebugBundle);
   $('copyLogBtn').addEventListener('click', async () => {
     // Capture state at the moment the operator asks for support. This makes the
     // copied log self-contained instead of relying on a value having happened

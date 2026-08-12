@@ -3,7 +3,13 @@
  *
  * Input : RGBA ImageData at full working resolution (default 384x288).
  * Coarse: score + Otsu + top-connected flood fill at half resolution.
- * Refine: subpixel vertical-gradient peak at full resolution.
+ * Path  : dynamic-programming minimum-cost path across all columns at full
+ *         resolution (edge evidence + sky-above/ground-below region evidence,
+ *         with a capped per-column transition cost). Continuity is a PRIOR
+ *         here: a cloud edge or a wire above the true skyline cannot capture
+ *         isolated columns, while a genuine vertical wall edge survives
+ *         because a single large jump costs no more than the cap.
+ * Refine: subpixel vertical-gradient peak around the DP path.
  * Output: per-column boundary, per-column confidence, and an INDEPENDENT
  *         gradient-only boundary estimate so the caller can cross-check the
  *         two methods instead of trusting one.
@@ -13,6 +19,7 @@ let W = 0, H = 0;          // full working resolution
 let hw = 0, hh = 0;        // half resolution
 let lum, blueness, texture, score, mask, visited, queue;
 let colMask, colEdge, colRefined, colConf, colFlag;
+let gradV, regionCost, dpPrev, dpCur, dpParent, fwdVal, bwdVal, fwdSrc, bwdSrc, dpPath;
 
 function alloc(w, h) {
   W = w; H = h; hw = w >> 1; hh = h >> 1;
@@ -28,6 +35,16 @@ function alloc(w, h) {
   colRefined = new Float32Array(W);
   colConf = new Float32Array(W);
   colFlag = new Uint8Array(W);
+  gradV = new Float32Array(W * H);
+  regionCost = new Float32Array(hw * (hh + 1));
+  dpPrev = new Float32Array(H);
+  dpCur = new Float32Array(H);
+  dpParent = new Int16Array(W * H);
+  fwdVal = new Float32Array(H);
+  bwdVal = new Float32Array(H);
+  fwdSrc = new Int16Array(H);
+  bwdSrc = new Int16Array(H);
+  dpPath = new Int16Array(W);
 }
 
 function otsu(values, lo, hi) {
@@ -165,36 +182,127 @@ function analyse(data, width, height) {
     colMask[xb] = b * 2;
   }
 
-  // Independent estimator: topmost strong vertical gradient per column at full
-  // resolution. Deliberately shares no state with the mask above.
+  // Full-resolution vertical gradient, and the frame-wide scale that turns it
+  // into 0..1 edge evidence for the path cost below.
+  let gSumAll = 0, gSum2All = 0, gNAll = 0;
   for (let x = 0; x < W; x++) {
-    let sum = 0, sum2 = 0, n = 0;
-    for (let y = 2; y < H - 2; y++) {
+    for (let y = 1; y < H - 1; y++) {
       const g = Math.abs(lum[(y + 1) * W + x] - lum[(y - 1) * W + x]);
-      sum += g; sum2 += g * g; n++;
+      gradV[y * W + x] = g;
+      gSumAll += g; gSum2All += g * g; gNAll++;
     }
-    const mean = sum / n, sd = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
-    const cut = mean + 2.0 * sd;
-    let found = H - 1;
+  }
+  const gMeanAll = gSumAll / Math.max(1, gNAll);
+  const gSdAll = Math.sqrt(Math.max(0, gSum2All / Math.max(1, gNAll) - gMeanAll * gMeanAll));
+  const gRef = Math.max(4, gMeanAll + 2.0 * gSdAll);
+
+  // Independent estimator: STRONGEST vertical gradient per column. The old
+  // topmost-above-threshold rule fired on any cloud edge, branch or wire above
+  // the true horizon, which drove the cross-check agreement (and with it every
+  // column's confidence) to zero on partly cloudy days.
+  for (let x = 0; x < W; x++) {
+    let bestY = H - 1, bestG = -1;
     for (let y = 2; y < H - 2; y++) {
-      const g = Math.abs(lum[(y + 1) * W + x] - lum[(y - 1) * W + x]);
-      if (g > cut) { found = y; break; }
+      const g = gradV[y * W + x];
+      if (g > bestG) { bestG = g; bestY = y; }
     }
-    colEdge[x] = found;
+    colEdge[x] = bestY;
   }
 
-  // Full-resolution subpixel refinement around the coarse boundary.
-  const SEARCH = 10;
+  // Region evidence per half-res column: how well "sky above row, ground below
+  // row" fits the score field. Prefix sums make each candidate row O(1).
+  for (let hx = 0; hx < hw; hx++) {
+    const base = hx * (hh + 1);
+    let run = 0;
+    regionCost[base] = 0;
+    for (let hy = 0; hy < hh; hy++) {
+      run += score[hy * hw + hx] - thr;
+      regionCost[base + hy + 1] = run;
+    }
+    const total = run;
+    let mMin = Infinity, mMax = -Infinity;
+    for (let hy = 0; hy <= hh; hy++) {
+      const m = 2 * regionCost[base + hy] - total;   // sky-above minus sky-below
+      regionCost[base + hy] = m;
+      if (m < mMin) mMin = m;
+      if (m > mMax) mMax = m;
+    }
+    const span = Math.max(1e-6, mMax - mMin);
+    for (let hy = 0; hy <= hh; hy++) {
+      regionCost[base + hy] = 1 - (regionCost[base + hy] - mMin) / span;  // 0 best, 1 worst
+    }
+  }
+
+  /* Dynamic-programming skyline: minimum-cost path visiting one row per
+   * column. Unary cost favours strong edges with sky above and ground below.
+   * The transition cost is linear in the jump but CAPPED, which is the spike
+   * versus step distinction expressed as geometry: a wall edge pays the cap
+   * once and follows the wall, while a one-column excursion to a cloud pays
+   * the cap twice and loses to the continuous path.  O(W*H) via the standard
+   * forward/backward min-convolution for capped-linear costs. */
+  const LAMBDA = 0.02;   // cost per pixel of vertical movement between columns
+  const CAP = 1.0;       // maximum transition cost — the price of one real step
+  const W_EDGE = 0.45, W_REGION = 0.55;
+
+  const unary = (x, y) => {
+    const e = y >= 1 && y <= H - 2 ? Math.min(1, gradV[y * W + x] / gRef) : 0;
+    const hx = Math.min(hw - 1, x >> 1);
+    const hy = Math.min(hh, y >> 1);
+    return W_EDGE * (1 - e) + W_REGION * regionCost[hx * (hh + 1) + hy];
+  };
+
+  for (let y = 0; y < H; y++) dpPrev[y] = unary(0, y);
+  for (let x = 1; x < W; x++) {
+    // Forward sweep: best predecessor at or above each row, linear cost.
+    let v = Infinity, src = 0;
+    for (let y = 0; y < H; y++) {
+      v += LAMBDA;
+      if (dpPrev[y] < v) { v = dpPrev[y]; src = y; }
+      fwdVal[y] = v; fwdSrc[y] = src;
+    }
+    // Backward sweep: best predecessor at or below.
+    v = Infinity; src = H - 1;
+    for (let y = H - 1; y >= 0; y--) {
+      v += LAMBDA;
+      if (dpPrev[y] < v) { v = dpPrev[y]; src = y; }
+      bwdVal[y] = v; bwdSrc[y] = src;
+    }
+    // Global minimum: the capped "step anywhere" transition.
+    let gMin = Infinity, gArg = 0;
+    for (let y = 0; y < H; y++) if (dpPrev[y] < gMin) { gMin = dpPrev[y]; gArg = y; }
+    const stepped = gMin + CAP;
+
+    const pBase = x * H;
+    for (let y = 0; y < H; y++) {
+      let best = fwdVal[y], bestSrc = fwdSrc[y];
+      if (bwdVal[y] < best) { best = bwdVal[y]; bestSrc = bwdSrc[y]; }
+      if (stepped < best) { best = stepped; bestSrc = gArg; }
+      dpCur[y] = best + unary(x, y);
+      dpParent[pBase + y] = bestSrc;
+    }
+    dpPrev.set(dpCur);
+  }
+  let endY = 0, endV = Infinity;
+  for (let y = 0; y < H; y++) if (dpPrev[y] < endV) { endV = dpPrev[y]; endY = y; }
+  dpPath[W - 1] = endY;
+  for (let x = W - 1; x > 0; x--) dpPath[x - 1] = dpParent[x * H + dpPath[x]];
+
+  // Subpixel refinement around the DP path, plus per-column confidence. The
+  // coarse flood-fill boundary keeps its job of flagging columns where the
+  // obstruction runs off the top of the frame or no obstruction is visible —
+  // the path is forced to SOME row there, but the row means nothing.
+  const SEARCH = 4;
   for (let x = 0; x < W; x++) {
     const c = colMask[x];
     colFlag[x] = 0;
     if (c <= 1) { colFlag[x] = 1; colRefined[x] = 0; colConf[x] = 0; continue; }        // obstruction runs off the top
     if (c >= H - 2) { colFlag[x] = 2; colRefined[x] = H - 1; colConf[x] = 0; continue; } // no obstruction in frame
 
-    let bestY = c, bestG = -1, gSum = 0, gN = 0;
-    const y0 = Math.max(2, c - SEARCH), y1 = Math.min(H - 3, c + SEARCH);
+    const p = dpPath[x];
+    let bestY = Math.max(2, Math.min(H - 3, p)), bestG = -1, gSum = 0, gN = 0;
+    const y0 = Math.max(2, p - SEARCH), y1 = Math.min(H - 3, p + SEARCH);
     for (let y = y0; y <= y1; y++) {
-      const g = Math.abs(lum[(y + 1) * W + x] - lum[(y - 1) * W + x]);
+      const g = gradV[y * W + x];
       gSum += g; gN++;
       if (g > bestG) { bestG = g; bestY = y; }
     }
@@ -206,29 +314,17 @@ function analyse(data, width, height) {
     colRefined[x] = bestY + Math.max(-1, Math.min(1, sub));
 
     const gMean = gN ? gSum / gN : 1;
-    const cContrast = Math.min(1, bestG / Math.max(4, gMean * 3.5));
-    const cAgree = Math.exp(-Math.abs(colMask[x] - colEdge[x]) / 8);
+    const cContrast = Math.min(1, bestG / Math.max(4, gMean * 1.5));
+    const cAgree = Math.exp(-Math.abs(colRefined[x] - colEdge[x]) / 8);
     // Score margin across the boundary, sampled on the coarse grid.
     const hx = Math.min(hw - 1, x >> 1);
-    const above = Math.max(0, (colMask[x] >> 1) - 3), below = Math.min(hh - 1, (colMask[x] >> 1) + 3);
+    const above = Math.max(0, (bestY >> 1) - 3), below = Math.min(hh - 1, (bestY >> 1) + 3);
     const cMargin = Math.min(1, Math.max(0, score[above * hw + hx] - score[below * hw + hx]) * 3);
     colConf[x] = Math.max(0, Math.min(1, 0.40 * cContrast + 0.35 * cAgree + 0.25 * cMargin));
   }
 
-  // Local smoothness veto: a column that disagrees wildly with its neighbours
-  // is almost always a mis-segmentation, not a real spike.
-  const smoothed = Float32Array.from(colRefined);
-  for (let x = 3; x < W - 3; x++) {
-    const win = [colRefined[x - 3], colRefined[x - 2], colRefined[x - 1], colRefined[x], colRefined[x + 1], colRefined[x + 2], colRefined[x + 3]].sort((a, b) => a - b);
-    const med = win[3];
-    if (Math.abs(colRefined[x] - med) > H * 0.08) {
-      colConf[x] *= 0.25;
-      smoothed[x] = med;
-    }
-  }
-
   return {
-    boundary: smoothed,
+    boundary: Float32Array.from(colRefined),
     confidence: colConf,
     edgeOnly: colEdge,
     maskOnly: colMask,

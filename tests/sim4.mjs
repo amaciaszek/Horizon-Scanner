@@ -1,10 +1,11 @@
 /* Loop-closure verification: inject a known gyro drift and confirm the
    distributed correction removes it. */
 import { createRequire } from 'module';
+import { fileURLToPath } from 'url';
 import { quatFromEuler, screenQuat, quatRotate, cameraRay, vecToAzAlt, wrap360, DEG } from '../js/math3d.js';
 import { Survey, BIN_COUNT, BIN_STEP } from '../js/survey.js';
 const require = createRequire(import.meta.url);
-const ROOT = new URL('../', import.meta.url).pathname; const fs=require('fs');
+const ROOT = fileURLToPath(new URL('../', import.meta.url)); const fs=require('fs');
 let onmsg=null; const fakeSelf={ set onmessage(f){onmsg=f;}, postMessage:m=>fakeSelf._last=m };
 new Function('self', fs.readFileSync(ROOT + 'workers/segment.worker.js','utf8'))(fakeSelf);
 
