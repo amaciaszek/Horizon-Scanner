@@ -724,3 +724,50 @@ on Windows (`C:\C:\...`); they use `fileURLToPath` now.
 Not verified on hardware: the DP path on real imagery (synthetic scenes have
 cleaner statistics than a real sensor at dusk), and the share sheet on the
 target phone.
+
+### 2026-08-12, later — first hardware run: the axis permutation is real, and so is a fake bias
+
+The first field run on the target phone (Android 10, Chrome 151) produced the
+exact §4.2 signature on fresh data: the flat spin integrated +330° on raw
+gyro y where flat-on-a-table physics demands z, and the upright sweep +376° on
+raw z where it must be y. The operator's turns were fine; the projection onto
+world vertical caught only -43°/-135° of them, calibration failed, and — via
+the skip path — one physical lap logged as 660°, spread 56°, 78 spike bins,
+0/720 verified, and a scrambled panorama. Segmentation confidence was 65% at
+dusk; the detector was not the problem this run. Azimuth was.
+
+Two fixes, both verified against the run's own logged vectors:
+
+`solveGyroAxisMap()` now exists (the handoff described it, but it had never
+been implemented here). During a spin about vertical the angular-velocity
+vector in the device frame must be parallel to vertical in the device frame;
+both come from the same event stream, so disagreement is the frame error. All
+48 signed permutations are scored against the mean gravity direction of each
+spin; ties on axes that carried no rotation break toward the spec mapping. On
+the logged vectors it recovers the y/z swap ([0,2,1], all +) and both spins
+project to 330°/376°. It is invoked as a recovery path when the upright
+validation fails, applies the map to all subsequent rates (after bias
+subtraction, which stays in the raw frame), and re-derives the gyro scale from
+the remapped flat turn. Sign assumption: both turns counter-clockwise as
+instructed — a CW-turning operator on a permuted device is undetectable from
+gyro+gravity alone and lands on the landmark check, which is logged with the
+map. `tests/gyro-axis.test.mjs` feeds the actual field vectors.
+
+The stationary bias gate: the same run measured "bias" of 8.6°/s with
+25-31°/s of noise, because the phone was in the operator's hand at ~59° tilt
+for the whole "lay flat, don't touch" stage — the old gate checked one
+instant and passed on a null gravity reading. The stage now requires 4 s of
+SUSTAINED flat-and-still (a null reading waits instead of passing), the UI
+says "put the phone DOWN" and explains the timer only runs while it is still,
+and `finishStationaryDiagnostic` refuses any bias measured with noise over
+6°/s, pose wobble over 4°, or magnitude over 3°/s — zero bias plus loop
+closure beats a hand-tremor bias every time. If no flat surface exists, it
+proceeds after 25 s without a bias rather than trapping the operator.
+
+The calibration turns explicitly do not need to be exact and the UI now says
+so: axis identification needs direction, not magnitude; scale tolerates ±25%
+and loop closure absorbs the rest.
+
+Not verified on hardware: the solved map driving a real survey end to end.
+The next run at the same site is the test — expect pass-1 travel near 360°,
+spread collapsing, and a panorama that reads left to right.

@@ -440,14 +440,50 @@ function currentHeading() {
 
 /* ------------------------------------------------------------- calibration */
 
+function finishStationary(now) {
+  const r = orientation.finishStationaryDiagnostic();
+  log(r.biasApplied ? 'info' : 'warn', 'SENSOR_STATIONARY', JSON.stringify(r));
+  log(r.biasApplied ? 'info' : 'warn',
+    `Stationary test: ${r.samples} samples at ${r.sampleRateHz.toFixed(1)} Hz; `
+    + `gyro bias x/y/z ${['x', 'y', 'z'].map(k => (r.gyroAxes[k].mean ?? 0).toFixed(4)).join('/')}°/s; `
+    + `noise σ ${['x', 'y', 'z'].map(k => (r.gyroAxes[k].std ?? 0).toFixed(4)).join('/')}°/s; `
+    + `gravity ${(r.gravityMagnitude.mean ?? 0).toFixed(3)} m/s²; `
+    + `screen ${(r.screenFlatnessDeg.mean ?? 0).toFixed(2)}° from horizontal.`);
+  if (!r.biasApplied) {
+    log('warn', `Gyro bias NOT applied (${r.biasRefusedReason}). Zero bias is safer than a bias measured from a moving phone; loop closure will absorb the resulting drift.`);
+  }
+  orientation.beginSpinDiagnostic();
+  state.sensorCal = { stage: 'spin', startedAt: now };
+  director.calibrationProgress = 0;
+  syncControls();
+}
+
 function tickCalibration(now) {
   if (state.sensorCal.stage === 'stationary') {
     const elapsed = now - state.sensorCal.startedAt;
     const flat = orientation.screenFlatnessDeg();
-    const flatEnough = flat === null || flat <= 12;
-    const quietEnough = Math.abs(orientation.gyroYawRate) <= 5;
-    director.calibrationProgress = clamp(elapsed / 4000, 0, 1);
+    // Sustained stillness, not an instantaneous snapshot. The field failure
+    // mode: the operator taps Start and keeps holding the phone; one quiet
+    // instant (or a null gravity reading) let the old check pass and a
+    // hand-tremor "bias" of 8.6°/s got locked in. `flat === null` must WAIT,
+    // not pass — no gravity reading means we know nothing yet.
+    const stillNow = flat !== null && flat <= 15 && orientation.stillness > 0.7;
+    if (!stillNow) state.sensorCal.stillSince = now;
+    const heldMs = now - (state.sensorCal.stillSince ?? now);
+    director.calibrationProgress = clamp(heldMs / 4000, 0, 1);
     const enoughSamples = orientation.stationarySampleCount >= 40;
+    if (heldMs >= 4000 && enoughSamples) {
+      finishStationary(now);
+      return;
+    }
+    // A phone that will not settle (no flat surface available) eventually
+    // proceeds anyway: the bias plausibility gate refuses a moving measurement,
+    // so continuing with zero bias is safe, and being stuck here is not.
+    if (elapsed >= 25000 && enoughSamples) {
+      log('warn', 'Stationary test never settled — proceeding without a bias measurement. For best drift correction, restart with the phone on a table or the ground.');
+      finishStationary(now);
+      return;
+    }
     if (elapsed >= 12000 && !enoughSamples) {
       const r = orientation.finishStationaryDiagnostic();
       log('error', 'SENSOR_STATIONARY_FAILED', JSON.stringify(r),
@@ -457,20 +493,6 @@ function tickCalibration(now) {
       director.calibrationProgress = 0;
       syncControls();
       return;
-    }
-    if (elapsed >= 4000 && enoughSamples && flatEnough && quietEnough) {
-      const r = orientation.finishStationaryDiagnostic();
-      log(r.biasApplied ? 'info' : 'warn', 'SENSOR_STATIONARY', JSON.stringify(r));
-      log(r.biasApplied ? 'info' : 'warn',
-        `Stationary test: ${r.samples} samples at ${r.sampleRateHz.toFixed(1)} Hz; `
-        + `gyro bias x/y/z ${['x', 'y', 'z'].map(k => (r.gyroAxes[k].mean ?? 0).toFixed(4)).join('/')}°/s; `
-        + `noise σ ${['x', 'y', 'z'].map(k => (r.gyroAxes[k].std ?? 0).toFixed(4)).join('/')}°/s; `
-        + `gravity ${(r.gravityMagnitude.mean ?? 0).toFixed(3)} m/s²; `
-        + `screen ${(r.screenFlatnessDeg.mean ?? 0).toFixed(2)}° from horizontal.`);
-      orientation.beginSpinDiagnostic();
-      state.sensorCal = { stage: 'spin', startedAt: now };
-      director.calibrationProgress = 0;
-      syncControls();
     }
     return;
   }
@@ -618,8 +640,36 @@ function finishUprightSpinDiagnostic() {
         `The upright rotation measured +${r.measuredDeg.toFixed(0)}° — a full clockwise turn where counter-clockwise was needed. The sensor looks fine; redo just this step turning the other way (to your left).`);
       state.sensorCal = { stage: 'failed', reason: 'wrong-direction', startedAt: performance.now() };
     } else {
+      // Before declaring the sensor broken, try solving the axis mapping. Some
+      // devices report rotationRate components transposed relative to their own
+      // orientation frame; both spins showing clean full turns on the WRONG raw
+      // axes is the signature (field case 2026-08-12: flat on y, upright on z).
+      const solved = orientation.solveGyroAxisMap();
+      if (solved.status === 'remapped') {
+        log('warn', 'SENSOR_AXIS_MAP_SOLVED', JSON.stringify({
+          perm: solved.perm, signs: solved.signs,
+          residualDeg: Number(solved.residualDeg.toFixed(2)),
+          projections: solved.projections.map(p => Number(p.toFixed(1))),
+          leftHanded: solved.leftHanded
+        }));
+        log('warn',
+          `This phone reports its gyroscope axes in a non-standard order${solved.leftHanded ? ' (mirrored)' : ''}. `
+          + `Solved the mapping from your two turns: once remapped, the flat turn projects to ${solved.projections[0].toFixed(0)}° and the upright turn to ${solved.projections[1].toFixed(0)}° (residual ${solved.residualDeg.toFixed(1)}°). Applying it. `
+          + `This assumes both turns were counter-clockwise as instructed — if they were not, azimuth will run backwards, which the landmark check will expose.`);
+        const scale = 360 / Math.abs(solved.projections[0]);
+        if (scale >= 0.8 && scale <= 1.2) {
+          orientation.gyroScale = scale;
+          log('info', `Gyro scale ${scale.toFixed(3)} adopted from the remapped flat turn.`);
+        }
+        state.sensorCal = { stage: 'settle', startedAt: performance.now() };
+        state.calibStart = performance.now();
+        state.calibFirstTry = 0;
+        director.calibrationProgress = 0;
+        syncControls();
+        return;
+      }
       log('error', 'SENSOR_AXIS_TEST_FAILED',
-        'The upright counter-clockwise rotation did not produce about -360° in projected survey yaw, a matching raw-axis turn, and closure near its starting orientation. Survey capture is blocked.');
+        `The upright counter-clockwise rotation did not produce about -360° in projected survey yaw, a matching raw-axis turn, and closure near its starting orientation, and the axis-map solver could not recover it (${solved.status}). Survey capture is blocked.`);
       state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', startedAt: performance.now() };
     }
     state.paused = true;
@@ -833,10 +883,12 @@ function renderLive() {
   let d = director.directive(ctx);
   if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
     const flat = orientation.screenFlatnessDeg();
+    const notDown = flat === null || flat > 15;
+    const stalled = performance.now() - state.sensorCal.startedAt > 8000 && director.calibrationProgress < 0.5;
     d = {
-      tone: flat !== null && flat > 12 ? 'fix' : 'work',
-      headline: flat !== null && flat > 12 ? 'Lay the phone flat' : 'Do not touch the phone',
-      detail: `Screen face up on a stable surface. Measuring gyro noise, bias, gravity, and horizontal${flat === null ? '' : ` — currently ${flat.toFixed(1)}° from flat`}.`,
+      tone: notDown || stalled ? 'fix' : 'work',
+      headline: notDown ? 'Put the phone DOWN — screen up' : 'Hands off — measuring',
+      detail: `Set it on a table or the ground and do not touch it${stalled ? ' — the timer only runs while it is completely still' : ''}. Measuring gyro noise, bias, and gravity${flat === null ? '' : ` — currently ${flat.toFixed(1)}° from flat`}.`,
       progress: director.calibrationProgress,
       arrow: null
     };
@@ -845,7 +897,7 @@ function renderLive() {
     d = {
       tone: travelled >= 270 ? 'good' : 'work',
       headline: 'Rotate once counter-clockwise',
-      detail: `${travelled.toFixed(0)}° measured. Keep the screen face up and turn the phone counter-clockwise on the table until it approximately returns to its starting direction, then press Finish.`,
+      detail: `${travelled.toFixed(0)}° measured. Keep the screen face up and turn the phone counter-clockwise (to your LEFT) roughly one full circle, then press Finish. It does not need to be exact — direction matters, precision does not.`,
       progress: clamp(travelled / 360, 0, 1),
       arrow: -1
     };
@@ -856,7 +908,7 @@ function renderLive() {
     d = {
       tone: travelled >= 270 ? 'good' : 'work',
       headline: 'Sweep upright counter-clockwise',
-      detail: `${travelled.toFixed(0)}° measured. Hold the phone upright as you will during the survey, rotate counter-clockwise through one complete horizon sweep, return to the starting view, then press Finish.`,
+      detail: `${travelled.toFixed(0)}° measured. Hold the phone upright as you will during the survey and turn yourself counter-clockwise (to your LEFT) through roughly one full circle, then press Finish. A rough circle is fine — direction matters, precision does not.`,
       progress: clamp(travelled / 360, 0, 1),
       arrow: -1
     };

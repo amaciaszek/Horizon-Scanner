@@ -87,6 +87,11 @@ export class OrientationSource {
     this.gyroSamples = 0;
     this.gyroBias = [0, 0, 0];   // device x/y/z bias, deg/s
     this.gyroScale = 1;           // conservative scale from a declared full turn
+    // Signed axis permutation applied to rotationRate AFTER bias subtraction.
+    // Some devices report rotationRate components transposed relative to their
+    // own orientation frame (observed in the field: a flat spin landing on the
+    // y gyro axis, an upright spin on z). null means identity — trust the spec.
+    this.gyroAxisMap = null;      // { perm:[i,i,i], signs:[±1,±1,±1], residualDeg }
     this.lastGravity = null;
     this._lastMotionAt = 0;
     this._onMotion = this._onMotion.bind(this);
@@ -388,7 +393,11 @@ export class OrientationSource {
         elevation: att.elevation, roll: att.roll
       });
     }
-    const w = rawW.map((v, i) => v - this.gyroBias[i]);
+    let w = rawW.map((v, i) => v - this.gyroBias[i]);
+    if (this.gyroAxisMap) {
+      const m = this.gyroAxisMap;
+      w = [m.signs[0] * w[m.perm[0]], m.signs[1] * w[m.perm[1]], m.signs[2] * w[m.perm[2]]];
+    }
     // World up, expressed in the device frame.
     const up = quatRotate(quatConj(this.quat), [0, 0, 1]);
     this.gyroYawRate = -(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]) * this.gyroScale;
@@ -413,6 +422,12 @@ export class OrientationSource {
     if (this._spinActive && gravity) {
       const mag = Math.hypot(...gravity);
       if (mag > 1) this._spinFlat.push(Math.acos(clamp(Math.abs(gravity[2]) / mag, -1, 1)) * RAD);
+      if (mag > 1 && this._spinTrace) {
+        // Mean gravity over the spin is the world-vertical in the device frame,
+        // which is what the axis-map solver aligns the integrated turn against.
+        for (let i = 0; i < 3; i++) this._spinTrace.gravitySum[i] += gravity[i] / mag;
+        this._spinTrace.gravityN++;
+      }
     }
     if (this.gyroSamples > 20 && !this.gyroAvailable) {
       this.gyroAvailable = true;
@@ -461,7 +476,23 @@ export class OrientationSource {
     const roll = stats(samples.map(s => s.roll));
     const durationMs = samples.length > 1 ? samples[samples.length - 1].t - samples[0].t : 0;
     const enough = samples.length >= 40 && durationMs >= 2000;
-    if (enough) this.gyroBias = axes.map(a => a.mean || 0);
+    // A bias is only a bias if it was measured on a phone that was actually
+    // still. Field case: a handheld "stationary" test read 8.6°/s mean with
+    // 25-31°/s of noise — hand tremor, not sensor bias — and subtracting it
+    // corrupted every rotation for the rest of the session. Real MEMS bias is
+    // under ~1°/s with noise well under 6°/s, so anything beyond that is the
+    // operator moving, and applying zero bias is strictly safer.
+    const noise = Math.max(...axes.map(a => a.std ?? Infinity));
+    const biasMag = Math.max(...axes.map(a => Math.abs(a.mean ?? 0)));
+    const wobble = flatness.std ?? Infinity;
+    const still = noise < 6 && wobble < 4;
+    const plausible = biasMag < 3;
+    const biasApplied = enough && still && plausible;
+    const biasRefusedReason = biasApplied ? null
+      : !enough ? 'too-few-samples'
+        : !still ? `not-still (gyro noise ${noise.toFixed(1)}°/s, pose wobble ${wobble.toFixed(1)}°)`
+          : `implausible-bias (${biasMag.toFixed(1)}°/s)`;
+    if (biasApplied) this.gyroBias = axes.map(a => a.mean || 0);
     this.stationaryDiagnostic = {
       samples: samples.length,
       durationMs,
@@ -472,7 +503,8 @@ export class OrientationSource {
       screenFlatnessDeg: flatness,
       orientationElevationDeg: elevation,
       orientationRollDeg: roll,
-      biasApplied: enough
+      biasApplied,
+      biasRefusedReason
     };
     return this.stationaryDiagnostic;
   }
@@ -497,6 +529,8 @@ export class OrientationSource {
       projectedNegativeDeg: 0,
       rawAxisSignedDeg: [0, 0, 0],
       rawAxisAbsoluteDeg: [0, 0, 0],
+      gravitySum: [0, 0, 0],
+      gravityN: 0,
       orientationAlphaTravel: 0,
       lastAlpha: Number.isFinite(this.alpha) ? this.alpha : null,
       rateMin: Infinity,
@@ -549,6 +583,9 @@ export class OrientationSource {
       samples: this._spinFlat.length,
       trace: this._spinTrace ? {
         ...this._spinTrace,
+        meanGravity: this._spinTrace.gravityN
+          ? this._spinTrace.gravitySum.map(v => v / this._spinTrace.gravityN)
+          : null,
         rateMin: Number.isFinite(this._spinTrace.rateMin) ? this._spinTrace.rateMin : null,
         rateMax: Number.isFinite(this._spinTrace.rateMax) ? this._spinTrace.rateMax : null
       } : null
@@ -559,6 +596,80 @@ export class OrientationSource {
     this._spinStart = null;
     this._spinTrace = null;
     return this.spinDiagnostic;
+  }
+
+  /**
+   * Solve which reported gyro axis is which physical axis, from the two spins.
+   *
+   * Physics: during a rotation about world vertical, the angular-velocity
+   * vector in the device frame must be parallel to vertical in the device
+   * frame — and both come from the same event stream, so any disagreement IS
+   * the frame error. One spin constrains one axis; the flat and upright tests
+   * supply two roughly perpendicular poses, which pins the whole mapping.
+   *
+   * All 48 signed permutations are scored by how well they align the
+   * integrated raw turn with the mean gravity direction of each spin. The
+   * alignment is SIGNED against +gravity, which assumes both turns were
+   * counter-clockwise as instructed — the one thing this cannot detect is an
+   * operator who turned clockwise both times on a permuted device; the
+   * landmark check remains the backstop for that.
+   *
+   * The turns do not need to be precise: axis identification needs direction,
+   * not magnitude, so "roughly a full circle" is genuinely good enough.
+   */
+  solveGyroAxisMap() {
+    const spins = [this.flatSpinDiagnostic, this.uprightSpinDiagnostic];
+    if (spins.some(s => !s?.trace?.meanGravity)) return { status: 'insufficient-data' };
+    const data = spins.map(s => {
+      const g = s.trace.meanGravity;
+      const mag = Math.hypot(...g) || 1;
+      return { I: s.trace.rawAxisSignedDeg, g: g.map(v => v / mag) };
+    });
+    // If gravity barely moved between the two poses, the second spin adds no
+    // new constraint and any solution is underdetermined.
+    const poseDot = Math.abs(data[0].g[0] * data[1].g[0] + data[0].g[1] * data[1].g[1] + data[0].g[2] * data[1].g[2]);
+    if (poseDot > 0.7) return { status: 'poses-too-similar', poseDot };
+
+    const perms = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    const score = (perm, signs) => {
+      let residualDeg = 0;
+      const projections = [];
+      for (const d of data) {
+        const v = [signs[0] * d.I[perm[0]], signs[1] * d.I[perm[1]], signs[2] * d.I[perm[2]]];
+        const n = Math.hypot(...v) || 1;
+        const dot = v[0] * d.g[0] + v[1] * d.g[1] + v[2] * d.g[2];
+        residualDeg = Math.max(residualDeg, Math.acos(clamp(dot / n, -1, 1)) * RAD);
+        projections.push(dot);
+      }
+      return { residualDeg, projections };
+    };
+    let best = null;
+    for (const perm of perms) {
+      for (let sx = -1; sx <= 1; sx += 2) for (let sy = -1; sy <= 1; sy += 2) for (let sz = -1; sz <= 1; sz += 2) {
+        const signs = [sx, sy, sz];
+        const r = score(perm, signs);
+        // An axis that carried no rotation in either spin has an unconstrained
+        // sign; the tiny penalty breaks such ties toward the least change from
+        // the spec mapping instead of toward loop order.
+        const changes = perm.reduce((n, p, i) => n + (p !== i ? 1 : 0), 0)
+          + signs.reduce((n, s) => n + (s !== 1 ? 1 : 0), 0);
+        const cost = r.residualDeg + 0.01 * changes;
+        if (!best || cost < best.cost) best = { perm, signs, cost, ...r };
+      }
+    }
+    const identity = score([0, 1, 2], [1, 1, 1]);
+    const valid = r => r.residualDeg <= 30
+      && r.projections.every(p => p >= 270 && p <= 450);
+    if (valid(identity)) return { status: 'identity', ...identity };
+    if (!valid(best)) return { status: 'unsolved', best, identity };
+
+    const isIdentity = best.perm.every((p, i) => p === i) && best.signs.every(s => s === 1);
+    if (isIdentity) return { status: 'identity', ...best };
+    // Determinant of a signed permutation: permutation parity times the signs.
+    const PARITY = [1, -1, -1, 1, 1, -1];   // matches the perms list order
+    const det = PARITY[perms.indexOf(best.perm)] * best.signs[0] * best.signs[1] * best.signs[2];
+    this.gyroAxisMap = { perm: best.perm, signs: best.signs, residualDeg: best.residualDeg };
+    return { status: 'remapped', ...best, leftHanded: det < 0 };
   }
 
   /**
@@ -687,6 +798,7 @@ export class OrientationSource {
       sensorSource: this.sensorSource,
       gyroBiasDegPerSec: this.gyroBias.map(v => Number(v.toFixed(4))),
       gyroScale: Number(this.gyroScale.toFixed(6)),
+      gyroAxisMap: this.gyroAxisMap,
       stationaryDiagnostic: this.stationaryDiagnostic,
       spinDiagnostic: this.spinDiagnostic,
       flatSpinDiagnostic: this.flatSpinDiagnostic,
