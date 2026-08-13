@@ -32,6 +32,31 @@ const DEG2RAD = Math.PI / 180;
  */
 export const SPIN_KINDS = ['yaw', 'roll', 'pitch'];
 
+/** Below this rate the orientation stream's own jitter dominates its apparent
+ *  motion, so such intervals are dropped from the axis solve. See the note in
+ *  solveGyroAxisMap where it is applied. */
+const RATE_FLOOR_DEG_S = 20;
+
+/** Seconds over which gravity's movement is measured in the axis solve. Long
+ *  enough to bury the orientation stream's jitter, short enough that treating
+ *  the arc as a straight line stays a sub-percent approximation. */
+const GRAVITY_BASELINE_S = 0.1;
+
+/**
+ * What kind of motion this was, from the fraction of it that moved gravity
+ * through the device frame. Near 0 is a turn about vertical (gravity parked on
+ * one axis); near 1 is an end-over-end tumble.
+ *
+ * Thresholds sized for a human hand, not a rig: a 360° turn wobbling by ±10° a
+ * few times drags gravity through ~120° of path, so "about vertical" has to
+ * tolerate a ratio near 0.35 before it starts calling a turn a tumble.
+ */
+function classifyMotion(sweepRatio) {
+  if (sweepRatio === null) return 'too-little';
+  if (sweepRatio < 0.5) return 'about-vertical';
+  return sweepRatio > 0.65 ? 'tumble' : 'mixed';
+}
+
 /** Least-squares slope of `key` against time, in units per second. */
 function slope(pts, tKey, key) {
   const n = pts.length;
@@ -71,6 +96,7 @@ export class OrientationSource {
     // Yaw datum: maps the alpha-derived yaw onto true azimuth.
     this.yawDatum = 0;
     this.datumLocked = false;
+    this.datumSpreadDeg = null;
     this._datumSamples = [];
 
     // Compass reliability
@@ -593,18 +619,19 @@ export class OrientationSource {
   }
 
   /**
-   * How far this motion has got, in degrees of the thing being asked for.
+   * What the in-progress motion has supplied so far: how far each REPORTED
+   * gyro axis has been turned, and how far gravity has travelled through the
+   * device frame.
    *
-   * Deliberately map-independent — the progress meter must not depend on the
-   * very axis mapping this test exists to discover. For the tumble the honest
-   * measure is how far world-up has actually travelled through the device
-   * frame; for the two turns about vertical it is the largest single-axis
-   * integrated turn, which cancels wobble instead of counting it.
+   * These are exactly the two things the solver needs — the first tells it
+   * which reported axis is which, the second tells it which way each one
+   * points — so they are also exactly what is worth coaching. Deliberately
+   * map-independent, since the mapping is the unknown.
    */
-  spinProgress() {
-    if (!this._spinStart || !this._spinTrace) return 0;
-    if (this._spinKind === 'pitch') return this._spinTrace.sweepDeg;
-    return Math.max(...this._spinTrace.rawAxisSignedDeg.map(Math.abs));
+  spinEvidence() {
+    const tr = this._spinTrace;
+    if (!tr) return { work: [0, 0, 0], sweepDeg: 0, totalRotDeg: 0 };
+    return { work: tr.rawAxisAbsoluteDeg.slice(), sweepDeg: tr.sweepDeg, totalRotDeg: tr.totalRotDeg };
   }
 
   finishSpinDiagnostic() {
@@ -628,14 +655,7 @@ export class OrientationSource {
     // regardless of what the gyro claims — which is what lets the solver work
     // out for itself which kind of motion it was actually handed.
     const sweepRatio = totalRotDeg > 20 ? sweepDeg / totalRotDeg : null;
-    // Thresholds sized for a human hold, not a rig. A 360° turn wobbling by
-    // ±10° a few times drags up through ~120° of path, so "about vertical"
-    // has to tolerate a ratio near 0.35 before it starts calling a turn a
-    // tumble; a genuine tumble sits near 1.0, or 0.85 if the phone's axis was
-    // held well off horizontal.
-    const motion = sweepRatio === null ? 'too-little'
-      : sweepRatio < 0.5 ? 'about-vertical'
-        : sweepRatio > 0.65 ? 'tumble' : 'mixed';
+    const motion = classifyMotion(sweepRatio);
     const result = {
       kind: this._spinKind,
       durationMs: performance.now() - this._spinStart.t,
@@ -720,40 +740,86 @@ export class OrientationSource {
    * exactly 360° — a human turning roughly, holding the phone roughly, is
    * exactly the input this was built for.
    */
-  solveGyroAxisMap() {
+  solveGyroAxisMap({ apply = true, includeActive = false, maxIntervals = 1200 } = {}) {
     const spins = SPIN_KINDS
       .map(k => this._spinData[k])
-      .filter(s => s && s.samples.length > 8 && s.totalRotDeg > 45);
-    if (spins.length < 2) return { status: 'insufficient-data', usableTests: spins.length };
+      .filter(s => s && s.samples.length > 8 && s.totalRotDeg > 20);
+    // The live coach solves repeatedly while the operator is still moving the
+    // phone, so it needs the in-progress samples and must not install anything.
+    if (includeActive && this._spinActive && this._spinTrace && this._spinSamples.length > 8) {
+      const tr = this._spinTrace;
+      const ratio = tr.totalRotDeg > 20 ? tr.sweepDeg / tr.totalRotDeg : null;
+      spins.push({
+        kind: this._spinKind, samples: this._spinSamples,
+        totalRotDeg: tr.totalRotDeg, sweepDeg: tr.sweepDeg, motion: classifyMotion(ratio)
+      });
+    }
+    if (!spins.length) return { status: 'insufficient-data', usableTests: 0 };
 
     // Per-interval quantities, computed once because they do not depend on the
     // candidate map. Midpoint values throughout: at 200°/s and 50 Hz a step is
     // 4°, and a one-sided difference would carry a systematic error of that
     // size straight into the residual.
     const iv = [];
+    const work = [0, 0, 0];
     spins.forEach((spin, si) => {
       const s = spin.samples;
+      // Sample times, so the gravity baseline below can be chosen in seconds
+      // rather than in samples — the motion stream's rate varies from 30 to
+      // 60 Hz across devices and even within one run.
+      const t = new Float64Array(s.length);
+      for (let k = 1; k < s.length; k++) t[k] = t[k - 1] + (s[k].dt > 0 && s[k].dt < 0.5 ? s[k].dt : 0);
+
+      let lo = 0, hi = 0;
       for (let k = 0; k + 1 < s.length; k++) {
         const dt = s[k + 1].dt;
         if (!(dt > 0 && dt < 0.5)) continue;
-        const um = [0, 1, 2].map(i => (s[k].u[i] + s[k + 1].u[i]) / 2);
+        const w = [0, 1, 2].map(i => (s[k].w[i] + s[k + 1].w[i]) / 2);
+        for (let i = 0; i < 3; i++) work[i] += Math.abs(w[i]) * dt;
+        // Skip near-stationary moments. The orientation stream's own jitter
+        // produces an apparent du/dt of tens of degrees per second however
+        // slowly the phone is actually moving, so these intervals carry far
+        // more noise than signal — as do the idle seconds at either end of
+        // any motion, by the same argument.
+        if (Math.hypot(...w) < RATE_FLOOR_DEG_S) continue;
+
+        // Measure how far gravity moved over a WIDE baseline rather than
+        // between neighbouring samples. Orientation jitter of a degree or so
+        // becomes ~50°/s of phantom du/dt when divided by a 20 ms step, which
+        // swamps a gently waved phone; spread over ~100 ms it falls by the
+        // ratio of the spans while the real motion is unchanged. The cost is
+        // a second-order chord-versus-arc error, well under 1% even when the
+        // phone is being thrown about at 200°/s.
+        while (lo + 1 < s.length && t[k] - t[lo] > GRAVITY_BASELINE_S / 2) lo++;
+        if (hi < k) hi = k;
+        while (hi + 1 < s.length && t[hi] - t[k] < GRAVITY_BASELINE_S / 2) hi++;
+        const span = t[hi] - t[lo];
+        if (!(span > 0)) continue;
+        const um = [0, 1, 2].map(i => (s[lo].u[i] + s[hi].u[i]) / 2);
         const un = Math.hypot(...um);
-        if (!(un > 0.5)) continue;
+        if (!(un > 0.5)) continue;   // gravity reversed across the span
         iv.push({
-          si, dt,
-          w: [0, 1, 2].map(i => (s[k].w[i] + s[k + 1].w[i]) / 2),
+          si, dt, w, span,
           u: um.map(v => v / un),
-          du: [0, 1, 2].map(i => (s[k + 1].u[i] - s[k].u[i]) / dt)
+          du: [0, 1, 2].map(i => (s[hi].u[i] - s[lo].u[i]) / span)
         });
       }
     });
-    if (iv.length < 20) return { status: 'insufficient-data', intervals: iv.length };
+    if (iv.length < 20) {
+      return { status: 'insufficient-data', intervals: iv.length, work: work.map(v => Math.round(v)) };
+    }
+    // Cost is 48 candidates times this list, and the live coach re-solves
+    // several times a second on a phone while the camera pipeline is also
+    // running. Thinning it keeps that bounded; the evidence is spread evenly
+    // through the motion, so a stride costs accuracy nothing that matters.
+    const stride = Math.ceil(iv.length / maxIntervals);
+    const ivs = stride > 1 ? iv.filter((_, i) => i % stride === 0) : iv;
 
     // Total rotation in radians. A signed permutation cannot change a vector's
     // length, so this is identical for all 48 candidates and turns the residual
     // into a dimensionless score.
     let den = 0;
-    for (const v of iv) den += Math.hypot(...v.w) * DEG2RAD * v.dt;
+    for (const v of ivs) den += Math.hypot(...v.w) * DEG2RAD * v.dt;
     if (!(den > 1)) return { status: 'too-little-rotation', totalDeg: Math.round(den / DEG2RAD) };
 
     const PERMS = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
@@ -768,7 +834,7 @@ export class OrientationSource {
         const signs = [sx, sy, sz];
         let num = 0;
         const align = spins.map(() => 0);
-        for (const v of iv) {
+        for (const v of ivs) {
           const a = mapped(v, perm, signs);
           const r0 = a[0] * DEG2RAD, r1 = a[1] * DEG2RAD, r2 = a[2] * DEG2RAD;
           // Residual of du/dt + ω × u, which a correct map drives to zero.
@@ -867,21 +933,54 @@ export class OrientationSource {
     // the device frame, so the angle it integrates must equal the angle up
     // actually swept. Their ratio is the scale error — and how close the
     // operator came to a full circle never enters into it.
-    let sweptRad = 0, arcRad = 0;
-    for (const v of iv) {
-      if (spins[v.si].motion !== 'tumble') continue;
+    // This number multiplies every azimuth the survey ever records, so its
+    // run-to-run stability IS the survey's bearing accuracy: the field runs of
+    // 2026-08-13 returned 1.0112 and 1.0538 from the same phone, and 4% of a
+    // lap is 15° of bearing. A ratio of sums let a handful of fast, badly
+    // tracked instants set it, so this takes the MEDIAN of the per-interval
+    // ratios instead and reports how much they disagreed. Any motion that
+    // moves gravity contributes, tumble or not.
+    const ratios = [];
+    for (const v of ivs) {
       const a = mapped(v, pick.perm, pick.signs).map(x => x * DEG2RAD);
       const dot = a[0] * v.u[0] + a[1] * v.u[1] + a[2] * v.u[2];
-      arcRad += Math.hypot(a[0] - dot * v.u[0], a[1] - dot * v.u[1], a[2] - dot * v.u[2]) * v.dt;
-      sweptRad += Math.hypot(...v.du) * v.dt;
+      const perp = Math.hypot(a[0] - dot * v.u[0], a[1] - dot * v.u[1], a[2] - dot * v.u[2]);
+      if (perp < 0.35) continue;                     // lost in the noise floor
+      const swept = Math.hypot(...v.du);
+      if (swept < 0.2) continue;
+      // du is a CHORD rate: it measures the straight line between two points on
+      // gravity's arc, which is shorter than the arc itself. Ignoring that
+      // understates fast motion — and rejecting the fast intervals instead is
+      // worse, because it keeps only the slow ones where jitter dominates. The
+      // angle turned across the baseline is known, so correct for it: arc =
+      // chord · (θ/2)/sin(θ/2). Second-order, so the uncalibrated θ is fine.
+      const theta = perp * v.span;
+      if (theta > 1.2) continue;                     // too coarse to correct
+      const arc = theta > 1e-3 ? swept * (theta / 2) / Math.sin(theta / 2) : swept;
+      ratios.push({ r: arc / perp, w: perp * v.dt });
     }
-    // Needs ~85° of genuine tumble before the ratio means anything.
-    const scaleFromSweep = arcRad > 1.5 ? sweptRad / arcRad : null;
-    const scaleApplied = Number.isFinite(scaleFromSweep) && scaleFromSweep >= 0.8 && scaleFromSweep <= 1.2;
-    if (scaleApplied) this.gyroScale = scaleFromSweep;
+    let scaleFromSweep = null, scaleSpread = null;
+    if (ratios.length >= 25) {
+      ratios.sort((a, b) => a.r - b.r);
+      const total = ratios.reduce((s, x) => s + x.w, 0);
+      const at = f => {
+        let acc = 0;
+        for (const x of ratios) { acc += x.w; if (acc >= total * f) return x.r; }
+        return ratios[ratios.length - 1].r;
+      };
+      scaleFromSweep = at(0.5);
+      scaleSpread = (at(0.75) - at(0.25)) / 2;   // half the interquartile range
+    }
+    // Refuse a figure the evidence does not actually support. Leaving the scale
+    // at 1 costs a percent or so that loop closure absorbs; adopting a bad one
+    // rotates the whole survey.
+    const scaleApplied = Number.isFinite(scaleFromSweep)
+      && scaleFromSweep >= 0.8 && scaleFromSweep <= 1.2
+      && scaleSpread < 0.08;
+    if (scaleApplied && apply) this.gyroScale = scaleFromSweep;
 
     const isIdentity = pick.perm.every((p, i) => p === i) && pick.signs.every(s => s === 1);
-    this.gyroAxisMap = isIdentity ? null : { perm: pick.perm, signs: pick.signs };
+    if (apply) this.gyroAxisMap = isIdentity ? null : { perm: pick.perm, signs: pick.signs };
     return {
       status: isIdentity ? 'identity' : 'remapped',
       perm: pick.perm, signs: pick.signs,
@@ -893,7 +992,11 @@ export class OrientationSource {
       margin: Number((cands.find(c => c.perm.some((p, i) => p !== pick.perm[i]))?.resid ?? Infinity).toFixed(3)),
       align: pick.align.map(a => Number(a.toFixed(1))),
       scaleFromSweep: scaleFromSweep === null ? null : Number(scaleFromSweep.toFixed(4)),
+      scaleSpread: scaleSpread === null ? null : Number(scaleSpread.toFixed(4)),
       scaleApplied,
+      // How much each REPORTED axis was exercised, and how far gravity
+      // travelled. The live coach reads these to say what is still missing.
+      work: work.map(v => Math.round(v)),
       tests
     };
   }
@@ -997,8 +1100,19 @@ export class OrientationSource {
     this.yawDatum = circMean(this._datumSamples);
     this.datumLocked = true;
     const spread = this._datumSamples.reduce((m, s) => Math.max(m, Math.abs(angDiff(s, this.yawDatum))), 0);
-    this.log('info', `Yaw datum locked at ${this.yawDatum.toFixed(1)}° from ${this._datumSamples.length} compass samples, spread ${spread.toFixed(1)}°.`);
+    this.datumSpreadDeg = spread;
     if (spread > 12) this.compassReliability = 'poor';
+    // This one number is the accuracy of every absolute bearing in the finished
+    // profile. The shape of the horizon comes from the gyroscope and is fine
+    // either way, but "which compass bearing is that rooftop at" is only ever
+    // as good as this, and a scattered magnetometer used to slip by as a quiet
+    // INFO line while the survey looked perfectly healthy.
+    const bad = spread > 12;
+    this.log(bad ? 'warn' : 'info',
+      `Yaw datum locked at ${this.yawDatum.toFixed(1)}° from ${this._datumSamples.length} compass samples, spread ${spread.toFixed(1)}°.`
+      + (bad
+        ? ` The magnetometer disagreed with itself by ${spread.toFixed(0)}°, so every bearing in this survey could be out by roughly ±${(spread / 2).toFixed(0)}°. The horizon SHAPE is unaffected. Fix the bearings afterwards with the landmark tool: two landmarks at least 90° apart with map bearings will pin the offset.`
+        : ''));
     return true;
   }
 
@@ -1013,6 +1127,7 @@ export class OrientationSource {
       absolute: this.absolute,
       hasCompass: this.hasCompass,
       compassReliability: this.compassReliability,
+      datumSpreadDeg: this.datumSpreadDeg === null ? null : Number(this.datumSpreadDeg.toFixed(1)),
       compassRejects: this.compassRejects,
       compassChecks: this.compassChecks,
       gyroReliability: this.eventRate >= 25 ? 'good' : this.eventRate >= 10 ? 'fair' : 'poor',

@@ -887,3 +887,153 @@ rigid-body model integrating a quaternion so the gyro reading and the gravity
 direction come from one consistent state. The bar for the next field run is a
 log line reading `SENSOR_AXIS_SOLVE` with status remapped, `decidedBy`
 kinematics, and a residual under about 0.2.
+
+### 2026-08-13, 01:29 — confirmed on hardware, and my prediction was wrong
+
+First calibration this phone has ever completed. `SENSOR_AXIS_SOLVE` reported
+status `remapped`, `decidedBy: "kinematics"`, `assumedDirection: false`,
+residual 0.23 against 0.70 for the next-best axis order, scale 1.0112 applied
+from the tumble's gravity sweep. The stationary stage took 3.97 s instead of
+timing out at 25.
+
+The wiring is NOT the y/z swap predicted from the 23:37 logs. It is a
+three-way cyclic rotation, `perm [2,0,1]`:
+
+    reported beta  carries ω_y
+    reported gamma carries ω_z
+    reported alpha carries ω_x
+
+Each of the three motions lands on exactly the axis it should once that map is
+applied — yaw's 356° on device Z, roll's 341° on device Y, pitch's 378° on
+device X — and the alignment about vertical comes out 372° / 344° / 14°, the
+last being the tumble, which must be ~0 and is. Determinant +1, so this is a
+real mounting rotation and not a mirrored triad.
+
+Why the earlier guess was wrong is worth keeping: it was read off two motions
+that were never as distinct as their labels claimed. The old "upright" spin
+logged `flatnessMean 12°` with `meanGravity` still 0.80 along device Z — the
+phone was nearly flat for both tests, so the pair genuinely could not tell a
+transposition from a rotation. Three deliberately different motions can. That
+is the whole argument for the third test, restated as evidence.
+
+Real-world residual floor is around 0.2, an order of magnitude above the
+simulator's 0.007, and the causes are visible in the bundle: gravity is
+quantised to 0.1 m/s² (~0.6° of angle) and the gyro to 0.1°/s, the motion
+stream runs at 34-43 Hz, and the browser's fusion lags a fast tumble. The
+`unsolved` gate at 0.6 leaves comfortable headroom, and the discriminator that
+actually matters — the gap to the next axis order — was 3x.
+
+Also fixed here: `lockDatum` logged a 56.3° compass spread as a quiet INFO
+line. That number is the accuracy of every absolute bearing in the finished
+profile (±28° in this run) while the survey otherwise reads healthy. It is now
+a WARN naming the consequence and pointing at the landmark tool, and the
+acceptance report carries a `Bearing datum` line so it survives into the
+export.
+
+### 2026-08-13, later — the three tests become one: wave the phone about
+
+Calibration had just succeeded on hardware for the first time, and the
+operator's verdict was still *"the way to spin it end over end was very
+confusing, i may have spun it the wrong way, its a lot."* Both halves of that
+are worth separating.
+
+The worry was unfounded: the tumble's direction never mattered. That run logged
+`assumedDirection: false`, meaning the sign came from the way gravity swept and
+not from any instruction. But an instruction the operator has to worry about is
+a bad instruction even when it is ignorable, and "a lot" is a straightforward
+design failure.
+
+So the three posed tests are gone, replaced by one unchoreographed motion:
+hold the phone and turn and tip it every which way. No poses, no directions, no
+circles to count, no naming of axes.
+
+The physics prefers this, which is the part worth recording. The solver only
+ever needed every reported gyro axis to turn a little while gravity moved. In
+the posed version gravity sat *still* through two tests out of three — that was
+why signs could tie and why the "turn left" assumption existed at all. Waved,
+gravity moves continuously, so every sign is pinned by kinematics on every run.
+Measured over the simulation grid: `assumedDirection` was false in 20 runs out
+of 20, and the median residual fell from 0.23 (posed, on hardware) to 0.013.
+
+Two solver changes were needed, both found by simulating what the field bundles
+actually show this hardware doing — 0.1 quantisation on both streams, and a
+fused orientation estimate that lags and jitters:
+
+- **A rate floor.** Below ~20°/s the orientation stream's own jitter produces
+  more apparent gravity movement than the real motion does. A degree of jitter
+  across a 20 ms step reads as 50°/s of phantom du/dt. Those intervals are now
+  skipped, which also discards the idle seconds at either end of any motion.
+- **A wide gravity baseline.** Gravity's movement is measured across ~100 ms
+  rather than between neighbouring samples, so jitter falls by the ratio of the
+  spans while the signal does not. This was the big one: gentle waving at high
+  sensor lag went from 21/30 to 30/30, the whole grid from 155/200 to 195/200,
+  worst residual roughly halved, and the measured gyro scale error dropped from
+  0.031 to 0.003. The cost is a chord-versus-arc approximation, under 1% even
+  at 200°/s.
+
+The app now solves live, several times a second, on the samples arriving as the
+operator waves — thinned to ~260 intervals, 3 ms a call against 8 ms for the
+full set for an identical answer. So there is no button to press at the right
+moment and no way to finish too early: it watches, says what is still missing,
+and stops when it is sure. Median time to convergence in simulation is 4
+seconds.
+
+The property that governs all of it, asserted in `tests/gyro-freeform.test.mjs`
+across 200 runs spanning 25-220°/s and 0-220 ms of orientation lag: **a wrong
+map is never returned.** Every failure is a refusal. That is what makes it safe
+to remove the instructions — a silently transposed axis map would corrupt every
+azimuth in a survey while the report still read healthy, so the only acceptable
+failure is one that asks the operator to wave again.
+
+Guidance inverted along the way, and the old advice was actively wrong: brisk
+waving is *better* than slow, because jitter is a fixed angular error while the
+signal scales with rate. The screen now says so.
+
+Not verified on hardware. The bar for the next run is `SENSOR_AXIS_SOLVE` with
+`decidedBy: "kinematics"`, `assumedDirection: false`, and the same
+`perm [2,0,1]` this phone has already produced once.
+
+### 2026-08-13, 22:46 — a 5% gyro scale is a 26° azimuth error
+
+First run to reach the far side: 356° of 360° covered, 712/720 bins, 5291
+observations, calibration solving to the same `perm [2,0,1]` with margin 0.768.
+What remained was ugly: maximum spread 66°, 87 spike bins, and a panorama in
+which the neighbouring house fanned out across a third of the circle.
+
+Both trace back to one number. `gyroScale` came out **1.0538** here against
+**1.0112** from the same phone four hours earlier. Gyro scale is a fixed
+property of a device; a 4% swing between runs is a measurement fault, and it
+multiplies every azimuth the survey records. Pass 1 travelled 489° — 1.36 laps
+— so bins near the start were visited twice with up to 26° of accumulated
+azimuth error between visits. At the vertical edge of a close, tall house the
+true skyline falls from ~45° to ~5° within two or three degrees of azimuth, so
+a 26° misplacement writes roof altitudes into open-sky bins. That is the 66°
+spread and the 87 spikes, and it is not a detector failure: mean segmentation
+confidence was 60% and the clipped-column and no-sky gates all did their jobs.
+
+Why the scale was wrong: it was a ratio of sums over the tumble, and that run's
+tumble peaked at 396°/s. Two errors compound at that speed — the fused
+orientation stream cannot keep up, and `du` measures the CHORD across gravity's
+arc rather than the arc itself, which understates fast motion. Fixed by:
+
+- taking the weighted **median of per-interval ratios** rather than a ratio of
+  sums, so a handful of badly tracked instants cannot set the answer;
+- correcting chord to arc explicitly — `arc = chord · (θ/2)/sin(θ/2)`, where θ
+  is the angle turned across the gravity baseline, known from the gyro. The
+  first instinct, rejecting the fast intervals, made things *worse*: it keeps
+  only the slow ones, where jitter dominates. Measured: median error at 450°/s
+  went 1.3% high under rejection versus 1.1% with correction, and the low bias
+  at speed disappeared;
+- reporting `scaleSpread` and refusing a scale whose own intervals disagree.
+
+Measured across paces and sensor lags, median error is now **0.32%** at normal
+speed and 1.1% at a violent 450°/s, against the 4% swing the field produced.
+
+What is NOT fixed, because it cannot be: the near house fans in the panorama
+because of **parallax**. Turning on the spot orbits the camera around the
+operator's spine, perhaps 0.4 m out; a house 4 m away therefore shifts about 6°
+between adjacent keyframes, and no stitcher recovers that from a single
+viewpoint. It is a property of the geometry, not a bug, and it affects imagery
+only — altitudes come from camera geometry and gravity and are untouched.
+
+Not verified on hardware.

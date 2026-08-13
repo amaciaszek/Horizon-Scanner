@@ -93,7 +93,32 @@ const PITCH = wrap('Seen from the side: phone tumbling end over end, top edge aw
   <text x="60" y="124" text-anchor="middle" style="${S.label}">PITCH · TUMBLE</text>
 `);
 
-const FIGURES = { yaw: YAW, roll: ROLL, pitch: PITCH };
+/* Freeform — the only figure calibration now shows. There is no pose to adopt
+ * and no direction to get right, so it draws the opposite of an instruction:
+ * a phone mid-tumble with arrows curling around all three axes at once, and
+ * ghosts of it at other angles. The message to read off it in one glance is
+ * "every which way", which is the whole of the procedure. */
+const FREEFORM = wrap('Turn and tumble the phone in every direction', `
+  <g opacity="0.22" transform="translate(34 40) rotate(-52)">
+    <rect x="-9" y="-17" width="18" height="34" rx="3" style="${S.body}"/>
+  </g>
+  <g opacity="0.22" transform="translate(88 76) rotate(34)">
+    <rect x="-9" y="-17" width="18" height="34" rx="3" style="${S.body}"/>
+  </g>
+  <g opacity="0.22" transform="translate(84 30) rotate(78)">
+    <rect x="-9" y="-17" width="18" height="34" rx="3" style="${S.body}"/>
+  </g>
+  <g transform="translate(58 58) rotate(-18)">
+    <rect x="-13" y="-25" width="26" height="50" rx="4" style="${S.body}"/>
+    <rect x="-9.5" y="-20" width="19" height="38" rx="2" style="${S.screenLit}"/>
+    <circle cx="0" cy="21" r="2.2" style="${S.screen}"/>
+  </g>
+  <path d="M20,58 A38,15 0 1 0 96,58" style="${S.arrow}" marker-end="url(#cfhead)"/>
+  <path d="M58,20 A15,38 0 1 0 58,96" style="${S.arrow}" marker-end="url(#cfhead)"/>
+  <text x="60" y="124" text-anchor="middle" style="${S.label}">ANY DIRECTION</text>
+`);
+
+const FIGURES = { yaw: YAW, roll: ROLL, pitch: PITCH, freeform: FREEFORM };
 
 /** SVG markup for a calibration stage, or null when the stage has no figure. */
 export function calibrationFigure(name) {

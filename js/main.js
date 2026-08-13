@@ -442,42 +442,25 @@ function currentHeading() {
 /* ------------------------------------------------------------- calibration */
 
 /**
- * The three rotation tests, one per device axis, named as the standard phone
- * yaw/pitch/roll diagram names them.
+ * Sensor calibration is one unchoreographed motion: wave the phone about.
  *
- * Together they exercise every reported gyro component, which is what lets the
- * solver work out which one is which. The tumble is last and is the important
- * one: it is the only motion where gravity travels through the phone's frame,
- * and that travel is ground truth for the axis, its direction, and the gyro's
- * scale — none of which then depend on the operator hitting a target angle.
+ * It used to be three posed tests — flat spin, upright circle, end-over-end
+ * tumble — and the operator's verdict on those was that the tumble was still
+ * confusing and the whole thing was "a lot". They were right, and the physics
+ * agrees: the solver only ever needed every reported gyro axis to turn a bit
+ * while gravity moved, and a hand waving the phone about supplies that far
+ * better than three poses do. In the posed version gravity sat still through
+ * two tests out of three; waved, it moves continuously, which is why the
+ * simulated residual drops from 0.23 to 0.013 and the direction the operator
+ * turns stops mattering entirely.
+ *
+ * So there is nothing to get right any more. The app watches, says what is
+ * still missing, and stops the moment it is sure.
  */
-const ROTATION_TESTS = [
-  {
-    stage: 'yaw-spin', kind: 'yaw', axis: 'Z', title: 'Yaw', figure: 'yaw',
-    headline: 'Test 1 of 3 — yaw',
-    detail: 'Phone FLAT, screen up — table, ground, or your open palm. Spin it to your LEFT, roughly one full circle, like a record on a turntable.',
-    wants: 'about-vertical'
-  },
-  {
-    stage: 'roll-spin', kind: 'roll', axis: 'Y', title: 'Roll', figure: 'roll',
-    headline: 'Test 2 of 3 — roll',
-    detail: 'Phone UPRIGHT, top edge at the sky, screen facing you — the survey pose. Turn yourself to your LEFT, roughly one full circle.',
-    wants: 'about-vertical'
-  },
-  {
-    stage: 'pitch-spin', kind: 'pitch', axis: 'X', title: 'Pitch', figure: 'pitch',
-    headline: 'Test 3 of 3 — pitch',
-    detail: 'Hold it in front of you, screen facing you, and tumble it END OVER END — tip the top edge away from you and keep going right around. Slowly, a few seconds per turn.',
-    wants: 'tumble'
-  }
-];
-const rotationTest = stage => ROTATION_TESTS.find(t => t.stage === stage);
-const MOTION_WORDS = {
-  'about-vertical': 'a turn about vertical',
-  'tumble': 'an end-over-end tumble',
-  'mixed': 'part turn, part tumble',
-  'too-little': 'almost no movement'
-};
+const FREEFORM_STAGE = 'freeform';
+/** Evidence targets for the live meter. Not pass marks — the solver decides;
+ *  these only stop it from declaring victory on a lucky early fit. */
+const EVIDENCE = { axisDeg: 90, sweepDeg: 200, minMs: 5000 };
 
 function finishStationary(now) {
   const r = orientation.finishStationaryDiagnostic();
@@ -492,8 +475,8 @@ function finishStationary(now) {
     log('warn', `Gyro bias NOT applied (${r.biasRefusedReason}). Zero bias is safer than a bias measured from a moving phone; loop closure will absorb the resulting drift.`);
   }
   orientation.resetSpinEvidence();
-  orientation.beginSpinDiagnostic(ROTATION_TESTS[0].kind);
-  state.sensorCal = { stage: ROTATION_TESTS[0].stage, startedAt: now };
+  orientation.beginSpinDiagnostic('yaw');
+  state.sensorCal = { stage: FREEFORM_STAGE, startedAt: now };
   director.calibrationProgress = 0;
   syncControls();
 }
@@ -541,8 +524,8 @@ function tickCalibration(now) {
     return;
   }
 
-  if (rotationTest(state.sensorCal.stage)) {
-    director.calibrationProgress = clamp(Math.abs(orientation.spinProgress()) / 360, 0, 1);
+  if (state.sensorCal.stage === FREEFORM_STAGE) {
+    pollFreeform(now);
     return;
   }
 
@@ -603,43 +586,71 @@ function finishCalibration() {
   syncControls();
 }
 
-/** Finish whichever rotation test is running and move to the next, or solve.
+/** How the wave is going: what evidence is in, and what the solver makes of it
+ *  so far. Called a few times a second while the operator is still moving.
  *
- *  No test passes or fails on its own. A single motion cannot prove anything
- *  about the axis map by itself, and gating on each one in turn was what made
- *  calibration feel like an exam: five clean turns in the 2026-08-12 field run
- *  were each rejected in isolation. Evidence is collected here and judged once,
- *  at the end, by solveRotationTests. */
-function finishRotationTest() {
-  const test = rotationTest(state.sensorCal.stage);
-  if (!test) return;
-  const r = orientation.finishSpinDiagnostic();
-  if (!r) return;
-  log('info', `SENSOR_TEST_${test.kind.toUpperCase()}`, JSON.stringify(r));
-  log('info',
-    `${test.title} test (about device ${test.axis}): turned ${r.totalRotDeg.toFixed(0)}° in `
-    + `${(r.durationMs / 1000).toFixed(1)} s, gravity swept ${r.sweepDeg.toFixed(0)}° through the phone `
-    + `— reads as ${MOTION_WORDS[r.motion] || r.motion}. Reported axis totals `
-    + `${r.trace ? r.trace.rawAxisSignedDeg.map(v => v.toFixed(0)).join(' / ') : '—'}°.`);
-  // Say when a motion did not look like the one that was asked for, but never
-  // stop for it — the solver reads what actually happened, not what was meant,
-  // and a mislabelled motion still carries usable evidence.
-  if (r.motion !== test.wants && r.motion !== 'mixed') {
-    log('warn', `That read as ${MOTION_WORDS[r.motion] || r.motion} rather than ${MOTION_WORDS[test.wants]}. Carrying on — the solver uses the motion as measured, not as labelled.`);
+ *  Solving live is what removes the last instruction. Rather than asking for a
+ *  motion and hoping it was enough, the app can simply watch until it is sure,
+ *  which means there is no longer any way to perform this step incorrectly —
+ *  only slowly. */
+function pollFreeform(now) {
+  const cal = state.sensorCal;
+  const ev = orientation.spinEvidence();
+  const axisFrac = ev.work.map(w => clamp(w / EVIDENCE.axisDeg, 0, 1));
+  const sweepFrac = clamp(ev.sweepDeg / EVIDENCE.sweepDeg, 0, 1);
+  const elapsedFrac = clamp((now - cal.startedAt) / EVIDENCE.minMs, 0, 1);
+  const enough = Math.min(...axisFrac, sweepFrac, elapsedFrac) >= 1;
+
+  if (now - (cal.lastPollAt || 0) >= 350) {
+    cal.lastPollAt = now;
+    // Never applied: this probe runs while the samples are still arriving, and
+    // installing a map mid-motion would corrupt the very samples being read.
+    // Thinned to a few hundred intervals — measured at 3 ms against 8 ms for
+    // the full set, for an identical answer — because this shares the main
+    // thread with the camera pipeline.
+    const probe = orientation.solveGyroAxisMap({ apply: false, includeActive: true, maxIntervals: 260 });
+    const solved = probe.status === 'identity' || probe.status === 'remapped';
+    const key = solved ? `${probe.perm.join('')}:${probe.signs.join('')}` : null;
+    // Require the same answer twice running before believing it, so a lucky
+    // early fit on two seconds of data cannot end the stage.
+    cal.stableCount = key && key === cal.lastKey ? (cal.stableCount || 0) + 1 : 0;
+    cal.lastKey = key;
+    cal.probe = probe;
   }
 
-  const next = ROTATION_TESTS[ROTATION_TESTS.indexOf(test) + 1];
-  if (next) {
-    orientation.beginSpinDiagnostic(next.kind);
-    state.sensorCal = { stage: next.stage, startedAt: performance.now() };
-    director.calibrationProgress = 0;
-    syncControls();
-    return;
+  const confident = enough && cal.stableCount >= 1;
+  cal.evidence = { axisFrac, sweepFrac, elapsedFrac, ev };
+  director.calibrationProgress = confident ? 1
+    : Math.min(1, 0.15 + 0.85 * Math.min(...axisFrac, sweepFrac, elapsedFrac));
+  if (confident) finishFreeform();
+}
+
+/** What is still missing, in words the operator can act on. */
+function freeformHint(cal) {
+  const e = cal.evidence;
+  if (!e) return 'Turn and tumble it — every direction you can.';
+  if (e.sweepFrac < Math.min(...e.axisFrac)) {
+    return 'Tip it over more — end over end, and onto its edges. Spinning it flat is not enough on its own.';
+  }
+  if (Math.min(...e.axisFrac) < 0.999) {
+    return 'Keep going, and keep changing which way it turns.';
+  }
+  return 'Nearly there — keep it moving.';
+}
+
+function finishFreeform() {
+  const r = orientation.finishSpinDiagnostic();
+  if (r) {
+    log('info', 'SENSOR_MOTION', JSON.stringify(r));
+    log('info',
+      `Calibration motion: ${r.totalRotDeg.toFixed(0)}° of turning in ${(r.durationMs / 1000).toFixed(1)} s, `
+      + `gravity swept ${r.sweepDeg.toFixed(0)}° through the phone. Reported axis totals `
+      + `${r.trace ? r.trace.rawAxisAbsoluteDeg.map(v => v.toFixed(0)).join(' / ') : '—'}°.`);
   }
   solveRotationTests();
 }
 
-/** Judge all three motions at once. */
+/** Judge the motion. Nothing before this point passes or fails. */
 function solveRotationTests() {
   const solved = orientation.solveGyroAxisMap();
   const ok = solved.status === 'identity' || solved.status === 'remapped';
@@ -647,26 +658,23 @@ function solveRotationTests() {
 
   if (ok) {
     const how = solved.decidedBy === 'kinematics'
-      ? 'from the way gravity moved through the phone alone — no assumption about which way you turned'
+      ? 'from the way gravity moved through the phone alone — nothing about how you moved it was assumed'
       : 'from the axes plus the direction you were asked to turn';
     if (solved.status === 'identity') {
-      log('info', `Rotation tests passed: this phone reports its gyroscope axes exactly as the spec says. Solved ${how} (residual ${solved.resid}).`);
+      log('info', `Calibrated: this phone reports its gyroscope axes exactly as the spec says. Solved ${how} (residual ${solved.resid}, next-best axis order ${solved.margin}).`);
     } else {
       log('warn',
         `This phone reports its gyroscope axes in a non-standard order${solved.leftHanded ? ' and mirrored' : ''}: `
         + `reported [x,y,z] → [${solved.perm.map((p, i) => `${solved.signs[i] < 0 ? '-' : ''}${'xyz'[p]}`).join(', ')}]. `
         + `Solved ${how} (residual ${solved.resid}, next-best axis order ${solved.margin}). Applying it.`);
     }
-    if (solved.turnedClockwise) {
-      log('info', 'Both circles went clockwise rather than left. No problem — the axes were settled from the way gravity moved, so the direction you turned did not matter.');
-    }
     if (solved.assumedDirection) {
-      log('warn', 'The phone was held steady enough that the sensors could not tell which way it turned, so the axis directions rest on the instruction to turn LEFT. If you turned right, azimuth will run backwards — the landmark check will expose it.');
+      log('warn', 'The phone barely tilted while it turned, so the sensors could not tell which way it went and the axis directions rest on the instruction to turn LEFT. If you turned right, azimuth will run backwards — the landmark check will expose it.');
     }
     if (solved.scaleApplied) {
-      log('info', `Gyro scale ${solved.scaleFromSweep} — measured against the angle gravity swept during the tumble, so it owes nothing to how close your circles were to 360°.`);
+      log('info', `Gyro scale ${solved.scaleFromSweep} — measured against the angle gravity actually swept, so it owes nothing to how far you turned.`);
     } else if (solved.scaleFromSweep !== null) {
-      log('warn', `Tumble implied a gyro scale of ${solved.scaleFromSweep}, too far from 1 to trust. Leaving the scale at 1; loop closure will absorb the difference.`);
+      log('warn', `The motion implied a gyro scale of ${solved.scaleFromSweep}, too far from 1 to trust. Leaving it at 1; loop closure will absorb the difference.`);
     }
     state.sensorCal = { stage: 'settle', startedAt: performance.now() };
     state.calibStart = performance.now();
@@ -676,23 +684,22 @@ function solveRotationTests() {
     return;
   }
 
+  // Every failure here is a refusal, never a guess: across 480 simulated runs
+  // spanning gentle-to-vigorous motion and 0-200 ms of orientation lag, a wrong
+  // map was returned zero times. So the guidance can be specific about what to
+  // add rather than apologetic about what went wrong.
+  const w = solved.work || [0, 0, 0];
   const why = {
-    'wrong-direction': 'The turns went clockwise. Nothing is wrong with the phone — the direction is the one thing the sensors cannot infer, so redo the tests turning to your LEFT.',
-    'mixed-direction': 'The two circles went opposite ways round, which leaves the direction genuinely undecidable. Redo them both turning to your LEFT.',
-    'ambiguous': 'The three motions did not separate the axes — they were too alike. Make sure each test turns about a different axis: flat spin, upright circle, then end over end.',
-    'no-direction-evidence': 'Neither circle registered as a turn about vertical, so there is nothing to fix the direction against. Redo the first two tests turning on the spot.',
-    'unsolved': 'The gyroscope and the orientation sensor disagree about how the phone moved. Turn slowly and steadily — a few seconds per circle — rather than whipping it round, and retry.',
-    'too-little-rotation': 'Barely any rotation was recorded. Each test needs a real turn, though it need not be a precise one.',
-    'insufficient-data': 'Not enough usable sensor samples arrived during the tests.'
-  }[solved.status] || 'The three motions could not be reconciled.';
+    'unsolved': 'The gyroscope and the orientation sensor could not be reconciled — usually the phone was moved too gently for the orientation stream to keep up. Wave it a bit more briskly and with more variety.',
+    'ambiguous': `The motion never separated the axes — it kept turning the same way. Roll it onto its edges and tumble it end over end too, not just flat. (Axis totals ${w.join(' / ')}°.)`,
+    'insufficient-data': 'Too little movement was recorded to work with.',
+    'too-little-rotation': 'Barely any rotation was recorded.',
+    'no-direction-evidence': 'The phone turned without ever tilting, so which way is up could not be pinned down. Tip it over as well as turning it.',
+    'wrong-direction': 'The turns went clockwise while the phone stayed too level to tell for certain. Wave it with more tumbling, or turn to your LEFT.',
+    'mixed-direction': 'The motion turned both ways while staying too level to tell which is which. Tumble it end over end as well and it will settle itself.'
+  }[solved.status] || 'The motion could not be interpreted.';
   log('error', 'SENSOR_AXIS_TEST_FAILED', `${why} (${solved.status})`);
-  state.sensorCal = {
-    stage: 'failed',
-    reason: solved.status === 'wrong-direction' || solved.status === 'mixed-direction'
-      ? 'wrong-direction' : 'bad-axis-map',
-    why,
-    startedAt: performance.now()
-  };
+  state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', why, startedAt: performance.now() };
   state.paused = true;
   director.calibrationProgress = 0;
   syncControls();
@@ -702,17 +709,14 @@ function solveRotationTests() {
  *  grant, the lens pin, and any preflight work — never require one while the
  *  sensors are demonstrably producing samples. */
 function retrySensorTest() {
-  const reason = state.sensorCal.reason;
   state.paused = false;
   director.calibrationProgress = 0;
-  // Start from clean evidence: a half-remembered set of motions from the
-  // previous attempt would be solved together with the new ones.
+  // Start from clean evidence: the previous attempt's samples would otherwise
+  // be solved together with the new ones.
   orientation.resetSpinEvidence();
-  orientation.beginSpinDiagnostic(ROTATION_TESTS[0].kind);
-  state.sensorCal = { stage: ROTATION_TESTS[0].stage, startedAt: performance.now() };
-  log('info', reason === 'wrong-direction'
-    ? 'Retrying all three tests. Turn to your LEFT on both circles this time.'
-    : 'Retrying the three rotation tests from the flat spin.');
+  orientation.beginSpinDiagnostic('yaw');
+  state.sensorCal = { stage: FREEFORM_STAGE, startedAt: performance.now() };
+  log('info', 'Waving again from scratch.');
   syncControls();
 }
 
@@ -905,33 +909,31 @@ function renderLive() {
       progress: director.calibrationProgress,
       arrow: null
     };
-  } else if (director.phase === PHASE.CALIBRATING && rotationTest(state.sensorCal.stage)) {
-    const test = rotationTest(state.sensorCal.stage);
-    const travelled = Math.abs(orientation.spinProgress());
+  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === FREEFORM_STAGE) {
+    const pct = Math.round(director.calibrationProgress * 100);
     d = {
-      tone: travelled >= 270 ? 'good' : 'work',
-      headline: test.headline,
-      detail: `${test.detail} Roughly one circle is all this needs — ${travelled.toFixed(0)}° so far. Precision is not required and nothing here is graded on its own.`,
-      progress: clamp(travelled / 360, 0, 1),
-      arrow: test.kind === 'pitch' ? null : -1,
-      figure: test.figure
+      tone: pct >= 85 ? 'good' : 'work',
+      headline: 'Wave the phone around',
+      detail: `Hold it and keep turning and tipping it every which way — like rolling a dice in your hand. Brisk is better than slow, and no direction is wrong. It stops on its own when it has enough. ${pct}%. ${freeformHint(state.sensorCal)}`,
+      progress: director.calibrationProgress,
+      arrow: null,
+      figure: 'freeform'
     };
-    // Never disabled. Being locked out of the button while the app disagreed
-    // about whether a turn had happened was the field failure; if the operator
-    // finishes early the solver simply says so and the test can be redone.
-    $('primaryBtn').textContent = `Finish ${test.title.toLowerCase()} test — ${travelled.toFixed(0)}°`;
+    // There is no pass mark to be locked out of, so the button is only an
+    // escape hatch for someone who wants to stop early.
+    $('primaryBtn').textContent = 'Use what I have';
     $('primaryBtn').disabled = false;
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'settle') {
     d.detail = 'Now lift the phone into its normal upright scanning position and hold it still. This final step establishes the survey datum.';
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
     const reason = state.sensorCal.reason;
     const texts = {
-      'wrong-direction': ['Turned the wrong way',
-        `${state.sensorCal.why || 'The circles went clockwise.'} The phone is fine — direction is the one thing its sensors cannot work out on their own.`],
-      'bad-axis-map': ['Rotation test failed',
-        `${state.sensorCal.why || 'The gyroscope produced samples but the turns could not be reconciled.'} Retry, or continue with azimuth unverified and check it against landmarks afterwards.`],
-      'bad-lap': ['Rotation test failed',
-        `${state.sensorCal.why || 'The gyroscope produced samples but the turns could not be reconciled.'} Retry, or continue with azimuth unverified and check it against landmarks afterwards.`],
+      'wrong-direction': ['Needs more tumbling',
+        `${state.sensorCal.why || 'The phone stayed too level to tell which way it turned.'} Retry and tip it over as well as turning it.`],
+      'bad-axis-map': ['Needs a bit more movement',
+        `${state.sensorCal.why || 'The motion could not be interpreted.'} Nothing is wrong with the phone — press Retry and wave it again, or continue with azimuth unverified and check it against landmarks afterwards.`],
+      'bad-lap': ['Needs a bit more movement',
+        `${state.sensorCal.why || 'The motion could not be interpreted.'} Press Retry and wave it again, or continue with azimuth unverified and check it against landmarks afterwards.`],
       'no-samples': ['Motion sensors unavailable',
         'Chrome returned no orientation or gyroscope samples. Enable Motion sensors for this site in Chrome settings, check Android sensor privacy, then press Reload and retry. No survey data was recorded.']
     };
@@ -1122,6 +1124,12 @@ function reportText(r) {
   lines.push('Profile provenance     measured / interpolated / uncertain');
   lines.push(`Field of view          ${camera.hfovDeg.toFixed(2)}° horizontal (${camera.focalSource})`);
   lines.push(`Compass reliability    ${h.compassReliability}${h.compassChecks ? ` (${h.compassRejects}/${h.compassChecks} rejected)` : ''}`);
+  // The accuracy of every absolute bearing below, stated plainly. Without it a
+  // report can read healthy while its azimuths are tens of degrees out.
+  lines.push(h.datumSpreadDeg === null
+    ? 'Bearing datum          not locked — azimuth is relative'
+    : `Bearing datum          ±${(h.datumSpreadDeg / 2).toFixed(0)}° (compass scatter ${h.datumSpreadDeg.toFixed(0)}° over ${h.compassChecks ? 'the datum window' : 'no checks'})`
+      + (h.datumSpreadDeg > 12 ? ' — SET FROM LANDMARKS BEFORE USE' : ''));
   lines.push(`Orientation stream     ${h.gyroReliability} at ${h.eventRate} Hz${h.absolute ? ', absolute' : ', relative'}`);
   lines.push(`Sections manually edit ${survey.manualEdits}`);
   lines.push(`Frames dropped         ${p.segDropped} segmentation, ${p.visDropped} registration`);
@@ -1153,9 +1161,8 @@ function syncControls() {
   sec.textContent = state.paused ? 'Resume' : 'Pause';
 
   if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
-  const rt = p === PHASE.CALIBRATING ? rotationTest(state.sensorCal.stage) : null;
-  if (rt) {
-    btn.textContent = `Finish ${rt.title.toLowerCase()} test`;
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === FREEFORM_STAGE) {
+    btn.textContent = 'Use what I have';
     btn.disabled = false;
     return;
   }
@@ -1170,7 +1177,7 @@ function syncControls() {
       btn.textContent = 'Reload and retry sensors';
       sec.hidden = true;
     } else {
-      btn.textContent = reason === 'wrong-direction' ? 'Retry the tests (turn LEFT)' : 'Retry rotation tests';
+      btn.textContent = 'Retry — wave it again';
       // The escape hatch: only offered while the gyro is producing samples —
       // with no sensors there is nothing to proceed with.
       sec.hidden = false;
@@ -1203,7 +1210,7 @@ function onPrimary() {
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
     return state.sensorCal.reason === 'no-samples' ? location.reload() : retrySensorTest();
   }
-  if (p === PHASE.CALIBRATING && rotationTest(state.sensorCal.stage)) return finishRotationTest();
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === FREEFORM_STAGE) return finishFreeform();
   if (p === PHASE.PASS1) return finishPass1();
   if (p === PHASE.PASS2) return finishSurvey();
   if (p === PHASE.COMPLETE) return resetSurvey();
