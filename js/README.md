@@ -1037,3 +1037,160 @@ viewpoint. It is a property of the geometry, not a bug, and it affects imagery
 only — altitudes come from camera geometry and gravity and are untouched.
 
 Not verified on hardware.
+
+### 2026-08-13, 23:06 — a full lap, and the field of view is the last big error
+
+First complete survey: **360.0° of 360.0°**, 720/720 bins observed, 5737
+observations. The one-motion calibration worked on the first try — five seconds
+of waving, `decidedBy: kinematics`, `assumedDirection: false`, the same
+`perm [2,0,1]` this phone has now produced three times, residual 0.208 against
+0.706 for the next axis order.
+
+Two of the new guards fired correctly and are worth recording as successes: the
+bias was **refused** (`not-still, gyro noise 27.8°/s`) because the phone was
+never set down, and the scale was **refused** (`scaleSpread 0.1455`) because the
+motion was frantic — 1598° of turning in 5 s, peaking at 645°/s, far past what
+the fused orientation stream can track. Both refusals are the right call, and
+both cost nothing: zero bias and unit scale are the safe defaults. The screen
+now needs to say "briskly, not frantically"; the previous advice only had a
+lower bound.
+
+What remains is one number, and it is large. `visualScale` settled at **2.642**:
+the imagery and the gyroscope, measuring the same rotation, disagree by that
+factor. Since `dVis = atan(dx / focalAssumed)`, a ratio above 1 means the true
+focal is LONGER than assumed — the frame spans about **27.6°**, not the 66° in
+use. The sanity check lands in the same place: 66° is a LANDSCAPE figure, and
+this stream is portrait 1080×1920, so the short side of a nominal 66° lens
+subtends about 40°. The app has been applying a long-side number to a short
+side.
+
+That single error explains the rest of the report:
+
+- Altitudes are overstated by roughly 2.6x — a point 60% up the frame is
+  reported at 16.3° when it is really 6.3°. The house reading 55-60° is not.
+- The error GROWS toward the frame edges, so the same skyline point read from
+  two keyframes that happened to catch it at different in-frame positions
+  disagrees by tens of degrees. That is what the 50.13° maximum spread and the
+  51 spike bins are made of — not detector failure, not azimuth drift.
+- Loop closure could not match, because the visual search hint is scaled by the
+  same wrong focal length.
+- The panorama's fanning near the house: frames projected 2.6x too wide cannot
+  align with their neighbours. Parallax is real but second order next to this.
+- Azimuth is untouched, because it comes from the gyroscope.
+
+The app had measured all of this and said so in one ambiguous report line
+("field of view is understated by 164%") while the profile looked plausible.
+Now it warns during the scan, names the measured figure in degrees, states the
+consequence, and says which control to set. The self-calibration path
+(`survey.addFocalSample`) never adopted it because its gate needs
+`quality >= 0.6` on twelve samples and this scan mostly ran at 0.25; the
+`visualScale` estimator, gated only on confident frames but not on the other
+four conditions, accumulated fine. Adopting from `visualScale` automatically is
+the obvious next step and is deliberately NOT taken here — it multiplies every
+altitude, so it should be verified against a lens scan on hardware first.
+
+Not verified on hardware.
+
+### 2026-08-13, later — measuring the lens instead of guessing it
+
+The operator's objection to being handed "set it to 28°" was correct, and it
+was the right instinct twice over: a number inferred passively from a survey
+that was mostly running at 0.25 match quality is not a measurement, and nobody
+should have to take it on faith.
+
+So `js/lenscal.js` measures it, from the oldest relation there is:
+
+    pixels = focal · tan(angle)
+
+Rotate the camera by a known angle, see how far the picture moved. What makes
+it trustworthy is where "known angle" comes from, and the two axes deliberately
+take it from different places:
+
+- **Horizontal**, from panning: the angle comes from the gyroscope, which by
+  this point has had its axes solved and its scale checked.
+- **Vertical**, from tilting: the angle comes from **gravity**. Nothing in this
+  app is more trustworthy than which way is down — it needs no calibration,
+  cannot drift, and no magnetic junk can reach it.
+
+That second one is the point. Altitude is the quantity this whole app exists to
+report, and altitude depends on the VERTICAL half-angle, which until now was
+never measured at all: `tanHalfV = tanHalfH · (WORK_H/WORK_W)`, derived from the
+horizontal through an assumed pixel aspect and crop. The most important number
+in the survey rested on the one part of the model nothing ever checked. It is
+now measured directly against gravity, and `camera.setMeasuredLens` keeps the
+two independent.
+
+Measured against a simulated pinhole camera with realistic matcher noise:
+
+| true FOV | recovered | uncertainty |
+|---|---|---|
+| 27.6° (the field lens) | 27.51° | ±0.18% |
+| 40° | 40.27° | ±0.26% |
+| 66° | 66.79° | ±0.47% |
+| 95° | 94.42° | ±0.93% |
+
+With one pair in five being a bad match and double the noise, worst error across
+twelve sessions was 0.70°. A camera whose vertical does not follow from its
+horizontal (50° by 20°) is recovered on both axes, where the derived model would
+have claimed 39.2° against a truth of 20° — which is the failure mode this
+exists to catch. Thin evidence is refused rather than guessed: a still phone
+yields nothing, two seconds is not enough, and panning without tilting leaves
+the vertical explicitly unready, because that is the axis altitudes depend on.
+
+Two subtleties were worth the trouble, both found by the tests disagreeing with
+the first implementation:
+
+- **Cut on the predicted shift, never the measured one.** Rejecting pairs whose
+  measured pixel shift was small keeps exactly those the noise happened to push
+  over the threshold, which biases the focal length up and the field of view
+  down — 3.3° of a 95° lens. Predicting the shift from a provisional fit breaks
+  the dependence.
+- **Gate on the uncertainty of the estimate, not the scatter of the pairs.** At
+  30 fps a 66° lens moves the image ~5 px between frames, so each pair is
+  individually good to maybe 8% while the median of two hundred is good to 0.5%.
+  Gating on per-pair scatter rejected sound measurements of ordinary lenses and
+  accepted only long ones.
+
+Built and tested here: the estimator, and the camera support for an independent
+vertical. NOT yet wired: the guided on-screen step that collects the pairs. That
+is the next piece, and until it exists the measurement has nothing to feed it.
+
+### 2026-08-13, later still — the lens step is wired
+
+`LENS_STAGE` now runs straight after the axis solve, because the horizontal
+half of the measurement compares the picture against the gyroscope and the
+gyroscope is only metric once its axes are known.
+
+There are no sub-steps. The coaching follows the evidence instead: it asks for
+detail in the scene while there are no pairs at all, for panning until the
+horizontal is ready, then for tilting, then it stops. Progress is the weaker of
+the two axes, so the bar cannot read finished while the VERTICAL is still
+missing — that being the axis altitudes depend on. It ends on its own the
+moment both are solid, times out after a minute rather than trapping an
+operator in front of a blank wall, and can be skipped, though never silently:
+the log then states that altitudes are only as good as the default and that the
+error grows toward the frame edges.
+
+Two ordering rules that matter:
+
+- The passive self-calibrator must not overwrite a deliberate measurement. It
+  runs on whatever imagery a survey happened to produce; the guided one ran on
+  a scene chosen for the job and measured the vertical against gravity.
+- `camera.setMeasuredLens` keeps the two axes independent, so nothing
+  downstream re-derives the vertical from the horizontal.
+
+Verified through the real modules in the browser, driven exactly as the capture
+loop drives them — including the registration-frame to working-frame pixel
+conversion, which is the one place a wiring slip could hide and produce a
+confident wrong answer. Feeding it the field lens: measured **27.45° against a
+true 27.6°, ±0.19%**, and the camera moved from its 66°/51.9° default to
+27.45°/20.7° with `verticalIsIndependent` true.
+
+The acceptance report now states both axes and says which way the vertical was
+obtained, so a profile can never again look healthy while resting on a derived
+number nothing checked.
+
+Still not verified on hardware — in particular whether the registration worker
+reports vertical shift as cleanly as horizontal, since nothing has needed `dy`
+before now. If the vertical never reaches ready in the field, that is where to
+look first.

@@ -12,6 +12,7 @@ import { Pipeline } from './pipeline.js';
 import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
 import { drawRing, drawProfile, drawOverlay } from './render.js';
 import { calibrationFigure } from './calfigures.js';
+import { LensCalibrator } from './lenscal.js';
 import * as store from './storage.js';
 import * as out from './exporters.js';
 import {
@@ -55,6 +56,7 @@ const director = new ScanDirector(survey);
 const orientation = new OrientationSource(log);
 const camera = new CameraSource($('video'), log);
 const pipeline = new Pipeline(log);
+const lensCal = new LensCalibrator(WORK_W, WORK_H);
 const preflight = new PreflightSweep();
 
 const state = {
@@ -209,6 +211,29 @@ async function processFrame() {
         }
       }
       const dVis = dVisMag * (state.visualSign ?? -1);
+
+      // The guided lens measurement, while it is running. Both axes are fed
+      // from the same matcher output, but the ANGLE each one is compared
+      // against comes from a different sensor on purpose: yaw from the
+      // gyroscope, tilt from gravity. See js/lenscal.js.
+      if (state.sensorCal.stage === LENS_STAGE) {
+        // r.dx/r.dy are registration-frame pixels; the calibrator works in the
+        // frame the survey actually measures angles in.
+        const toWork = WORK_W / LUMA_W;
+        lensCal.addPan({
+          dxPx: r.dx * toWork, dYawDeg: dGyro,
+          elevationDeg: att.elevation, quality: r.quality
+        });
+        if (state.prevElevation !== null) {
+          lensCal.addTilt({
+            dyPx: r.dy * toWork,
+            dPitchDeg: att.elevation - state.prevElevation,
+            quality: r.quality
+          });
+        }
+      }
+      state.prevElevation = att.elevation;
+
       const lensChange = highElevation
         ? null
         : survey.addFocalSample(r.dx, dGyro, att.elevation, r.quality);
@@ -248,6 +273,29 @@ async function processFrame() {
           if (ratio > 0.2 && ratio < 5) {
             state.visualScale = state.visualScale === null
               ? ratio : 0.98 * state.visualScale + 0.02 * ratio;
+            state.visualScaleN = (state.visualScaleN || 0) + 1;
+          }
+          // The image and the gyroscope are measuring the same rotation, so
+          // their ratio IS the field-of-view error — and the field of view
+          // multiplies every ALTITUDE this survey reports. Worse, the error
+          // grows toward the frame edges, so the same skyline read twice
+          // disagrees with itself; that is what a large "maximum spread" is
+          // made of. This was a quiet line in the report while the profile
+          // looked plausible, which is the worst way for it to fail.
+          if (!state.warnedFov && state.visualScaleN > 120
+              && (state.visualScale > 1.25 || state.visualScale < 0.8)) {
+            state.warnedFov = true;
+            const trueHfov = 2 * Math.atan((WORK_W / 2) / (camera.focalPx * state.visualScale)) * RAD;
+            log('warn', 'FOV_MISMATCH', JSON.stringify({
+              visualScale: Number(state.visualScale.toFixed(3)),
+              assumedHfovDeg: Number(camera.hfovDeg.toFixed(1)),
+              measuredHfovDeg: Number(trueHfov.toFixed(1)),
+              samples: state.visualScaleN
+            }));
+            log('warn',
+              `The camera's field of view is wrong. The imagery and the gyroscope agree the frame spans about ${trueHfov.toFixed(0)}°, not the ${camera.hfovDeg.toFixed(0)}° being assumed. `
+              + `Every ALTITUDE is therefore off by roughly ${state.visualScale.toFixed(1)}x, and by more toward the edges of the frame, which is what inflates the altitude spread. `
+              + `Azimuth is unaffected — it comes from the gyroscope. Set ${trueHfov.toFixed(0)}° under Advanced, or run Scan lenses, then press Recompute from keyframes.`);
           }
           // Opposed signs on a confident match means one of them is wrong;
           // trust neither for this frame rather than averaging them.
@@ -337,8 +385,12 @@ async function processFrame() {
 
     maybeKeyframe({ seg, quat, rawYaw, att, t });
 
-    // Adopt the self-calibrated focal length once it settles.
-    if (survey.focalPx && camera.focalSource !== 'self-calibrated') {
+    // Adopt the self-calibrated focal length once it settles — but never over a
+    // deliberate measurement. The passive estimator runs on whatever the survey
+    // happened to give it; the guided one ran on a scene chosen for the job and
+    // measured the vertical against gravity, so it wins.
+    if (survey.focalPx && camera.focalSource !== 'self-calibrated'
+        && camera.focalSource !== 'measured' && camera.focalSource !== 'manual') {
       const workFocal = survey.focalPx * (WORK_W / LUMA_W);
       if (camera.adoptFocal(workFocal)) {
         log('info', `Focal length self-calibrated: ${workFocal.toFixed(1)} px at ${WORK_W} px wide, giving ${camera.hfovDeg.toFixed(1)}° horizontal FOV.`);
@@ -458,6 +510,17 @@ function currentHeading() {
  * still missing, and stops the moment it is sure.
  */
 const FREEFORM_STAGE = 'freeform';
+/**
+ * Measuring the lens, which happens straight after the axis solve because it
+ * depends on it: the horizontal half of the measurement compares the picture
+ * against the gyroscope, and the gyroscope is only metric once its axes are
+ * known. The vertical half compares against gravity and would work at any time,
+ * but it is the half that matters, so it is worth doing them together.
+ */
+const LENS_STAGE = 'lens';
+/** Give up asking after this and let the operator proceed unverified rather
+ *  than trapping them in front of a featureless wall. */
+const LENS_TIMEOUT_MS = 60000;
 /** Evidence targets for the live meter. Not pass marks — the solver decides;
  *  these only stop it from declaring victory on a lucky early fit. */
 const EVIDENCE = { axisDeg: 90, sweepDeg: 200, minMs: 5000 };
@@ -526,6 +589,11 @@ function tickCalibration(now) {
 
   if (state.sensorCal.stage === FREEFORM_STAGE) {
     pollFreeform(now);
+    return;
+  }
+
+  if (state.sensorCal.stage === LENS_STAGE) {
+    pollLens(now);
     return;
   }
 
@@ -676,11 +744,7 @@ function solveRotationTests() {
     } else if (solved.scaleFromSweep !== null) {
       log('warn', `The motion implied a gyro scale of ${solved.scaleFromSweep}, too far from 1 to trust. Leaving it at 1; loop closure will absorb the difference.`);
     }
-    state.sensorCal = { stage: 'settle', startedAt: performance.now() };
-    state.calibStart = performance.now();
-    state.calibFirstTry = 0;
-    director.calibrationProgress = 0;
-    syncControls();
+    beginLensMeasurement();
     return;
   }
 
@@ -701,6 +765,72 @@ function solveRotationTests() {
   log('error', 'SENSOR_AXIS_TEST_FAILED', `${why} (${solved.status})`);
   state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', why, startedAt: performance.now() };
   state.paused = true;
+  director.calibrationProgress = 0;
+  syncControls();
+}
+
+function beginLensMeasurement() {
+  lensCal.reset();
+  state.prevElevation = null;
+  state.sensorCal = { stage: LENS_STAGE, startedAt: performance.now() };
+  director.calibrationProgress = 0;
+  syncControls();
+}
+
+/** Watch the lens measurement fill in, and stop as soon as it is solid. */
+function pollLens(now) {
+  const r = lensCal.result();
+  state.sensorCal.lens = r;
+  // Progress is the weaker of the two axes, so the bar cannot look finished
+  // while the vertical — the one altitudes depend on — is still missing.
+  const frac = v => clamp(v, 0, 1);
+  director.calibrationProgress = Math.min(
+    frac((r.nPan || 0) / 45), frac((r.nTilt || 0) / 45),
+    r.ready ? 1 : 0.95
+  );
+  if (r.ready) { finishLens(r); return; }
+  if (now - state.sensorCal.startedAt > LENS_TIMEOUT_MS) {
+    log('warn', 'LENS_MEASURE_TIMEOUT', JSON.stringify(r));
+    finishLens(null);
+  }
+}
+
+/** What the measurement still needs, in something the operator can act on. */
+function lensHint(r) {
+  if (!r || (!r.nPan && !r.nTilt)) {
+    return 'Point at something with detail — a tree, a fence, a rooftop. Blank sky or a plain wall gives the matcher nothing to hold onto.';
+  }
+  if (!r.panReady) return 'Keep panning left and right, smoothly.';
+  if (!r.tiltReady) return 'Horizontal done. Now tilt it up and down, the same slow sweep.';
+  return 'Almost there.';
+}
+
+function finishLens(r) {
+  if (r && r.ready && camera.setMeasuredLens(r.focalH, r.focalV)) {
+    log('info', 'LENS_MEASURED', JSON.stringify({
+      hfovDeg: Number(r.hfovDeg.toFixed(2)),
+      vfovDeg: Number(r.vfovDeg.toFixed(2)),
+      focalH: Number(r.focalH.toFixed(1)),
+      focalV: Number(r.focalV.toFixed(1)),
+      uncertaintyH: Number((r.uncertaintyH * 100).toFixed(2)),
+      uncertaintyV: Number((r.uncertaintyV * 100).toFixed(2)),
+      nPan: r.nPan, nTilt: r.nTilt, rejected: r.rejected
+    }));
+    log('info',
+      `Lens measured: ${r.hfovDeg.toFixed(1)}° across the frame and ${r.vfovDeg.toFixed(1)}° down it, `
+      + `to about ±${(Math.max(r.uncertaintyH, r.uncertaintyV) * 100).toFixed(1)}%, from ${r.nPan} pan and ${r.nTilt} tilt pairs. `
+      + `The vertical was measured against gravity rather than assumed from the horizontal, which is what altitudes actually depend on.`);
+    syncFovReadout();
+  } else {
+    log('warn', 'LENS_NOT_MEASURED', JSON.stringify(r || {}));
+    log('warn',
+      `Lens NOT measured — continuing on the ${camera.hfovDeg.toFixed(0)}° default. `
+      + 'Altitudes are only as good as that figure, and if it is wrong they are wrong by the same factor and by more toward the frame edges. '
+      + 'Azimuth is unaffected. You can measure it later from Advanced and press Recompute from keyframes.');
+  }
+  state.sensorCal = { stage: 'settle', startedAt: performance.now() };
+  state.calibStart = performance.now();
+  state.calibFirstTry = 0;
   director.calibrationProgress = 0;
   syncControls();
 }
@@ -853,6 +983,10 @@ function resetSurvey() {
   state.prevGyroYaw = null;
   state.announcedSource = false;
   state.visualScale = null;
+  state.visualScaleN = 0;
+  state.warnedFov = false;
+  state.prevElevation = null;
+  lensCal.reset();
   state.calibFirstTry = 0;
   state.calibGaveUp = false;
   state.visualSign = null;
@@ -922,6 +1056,20 @@ function renderLive() {
     // There is no pass mark to be locked out of, so the button is only an
     // escape hatch for someone who wants to stop early.
     $('primaryBtn').textContent = 'Use what I have';
+    $('primaryBtn').disabled = false;
+  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === LENS_STAGE) {
+    const r = state.sensorCal.lens;
+    const measured = r && r.hfovDeg
+      ? ` So far it reads ${r.hfovDeg.toFixed(0)}° across${r.vfovDeg ? ` and ${r.vfovDeg.toFixed(0)}° down` : ''}.` : '';
+    d = {
+      tone: r && r.ready ? 'good' : 'work',
+      headline: 'Measuring the lens',
+      detail: `Point at something with detail and sweep the phone slowly — left and right, then up and down. This measures how many degrees the frame actually covers, which sets every altitude. ${lensHint(r)}${measured}`,
+      progress: director.calibrationProgress,
+      arrow: null,
+      figure: 'lens'
+    };
+    $('primaryBtn').textContent = 'Skip — keep the default lens';
     $('primaryBtn').disabled = false;
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'settle') {
     d.detail = 'Now lift the phone into its normal upright scanning position and hold it still. This final step establishes the survey datum.';
@@ -1112,7 +1260,17 @@ function reportText(r) {
   lines.push('');
   lines.push(`Rotation source        ${h.gyro === 'available' ? 'gyroscope (metric)' : 'visual only (scaled by field of view)'}`);
   if (state.visualScale !== null) {
-    lines.push(`Visual/gyro scale      ${state.visualScale.toFixed(3)} — field of view is ${state.visualScale > 1 ? 'under' : 'over'}stated by ${Math.abs(1 - state.visualScale) * 100 < 200 ? (Math.abs(1 - state.visualScale) * 100).toFixed(0) + '%' : 'a lot'}`);
+    // State the consequence, not the ratio. This line used to read
+    // "field of view is understated by 164%", which is both ambiguous about
+    // direction and silent about the fact that it invalidates every altitude.
+    const measured = 2 * Math.atan((WORK_W / 2) / (camera.focalPx * state.visualScale)) * RAD;
+    const bad = state.visualScale > 1.25 || state.visualScale < 0.8;
+    lines.push(`Field of view measured ${measured.toFixed(1)}° horizontal, from imagery against the gyroscope`
+      + (bad ? ` — DISAGREES WITH THE ${camera.hfovDeg.toFixed(0)}° IN USE` : ' (agrees)'));
+    if (bad) {
+      lines.push(`  consequence          every altitude is out by about ${state.visualScale.toFixed(1)}x, more toward the frame edges;`);
+      lines.push('                       azimuth is unaffected. Set the measured value and recompute.');
+    }
   }
   lines.push(`Capture mode           ${director.mode.label}`);
   if (survey.lensChanges.length) {
@@ -1122,7 +1280,11 @@ function reportText(r) {
   lines.push(`  normal sweep         ${survey.keyframes.filter(k => k.captureKind !== 'obstruction-probe').length}`);
   lines.push(`  high obstruction     ${survey.keyframes.filter(k => k.captureKind === 'obstruction-probe').length}`);
   lines.push('Profile provenance     measured / interpolated / uncertain');
-  lines.push(`Field of view          ${camera.hfovDeg.toFixed(2)}° horizontal (${camera.focalSource})`);
+  // Both axes, because altitude depends on the VERTICAL one and that is the
+  // half that used to be derived rather than measured.
+  const intr = camera.intrinsics();
+  lines.push(`Field of view          ${camera.hfovDeg.toFixed(2)}° horizontal, ${intr.vfovDeg.toFixed(2)}° vertical (${camera.focalSource}`
+    + `${camera.focalSource === 'measured' ? ', vertical measured against gravity' : ', vertical derived from horizontal'})`);
   lines.push(`Compass reliability    ${h.compassReliability}${h.compassChecks ? ` (${h.compassRejects}/${h.compassChecks} rejected)` : ''}`);
   // The accuracy of every absolute bearing below, stated plainly. Without it a
   // report can read healthy while its azimuths are tens of degrees out.
@@ -1163,6 +1325,11 @@ function syncControls() {
   if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === FREEFORM_STAGE) {
     btn.textContent = 'Use what I have';
+    btn.disabled = false;
+    return;
+  }
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === LENS_STAGE) {
+    btn.textContent = 'Skip — keep the default lens';
     btn.disabled = false;
     return;
   }
@@ -1211,6 +1378,12 @@ function onPrimary() {
     return state.sensorCal.reason === 'no-samples' ? location.reload() : retrySensorTest();
   }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === FREEFORM_STAGE) return finishFreeform();
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === LENS_STAGE) {
+    // Skipping is allowed but never silent: the consequence is stated in the
+    // log and carried into the report.
+    const r = lensCal.result();
+    return finishLens(r.ready ? r : null);
+  }
   if (p === PHASE.PASS1) return finishPass1();
   if (p === PHASE.PASS2) return finishSurvey();
   if (p === PHASE.COMPLETE) return resetSurvey();

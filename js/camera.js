@@ -38,6 +38,7 @@ export class CameraSource {
     this.hfovDeg = 66;
     this.focalPx = null;
     this.focalSource = 'default';
+    this.measuredFocalV = null;
 
     // Lens inventory
     this.devices = [];           // [{deviceId, label, hfovDeg|null, isWide}]
@@ -110,6 +111,7 @@ export class CameraSource {
     this.activeDeviceId = deviceId;
     this.focalPx = null;
     this.focalSource = 'default';
+    this.measuredFocalV = null;
     return this.start(deviceId);
   }
 
@@ -218,6 +220,7 @@ export class CameraSource {
         this.lensSwaps++;
         this.focalPx = null;
         this.focalSource = 'default';
+    this.measuredFocalV = null;
         this.log('warn', `Camera changed underneath the survey: ${prev.width}x${prev.height} -> ${cur.width}x${cur.height}. Intrinsics discarded. Pin a lens under Advanced to stop this.`);
         if (this.onLensSwap) this.onLensSwap(prev, cur);
         prev = cur;
@@ -375,10 +378,30 @@ export class CameraSource {
     this.focalSource = 'manual';
   }
 
+  /**
+   * Adopt a lens measured against the sensors — see js/lenscal.js.
+   *
+   * The vertical is taken as its own measurement rather than being re-derived
+   * from the horizontal. Altitude is the quantity this app exists to report and
+   * it depends on the VERTICAL half-angle, so leaving that to follow from the
+   * horizontal via an assumed pixel aspect and crop puts the most important
+   * number in the survey on the one part of the model nothing ever checks.
+   */
+  setMeasuredLens(focalH, focalV) {
+    if (!Number.isFinite(focalH) || focalH < 40) return false;
+    this.focalPx = focalH;
+    this.hfovDeg = 2 * Math.atan((WORK_W / 2) / focalH) * RAD;
+    this.measuredFocalV = Number.isFinite(focalV) && focalV > 40 ? focalV : null;
+    this.focalSource = 'measured';
+    return true;
+  }
+
   /** Intrinsics for the working frame, in half-image tangent units. */
   intrinsics() {
     const tanHalfH = Math.tan(this.hfovDeg / 2 * DEG);
-    const tanHalfV = tanHalfH * (WORK_H / WORK_W);
+    const tanHalfV = this.measuredFocalV
+      ? (WORK_H / 2) / this.measuredFocalV
+      : tanHalfH * (WORK_H / WORK_W);
     const crop = this.cropFactor();
     return {
       tanHalfH, tanHalfV,

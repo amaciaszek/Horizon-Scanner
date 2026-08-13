@@ -118,7 +118,23 @@ const FREEFORM = wrap('Turn and tumble the phone in every direction', `
   <text x="60" y="124" text-anchor="middle" style="${S.label}">ANY DIRECTION</text>
 `);
 
-const FIGURES = { yaw: YAW, roll: ROLL, pitch: PITCH, freeform: FREEFORM };
+/* Lens measurement — the phone stays pointed at the scene and sweeps across it
+ * and down it, so the figure is a viewfinder with a cross of travel arrows
+ * rather than a phone in a pose. The tree stands in for "something with
+ * detail", which is the one thing the operator has to choose. */
+const LENS = wrap('Sweep the phone across a detailed scene, then up and down', `
+  <rect x="16" y="20" width="88" height="66" rx="4" style="${S.body}"/>
+  <g opacity="0.85">
+    <path d="M60,74 L60,58" style="stroke:#7d949e;stroke-width:2.4;stroke-linecap:round"/>
+    <path d="M60,60 q-13,-4 -16,-14 q11,1 16,8 q5,-9 16,-10 q-3,12 -16,16 Z" style="fill:#0f3b46;stroke:#2ec7e6;stroke-width:1.2;stroke-linejoin:round"/>
+    <path d="M28,74 L92,74" style="stroke:#2b414b;stroke-width:1.4"/>
+  </g>
+  <path d="M24,103 L96,103" style="${S.arrow}" marker-start="url(#cfhead)" marker-end="url(#cfhead)"/>
+  <path d="M112,26 L112,80" style="${S.arrow}" marker-start="url(#cfhead)" marker-end="url(#cfhead)"/>
+  <text x="56" y="124" text-anchor="middle" style="${S.label}">SWEEP BOTH WAYS</text>
+`);
+
+const FIGURES = { yaw: YAW, roll: ROLL, pitch: PITCH, freeform: FREEFORM, lens: LENS };
 
 /** SVG markup for a calibration stage, or null when the stage has no figure. */
 export function calibrationFigure(name) {
