@@ -136,6 +136,15 @@ main {
   background: rgba(6, 13, 17, 0.82);
   backdrop-filter: blur(10px);
 }
+.directive-row { display: flex; gap: 10px; align-items: flex-start; }
+.directive-text { flex: 1 1 auto; min-width: 0; }
+/* The calibration figure. Fixed width so the instruction text does not reflow
+   between stages, and it keeps its size on small screens — shrinking it is
+   what would make it useless, since it exists to be read at arm's length. */
+.directive-figure { flex: 0 0 74px; width: 74px; margin-top: 1px; }
+.directive-figure svg { display: block; width: 100%; height: auto; }
+@media (min-width: 420px) { .directive-figure { flex-basis: 92px; width: 92px; } }
+
 .directive-head { font: 640 1.02rem/1.25 var(--sans); letter-spacing: -0.01em; }
 .directive-detail { margin-top: 3px; font-size: 0.79rem; color: var(--ink-2); }
 .directive-bar { margin-top: 9px; height: 2px; background: var(--rule); border-radius: 2px; overflow: hidden; }

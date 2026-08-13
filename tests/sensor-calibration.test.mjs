@@ -22,16 +22,21 @@ assert(stationary.biasApplied, 'stationary run accepts a four-second, 50 Hz samp
 assert(Math.abs(o.gyroBias[0] - 0.12) < 0.001, 'stationary x-axis bias is recovered');
 assert(stationary.screenFlatnessDeg.mean < 0.3, 'face-up gravity reports a horizontal screen');
 
+// No rotation test scales anything on its own any more. A lap that fell short
+// used to be read as a scale error, which quietly assumed the operator had
+// meant to turn exactly 360°; the scale now comes from the angle gravity
+// sweeps during the tumble instead. See tests/gyro-axis.test.mjs.
 o.gyroYaw = 10;
 o.compassHeading = 42;
-o.beginSpinDiagnostic();
-o.gyroYaw = 370; // exactly one physical lap
+o.beginSpinDiagnostic('yaw');
+o.gyroYaw = 370;
 let spin = o.finishSpinDiagnostic();
-assert(Math.abs(spin.proposedScale - 1) < 1e-9 && spin.scaleApplied, 'a measured 360° lap keeps unit gyro scale');
+assert(o.gyroScale === 1, 'a rotation test never rescales the gyro by itself');
+assert(spin.kind === 'yaw' && Math.abs(spin.measuredDeg - 360) < 1e-9, 'the lap is still reported for the log');
 
-o.gyroScale = 1;
 o.gyroYaw = 0;
-o.beginSpinDiagnostic();
-o.gyroYaw = 176; // field failure previously observed
+o.beginSpinDiagnostic('roll');
+o.gyroYaw = 176; // the short lap seen in the field
 spin = o.finishSpinDiagnostic();
-assert(!spin.scaleApplied && o.gyroScale === 1, 'a 176° lap is diagnosed but not hidden by an unsafe scale correction');
+assert(o.gyroScale === 1, 'a short lap is recorded, not silently corrected for');
+assert(o.spinDiagnostics.yaw && o.spinDiagnostics.roll, 'each rotation test is filed under its own axis');

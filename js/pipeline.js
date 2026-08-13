@@ -40,8 +40,18 @@ export class Pipeline {
       this.visBusy = false;
       if (r) r(e.data);
     };
-    this.segWorker.onerror = e => { this.segBusy = false; this.log('error', 'Segmentation worker failed:', e.message); };
-    this.visWorker.onerror = e => { this.visBusy = false; this.log('error', 'Registration worker failed:', e.message); };
+    const workerError = name => e => {
+      this.segBusy = this.visBusy = false;
+      // A load failure (no message, no line) is almost always a stale cache
+      // right after a deploy: the page HTML is old but the worker file is new,
+      // or vice versa. Tell the operator the actual remedy.
+      const detail = e && e.message
+        ? `${e.message} (${e.filename || '?'}:${e.lineno || '?'})`
+        : 'failed to load — likely a stale cache after an update. Reload the page (pull down to refresh).';
+      this.log('error', `${name} worker: ${detail}`);
+    };
+    this.segWorker.onerror = workerError('Segmentation');
+    this.visWorker.onerror = workerError('Registration');
   }
 
   stop() {

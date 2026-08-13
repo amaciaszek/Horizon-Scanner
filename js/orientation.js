@@ -14,6 +14,23 @@ import {
  * arbiter of relative motion.
  */
 const MOTION_WINDOW_MS = 450;
+const DEG2RAD = Math.PI / 180;
+
+/**
+ * The three calibration motions, named for the axis each one turns about.
+ * Naming follows the standard phone convention (device X out the right side,
+ * Y out the top, Z out of the screen), so:
+ *
+ *   yaw   — about device Z. Phone flat, screen up; spin it like a record.
+ *   roll  — about device Y. Phone upright, top at the zenith; turn a circle.
+ *   pitch — about device X. Phone tumbles end over end.
+ *
+ * Between them every reported gyro component is exercised. The pitch tumble
+ * is the only one where gravity MOVES in the device frame, and that motion is
+ * ground truth: it fixes an axis, its sign, and the gyro's scale without
+ * assuming anything at all about the operator's aim.
+ */
+export const SPIN_KINDS = ['yaw', 'roll', 'pitch'];
 
 /** Least-squares slope of `key` against time, in units per second. */
 function slope(pts, tKey, key) {
@@ -103,15 +120,19 @@ export class OrientationSource {
     // short calibration window; summaries remain available to logs/archives.
     this.stationaryDiagnostic = null;
     this.spinDiagnostic = null;
-    this.flatSpinDiagnostic = null;
-    this.uprightSpinDiagnostic = null;
+    this.spinDiagnostics = { yaw: null, roll: null, pitch: null };
     this._stationarySamples = [];
     this._stationaryActive = false;
     this._spinActive = false;
     this._spinStart = null;
     this._spinFlat = [];
     this._spinTrace = null;
-    this._spinKind = 'flat';
+    this._spinKind = 'yaw';
+    this._spinSamples = [];
+    this._spinLastUp = null;
+    // Per-kind raw evidence for the axis solver. Held only across calibration.
+    this._spinData = { yaw: null, roll: null, pitch: null };
+    this._orientationSeen = false;
     this.sensorSource = 'none';
     this._genericSensors = [];
 
@@ -253,6 +274,7 @@ export class OrientationSource {
           if (!q || q.length !== 4) return;
           // Generic Sensor quaternions are [x,y,z,w]; this project uses [w,x,y,z].
           this.quat = quatNormalize([q[3], q[0], q[1], q[2]]);
+          this._orientationSeen = true;
           const now = sensor.timestamp || performance.now();
           this._rateWindow.push(now);
           while (this._rateWindow.length && now - this._rateWindow[0] > 1000) this._rateWindow.shift();
@@ -288,6 +310,7 @@ export class OrientationSource {
     this.absolute = this.absolute || !!e.absolute;
     this.sensorSource = 'legacy-events';
     this.quat = quatNormalize(quatFromEuler(this.alpha || 0, this.beta, this.gamma));
+    this._orientationSeen = true;
 
     if (this._spinActive && this._spinTrace && Number.isFinite(e.alpha)) {
       if (this._spinTrace.lastAlpha !== null) {
@@ -393,10 +416,14 @@ export class OrientationSource {
         elevation: att.elevation, roll: att.roll
       });
     }
-    let w = rawW.map((v, i) => v - this.gyroBias[i]);
+    // wRaw stays in the REPORTED frame (bias-subtracted only): the spin traces
+    // and the axis-map solver must see the device's own frame, or a re-solve
+    // after a retry would double-apply the map.
+    const wRaw = rawW.map((v, i) => v - this.gyroBias[i]);
+    let w = wRaw;
     if (this.gyroAxisMap) {
       const m = this.gyroAxisMap;
-      w = [m.signs[0] * w[m.perm[0]], m.signs[1] * w[m.perm[1]], m.signs[2] * w[m.perm[2]]];
+      w = [m.signs[0] * wRaw[m.perm[0]], m.signs[1] * wRaw[m.perm[1]], m.signs[2] * wRaw[m.perm[2]]];
     }
     // World up, expressed in the device frame.
     const up = quatRotate(quatConj(this.quat), [0, 0, 1]);
@@ -413,20 +440,42 @@ export class OrientationSource {
       if (delta >= 0) tr.projectedPositiveDeg += delta;
       else tr.projectedNegativeDeg += delta;
       for (let i = 0; i < 3; i++) {
-        tr.rawAxisSignedDeg[i] += w[i] * dt;
-        tr.rawAxisAbsoluteDeg[i] += Math.abs(w[i] * dt);
+        tr.rawAxisSignedDeg[i] += wRaw[i] * dt;
+        tr.rawAxisAbsoluteDeg[i] += Math.abs(wRaw[i] * dt);
       }
       tr.rateMin = Math.min(tr.rateMin, this.gyroYawRate);
       tr.rateMax = Math.max(tr.rateMax, this.gyroYawRate);
     }
-    if (this._spinActive && gravity) {
-      const mag = Math.hypot(...gravity);
+    if (this._spinActive && this._spinTrace) {
+      const tr = this._spinTrace;
+      const mag = gravity ? Math.hypot(...gravity) : 0;
       if (mag > 1) this._spinFlat.push(Math.acos(clamp(Math.abs(gravity[2]) / mag, -1, 1)) * RAD);
-      if (mag > 1 && this._spinTrace) {
-        // Mean gravity over the spin is the world-vertical in the device frame,
-        // which is what the axis-map solver aligns the integrated turn against.
-        for (let i = 0; i < 3; i++) this._spinTrace.gravitySum[i] += gravity[i] / mag;
-        this._spinTrace.gravityN++;
+      tr.totalRotDeg += Math.hypot(...wRaw) * dt;
+
+      // The solver's raw material: angular velocity in the REPORTED frame
+      // beside world-up in the TRUE device frame, sample by sample.
+      //
+      // `up` comes from the fused orientation quaternion rather than the
+      // accelerometer. That matters for the tumble: a hand-held phone swung
+      // end over end carries its own linear acceleration, which corrupts raw
+      // gravity exactly when the measurement counts. `up` is also independent
+      // of alpha, so a magnetometer swinging by 69° cannot reach it.
+      const u = this._orientationSeen ? up
+        : (mag > 3 ? [gravity[0] / mag, gravity[1] / mag, gravity[2] / mag] : null);
+      if (u) {
+        if (this._spinLastUp) {
+          // Chord to arc, exact for unit vectors: how far world-up has
+          // travelled through the device frame. Zero for a turn about
+          // vertical; a full circle for a clean end-over-end tumble.
+          const chord = Math.hypot(u[0] - this._spinLastUp[0], u[1] - this._spinLastUp[1], u[2] - this._spinLastUp[2]);
+          tr.sweepDeg += 2 * Math.asin(clamp(chord / 2, -1, 1)) * RAD;
+        }
+        this._spinLastUp = u;
+        if (this._spinSamples.length < 4000) this._spinSamples.push({ w: wRaw.slice(), u, dt });
+        if (mag > 3) {
+          for (let i = 0; i < 3; i++) tr.gravitySum[i] += gravity[i] / mag;
+          tr.gravityN++;
+        }
       }
     }
     if (this.gyroSamples > 20 && !this.gyroAvailable) {
@@ -509,10 +558,12 @@ export class OrientationSource {
     return this.stationaryDiagnostic;
   }
 
-  beginSpinDiagnostic(kind = 'flat') {
+  beginSpinDiagnostic(kind = 'yaw') {
     this._spinActive = true;
     this._spinKind = kind;
     this._spinFlat = [];
+    this._spinSamples = [];
+    this._spinLastUp = null;
     this._spinStart = {
       t: performance.now(),
       gyroYaw: this.gyroYaw,
@@ -531,6 +582,8 @@ export class OrientationSource {
       rawAxisAbsoluteDeg: [0, 0, 0],
       gravitySum: [0, 0, 0],
       gravityN: 0,
+      totalRotDeg: 0,
+      sweepDeg: 0,
       orientationAlphaTravel: 0,
       lastAlpha: Number.isFinite(this.alpha) ? this.alpha : null,
       rateMin: Infinity,
@@ -539,41 +592,58 @@ export class OrientationSource {
     this.spinDiagnostic = null;
   }
 
+  /**
+   * How far this motion has got, in degrees of the thing being asked for.
+   *
+   * Deliberately map-independent — the progress meter must not depend on the
+   * very axis mapping this test exists to discover. For the tumble the honest
+   * measure is how far world-up has actually travelled through the device
+   * frame; for the two turns about vertical it is the largest single-axis
+   * integrated turn, which cancels wobble instead of counting it.
+   */
   spinProgress() {
-    if (!this._spinStart) return 0;
-    const gyro = Math.abs(this.gyroYaw - this._spinStart.gyroYaw);
-    const orientation = Math.abs(this._spinTrace?.orientationAlphaTravel || 0);
-    const rawAxis = this._spinTrace
-      ? Math.max(...this._spinTrace.rawAxisSignedDeg.map(Math.abs))
-      : 0;
-    return this._spinKind === 'flat'
-      ? Math.max(gyro, orientation, rawAxis)
-      : rawAxis;
+    if (!this._spinStart || !this._spinTrace) return 0;
+    if (this._spinKind === 'pitch') return this._spinTrace.sweepDeg;
+    return Math.max(...this._spinTrace.rawAxisSignedDeg.map(Math.abs));
   }
 
   finishSpinDiagnostic() {
     this._spinActive = false;
     if (!this._spinStart) return null;
     const measuredDeg = this.gyroYaw - this._spinStart.gyroYaw;
-    const absMeasured = Math.abs(measuredDeg);
-    const proposedScale = absMeasured > 1 ? 360 / absMeasured : null;
-    // A modest scale error is plausibly a sensor calibration error. A large
-    // one more likely means the pose, axis mapping, or gesture was wrong; log
-    // it prominently instead of teaching the survey a dangerous correction.
-    const scaleApplied = this._spinKind === 'flat'
-      && Number.isFinite(proposedScale) && proposedScale >= 0.8 && proposedScale <= 1.2;
-    if (scaleApplied) this.gyroScale *= proposedScale;
+    // Nothing is scaled from "the operator meant to do exactly 360°". That
+    // assumption is what made these tests feel like a precision exam nobody
+    // could pass; the gyro's scale is measured instead against the angle
+    // gravity actually swept during the tumble. See solveGyroAxisMap.
     const flat = this._spinFlat.length
       ? { mean: this._spinFlat.reduce((a, v) => a + v, 0) / this._spinFlat.length,
           max: Math.max(...this._spinFlat) }
       : { mean: null, max: null };
+    const tr = this._spinTrace;
+    const totalRotDeg = tr?.totalRotDeg || 0;
+    const sweepDeg = tr?.sweepDeg || 0;
+    // How much of this motion moved gravity through the device frame. Near 0
+    // means a turn about vertical (gravity parked on one axis); near 1 means a
+    // tumble. Measured from the orientation stream alone, so it is true
+    // regardless of what the gyro claims — which is what lets the solver work
+    // out for itself which kind of motion it was actually handed.
+    const sweepRatio = totalRotDeg > 20 ? sweepDeg / totalRotDeg : null;
+    // Thresholds sized for a human hold, not a rig. A 360° turn wobbling by
+    // ±10° a few times drags up through ~120° of path, so "about vertical"
+    // has to tolerate a ratio near 0.35 before it starts calling a turn a
+    // tumble; a genuine tumble sits near 1.0, or 0.85 if the phone's axis was
+    // held well off horizontal.
+    const motion = sweepRatio === null ? 'too-little'
+      : sweepRatio < 0.5 ? 'about-vertical'
+        : sweepRatio > 0.65 ? 'tumble' : 'mixed';
     const result = {
       kind: this._spinKind,
       durationMs: performance.now() - this._spinStart.t,
       measuredDeg,
-      direction: measuredDeg >= 0 ? 'clockwise-positive' : 'clockwise-negative',
-      proposedScale,
-      scaleApplied,
+      totalRotDeg,
+      sweepDeg,
+      sweepRatio,
+      motion,
       resultingScale: this.gyroScale,
       compassClosureDeg: Number.isFinite(this.compassHeading) && Number.isFinite(this._spinStart.compass)
         ? angDiff(this.compassHeading, this._spinStart.compass) : null,
@@ -581,95 +651,251 @@ export class OrientationSource {
       flatnessMeanDeg: flat.mean,
       flatnessMaxDeg: flat.max,
       samples: this._spinFlat.length,
-      trace: this._spinTrace ? {
-        ...this._spinTrace,
-        meanGravity: this._spinTrace.gravityN
-          ? this._spinTrace.gravitySum.map(v => v / this._spinTrace.gravityN)
-          : null,
-        rateMin: Number.isFinite(this._spinTrace.rateMin) ? this._spinTrace.rateMin : null,
-        rateMax: Number.isFinite(this._spinTrace.rateMax) ? this._spinTrace.rateMax : null
-      } : null
+      trace: this._spinTrace ? (tr => ({
+        acceptedDt: tr.acceptedDt,
+        rejectedDt: tr.rejectedDt,
+        elapsedIntegratedSec: tr.elapsedIntegratedSec,
+        projectedSignedDeg: tr.projectedSignedDeg,
+        projectedAbsoluteDeg: tr.projectedAbsoluteDeg,
+        projectedPositiveDeg: tr.projectedPositiveDeg,
+        projectedNegativeDeg: tr.projectedNegativeDeg,
+        rawAxisSignedDeg: tr.rawAxisSignedDeg,
+        rawAxisAbsoluteDeg: tr.rawAxisAbsoluteDeg,
+        meanGravity: tr.gravityN ? tr.gravitySum.map(v => v / tr.gravityN) : null,
+        orientationAlphaTravel: tr.orientationAlphaTravel,
+        lastAlpha: tr.lastAlpha,
+        rateMin: Number.isFinite(tr.rateMin) ? tr.rateMin : null,
+        rateMax: Number.isFinite(tr.rateMax) ? tr.rateMax : null
+      }))(this._spinTrace) : null
     };
     this.spinDiagnostic = result;
-    if (this._spinKind === 'flat') this.flatSpinDiagnostic = result;
-    else this.uprightSpinDiagnostic = result;
+    this.spinDiagnostics[this._spinKind] = result;
+    // Raw per-sample evidence, kept out of the JSON-able result.
+    this._spinData[this._spinKind] = {
+      kind: this._spinKind, samples: this._spinSamples, totalRotDeg, sweepDeg, motion
+    };
     this._spinStart = null;
     this._spinTrace = null;
+    this._spinSamples = [];
+    this._spinLastUp = null;
     return this.spinDiagnostic;
   }
 
+  /** Forget every rotation test so a retry starts from clean evidence. */
+  resetSpinEvidence() {
+    this._spinData = { yaw: null, roll: null, pitch: null };
+    this.spinDiagnostics = { yaw: null, roll: null, pitch: null };
+    this.spinDiagnostic = null;
+    this.gyroAxisMap = null;
+    this.gyroScale = 1;
+  }
+
   /**
-   * Solve which reported gyro axis is which physical axis, from the two spins.
+   * Solve which reported gyro axis is which physical axis, from the three
+   * calibration motions.
    *
-   * Physics: during a rotation about world vertical, the angular-velocity
-   * vector in the device frame must be parallel to vertical in the device
-   * frame — and both come from the same event stream, so any disagreement IS
-   * the frame error. One spin constrains one axis; the flat and upright tests
-   * supply two roughly perpendicular poses, which pins the whole mapping.
+   * The whole method rests on one equation of rigid-body kinematics. World-up
+   * is fixed in the world, so seen from the turning device it counter-rotates:
    *
-   * All 48 signed permutations are scored by how well they align the
-   * integrated raw turn with the mean gravity direction of each spin. The
-   * alignment is SIGNED against +gravity, which assumes both turns were
-   * counter-clockwise as instructed — the one thing this cannot detect is an
-   * operator who turned clockwise both times on a permuted device; the
-   * landmark check remains the backstop for that.
+   *     du/dt = -(ω × u)
    *
-   * The turns do not need to be precise: axis identification needs direction,
-   * not magnitude, so "roughly a full circle" is genuinely good enough.
+   * Every motion sample is therefore one equation in the unknown axis map, and
+   * `u` comes from the orientation stream while `ω` comes from the gyro — two
+   * independent sensors that must agree. Where they disagree IS the frame
+   * error. All 48 signed permutations are scored on how badly they violate
+   * this, summed over every sample of every test, normalised by total
+   * rotation: 0 is perfect, ~1 means the map explains none of the motion.
+   *
+   * What each motion contributes:
+   *
+   *   pitch (tumble) — gravity sweeps, so du/dt is large and the equation
+   *     pins that axis outright, sign included. Nothing is assumed.
+   *   yaw / roll (turns about vertical) — ω is parallel to u, so ω × u is
+   *     zero whichever way the operator turned. These pin which axis, but
+   *     their sign ties, and the tie is broken by whatever wobble the hold
+   *     had, or failing that by the instruction to turn left.
+   *
+   * Nothing here asks for precision. There is no target angle, no pose
+   * tolerance, no flatness requirement, and no assumption that a circle was
+   * exactly 360° — a human turning roughly, holding the phone roughly, is
+   * exactly the input this was built for.
    */
   solveGyroAxisMap() {
-    const spins = [this.flatSpinDiagnostic, this.uprightSpinDiagnostic];
-    if (spins.some(s => !s?.trace?.meanGravity)) return { status: 'insufficient-data' };
-    const data = spins.map(s => {
-      const g = s.trace.meanGravity;
-      const mag = Math.hypot(...g) || 1;
-      return { I: s.trace.rawAxisSignedDeg, g: g.map(v => v / mag) };
-    });
-    // If gravity barely moved between the two poses, the second spin adds no
-    // new constraint and any solution is underdetermined.
-    const poseDot = Math.abs(data[0].g[0] * data[1].g[0] + data[0].g[1] * data[1].g[1] + data[0].g[2] * data[1].g[2]);
-    if (poseDot > 0.7) return { status: 'poses-too-similar', poseDot };
+    const spins = SPIN_KINDS
+      .map(k => this._spinData[k])
+      .filter(s => s && s.samples.length > 8 && s.totalRotDeg > 45);
+    if (spins.length < 2) return { status: 'insufficient-data', usableTests: spins.length };
 
-    const perms = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
-    const score = (perm, signs) => {
-      let residualDeg = 0;
-      const projections = [];
-      for (const d of data) {
-        const v = [signs[0] * d.I[perm[0]], signs[1] * d.I[perm[1]], signs[2] * d.I[perm[2]]];
-        const n = Math.hypot(...v) || 1;
-        const dot = v[0] * d.g[0] + v[1] * d.g[1] + v[2] * d.g[2];
-        residualDeg = Math.max(residualDeg, Math.acos(clamp(dot / n, -1, 1)) * RAD);
-        projections.push(dot);
+    // Per-interval quantities, computed once because they do not depend on the
+    // candidate map. Midpoint values throughout: at 200°/s and 50 Hz a step is
+    // 4°, and a one-sided difference would carry a systematic error of that
+    // size straight into the residual.
+    const iv = [];
+    spins.forEach((spin, si) => {
+      const s = spin.samples;
+      for (let k = 0; k + 1 < s.length; k++) {
+        const dt = s[k + 1].dt;
+        if (!(dt > 0 && dt < 0.5)) continue;
+        const um = [0, 1, 2].map(i => (s[k].u[i] + s[k + 1].u[i]) / 2);
+        const un = Math.hypot(...um);
+        if (!(un > 0.5)) continue;
+        iv.push({
+          si, dt,
+          w: [0, 1, 2].map(i => (s[k].w[i] + s[k + 1].w[i]) / 2),
+          u: um.map(v => v / un),
+          du: [0, 1, 2].map(i => (s[k + 1].u[i] - s[k].u[i]) / dt)
+        });
       }
-      return { residualDeg, projections };
-    };
-    let best = null;
-    for (const perm of perms) {
+    });
+    if (iv.length < 20) return { status: 'insufficient-data', intervals: iv.length };
+
+    // Total rotation in radians. A signed permutation cannot change a vector's
+    // length, so this is identical for all 48 candidates and turns the residual
+    // into a dimensionless score.
+    let den = 0;
+    for (const v of iv) den += Math.hypot(...v.w) * DEG2RAD * v.dt;
+    if (!(den > 1)) return { status: 'too-little-rotation', totalDeg: Math.round(den / DEG2RAD) };
+
+    const PERMS = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    const PARITY = [1, -1, -1, 1, 1, -1];   // permutation parity, same order
+    const mapped = (v, perm, signs) =>
+      [signs[0] * v.w[perm[0]], signs[1] * v.w[perm[1]], signs[2] * v.w[perm[2]]];
+
+    const cands = [];
+    for (let pi = 0; pi < 6; pi++) {
+      const perm = PERMS[pi];
       for (let sx = -1; sx <= 1; sx += 2) for (let sy = -1; sy <= 1; sy += 2) for (let sz = -1; sz <= 1; sz += 2) {
         const signs = [sx, sy, sz];
-        const r = score(perm, signs);
-        // An axis that carried no rotation in either spin has an unconstrained
-        // sign; the tiny penalty breaks such ties toward the least change from
-        // the spec mapping instead of toward loop order.
-        const changes = perm.reduce((n, p, i) => n + (p !== i ? 1 : 0), 0)
-          + signs.reduce((n, s) => n + (s !== 1 ? 1 : 0), 0);
-        const cost = r.residualDeg + 0.01 * changes;
-        if (!best || cost < best.cost) best = { perm, signs, cost, ...r };
+        let num = 0;
+        const align = spins.map(() => 0);
+        for (const v of iv) {
+          const a = mapped(v, perm, signs);
+          const r0 = a[0] * DEG2RAD, r1 = a[1] * DEG2RAD, r2 = a[2] * DEG2RAD;
+          // Residual of du/dt + ω × u, which a correct map drives to zero.
+          num += Math.hypot(
+            r1 * v.u[2] - r2 * v.u[1] + v.du[0],
+            r2 * v.u[0] - r0 * v.u[2] + v.du[1],
+            r0 * v.u[1] - r1 * v.u[0] + v.du[2]
+          ) * v.dt;
+          align[v.si] += (a[0] * v.u[0] + a[1] * v.u[1] + a[2] * v.u[2]) * v.dt;
+        }
+        cands.push({
+          perm, signs,
+          det: PARITY[pi] * sx * sy * sz,
+          changes: perm.reduce((n, p, i) => n + (p !== i ? 1 : 0), 0)
+            + signs.reduce((n, s) => n + (s !== 1 ? 1 : 0), 0),
+          resid: num / den,
+          align
+        });
       }
     }
-    const identity = score([0, 1, 2], [1, 1, 1]);
-    const valid = r => r.residualDeg <= 30
-      && r.projections.every(p => p >= 270 && p <= 450);
-    if (valid(identity)) return { status: 'identity', ...identity };
-    if (!valid(best)) return { status: 'unsolved', best, identity };
+    cands.sort((a, b) => a.resid - b.resid);
+    const best = cands[0];
+    const report = c => ({
+      perm: c.perm, signs: c.signs, det: c.det,
+      resid: Number(c.resid.toFixed(3)),
+      align: c.align.map(a => Number(a.toFixed(1)))
+    });
+    const tests = spins.map(s => ({
+      kind: s.kind, motion: s.motion,
+      totalDeg: Math.round(s.totalRotDeg), sweepDeg: Math.round(s.sweepDeg)
+    }));
 
-    const isIdentity = best.perm.every((p, i) => p === i) && best.signs.every(s => s === 1);
-    if (isIdentity) return { status: 'identity', ...best };
-    // Determinant of a signed permutation: permutation parity times the signs.
-    const PARITY = [1, -1, -1, 1, 1, -1];   // matches the perms list order
-    const det = PARITY[perms.indexOf(best.perm)] * best.signs[0] * best.signs[1] * best.signs[2];
-    this.gyroAxisMap = { perm: best.perm, signs: best.signs, residualDeg: best.residualDeg };
-    return { status: 'remapped', ...best, leftHanded: det < 0 };
+    // Nothing fits. Either the two sensor streams genuinely disagree, or the
+    // phone was shaken rather than turned.
+    if (best.resid > 0.6) return { status: 'unsolved', tests, best: report(best) };
+
+    // Candidates the data cannot tell apart. A rotation parallel to gravity
+    // has ω × u = 0 whichever way it went, so its sign always ties here.
+    const tol = Math.max(best.resid * 1.3, best.resid + 0.04);
+    const tied = cands.filter(c => c.resid <= tol);
+
+    // A rival PERMUTATION inside the tolerance is different in kind: it means
+    // the three motions failed to separate the axes, and no sign-picking
+    // rescues that. Say so rather than guessing.
+    const rival = tied.find(c => c.perm.some((p, i) => p !== best.perm[i]));
+    if (rival) return { status: 'ambiguous', tests, best: report(best), rival: report(rival) };
+
+    // A physical gyroscope triad is right-handed. Prefer that, but do not
+    // refuse a mirrored one outright — firmware does occasionally ship it.
+    const rightHanded = tied.filter(c => c.det > 0);
+    const pool = rightHanded.length ? rightHanded : tied;
+
+    // Only turns about vertical can testify about direction. During a tumble
+    // ω is perpendicular to gravity and its alignment is ~0 by construction,
+    // so letting it vote would be noise with an opinion.
+    const voters = spins.map((s, i) => (s.motion === 'about-vertical' ? i : -1)).filter(i => i >= 0);
+    const directionOf = c => voters.map(i => Math.sign(c.align[i]));
+
+    let pick, decidedBy, assumedDirection = false;
+    if (pool.length === 1) {
+      // Only one map survives, so the hold wobbled enough for the kinematics to
+      // settle every sign by itself. Two degrees per second of hand tremor is
+      // sufficient — which is to say every real hold. Which way the operator
+      // turned is then merely observed, never assumed, and never a reason to
+      // fail them: the map is right either way.
+      pick = pool[0];
+      decidedBy = 'kinematics';
+    } else if (!voters.length) {
+      return { status: 'no-direction-evidence', tests, best: report(best) };
+    } else {
+      // A rotation exactly parallel to gravity has ω × u = 0 whichever way it
+      // went, so a phone turned on a rig steady enough to have no wobble at
+      // all leaves the signs genuinely undecidable. The instruction to turn
+      // left is the only remaining information, and leaning on it is recorded
+      // as an assumption rather than passed off as a measurement.
+      const ccw = pool.filter(c => directionOf(c).every(s => s > 0));
+      const cw = pool.filter(c => directionOf(c).every(s => s < 0));
+      if (!ccw.length) {
+        return {
+          status: cw.length ? 'wrong-direction' : 'mixed-direction',
+          tests, best: report(best)
+        };
+      }
+      ccw.sort((a, b) => a.changes - b.changes || a.resid - b.resid);
+      pick = ccw[0];
+      decidedBy = 'direction';
+      assumedDirection = true;
+    }
+    // Which way the two turns about vertical actually went, as measured under
+    // the chosen map. Worth surfacing: an operator who turned right is fine,
+    // but it is the kind of thing a field log should record rather than hide.
+    const turnedClockwise = voters.length > 0 && voters.every(i => pick.align[i] < 0);
+
+    // Gyro scale, measured against gravity instead of against the operator.
+    // The component of ω perpendicular to up is exactly what drags up through
+    // the device frame, so the angle it integrates must equal the angle up
+    // actually swept. Their ratio is the scale error — and how close the
+    // operator came to a full circle never enters into it.
+    let sweptRad = 0, arcRad = 0;
+    for (const v of iv) {
+      if (spins[v.si].motion !== 'tumble') continue;
+      const a = mapped(v, pick.perm, pick.signs).map(x => x * DEG2RAD);
+      const dot = a[0] * v.u[0] + a[1] * v.u[1] + a[2] * v.u[2];
+      arcRad += Math.hypot(a[0] - dot * v.u[0], a[1] - dot * v.u[1], a[2] - dot * v.u[2]) * v.dt;
+      sweptRad += Math.hypot(...v.du) * v.dt;
+    }
+    // Needs ~85° of genuine tumble before the ratio means anything.
+    const scaleFromSweep = arcRad > 1.5 ? sweptRad / arcRad : null;
+    const scaleApplied = Number.isFinite(scaleFromSweep) && scaleFromSweep >= 0.8 && scaleFromSweep <= 1.2;
+    if (scaleApplied) this.gyroScale = scaleFromSweep;
+
+    const isIdentity = pick.perm.every((p, i) => p === i) && pick.signs.every(s => s === 1);
+    this.gyroAxisMap = isIdentity ? null : { perm: pick.perm, signs: pick.signs };
+    return {
+      status: isIdentity ? 'identity' : 'remapped',
+      perm: pick.perm, signs: pick.signs,
+      leftHanded: pick.det < 0,
+      decidedBy,
+      assumedDirection,
+      turnedClockwise,
+      resid: Number(pick.resid.toFixed(3)),
+      margin: Number((cands.find(c => c.perm.some((p, i) => p !== pick.perm[i]))?.resid ?? Infinity).toFixed(3)),
+      align: pick.align.map(a => Number(a.toFixed(1))),
+      scaleFromSweep: scaleFromSweep === null ? null : Number(scaleFromSweep.toFixed(4)),
+      scaleApplied,
+      tests
+    };
   }
 
   /**
@@ -801,8 +1027,7 @@ export class OrientationSource {
       gyroAxisMap: this.gyroAxisMap,
       stationaryDiagnostic: this.stationaryDiagnostic,
       spinDiagnostic: this.spinDiagnostic,
-      flatSpinDiagnostic: this.flatSpinDiagnostic,
-      uprightSpinDiagnostic: this.uprightSpinDiagnostic,
+      spinDiagnostics: this.spinDiagnostics,
       sampleIntervalMs: Math.round(this.eventDt * 1000)
     };
   }

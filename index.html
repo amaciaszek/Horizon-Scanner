@@ -33,8 +33,13 @@
     <canvas id="overlay" class="overlay"></canvas>
 
     <div class="directive" id="directive" data-tone="idle">
-      <p class="directive-head" id="directiveHead">Ready to survey</p>
-      <p class="directive-detail" id="directiveDetail">Stand where the telescope sits. Rotate your body around the phone, not the phone around you.</p>
+      <div class="directive-row">
+        <div class="directive-text">
+          <p class="directive-head" id="directiveHead">Ready to survey</p>
+          <p class="directive-detail" id="directiveDetail">Stand where the telescope sits. Rotate your body around the phone, not the phone around you.</p>
+        </div>
+        <div class="directive-figure" id="directiveFigure" hidden></div>
+      </div>
       <div class="directive-bar"><i id="directiveBar"></i></div>
     </div>
 

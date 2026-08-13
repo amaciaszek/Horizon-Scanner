@@ -771,3 +771,119 @@ and loop closure absorbs the rest.
 Not verified on hardware: the solved map driving a real survey end to end.
 The next run at the same site is the test — expect pass-1 travel near 360°,
 spread collapsing, and a panorama that reads left to right.
+
+### 2026-08-12, night — humans are not robots: the calibration bends to the operator
+
+Two more field bundles (23:37, 23:41), five clean turns, zero surveys started.
+Every turn the operator made was a full circle on the correct raw axis —
+330-411° — and the app failed all of them. Three causes, all ours:
+
+1. The "held still" timer only armed if the phone had been UN-still at least
+   once. Set it down before tapping Start — the diligent case — and it waited
+   out the full 25 s fallback, then printed "never settled" at a phone whose
+   gyro noise was 0.02°/s. Fixed: the timer arms on the first still tick.
+
+2. The axis solver averaged gravity over the whole spin window. A human picks
+   the phone up, turns while holding it tilted ~40° toward their face, lowers
+   it to press Finish; averaged flat idle seconds swamped the tilted turning
+   seconds and both spins looked like the same pose ("poses-too-similar",
+   five times). The solver now accumulates alignment PER SAMPLE, weighted by
+   rotation rate — the pose during the turn is the only pose that counts. No
+   flatness requirement, no exact 360, no robot poses; the two turns just
+   have to be in noticeably different holds, which they naturally are.
+
+3. The old identity-path validation (projected magnitude + closure + CCW
+   sign) is gone entirely; the solver judges every device the same way, with
+   identity as just another candidate. Acceptance is 240-500° of aligned turn
+   carrying at least 45% of the total rotation. A sign-only flip on a
+   spec-compliant device is handed back as "you turned clockwise" rather than
+   silently mirroring azimuth.
+
+Also: the flat-spin log no longer proposes a "scale" of 215x when the
+projection misses a permuted turn (it says what is actually happening), and a
+worker that fails to LOAD (stale cache right after a deploy — seen once in
+the 23:37 run) now says to refresh instead of "failed: undefined".
+
+`tests/gyro-axis.test.mjs` reconstructs the human gesture — idle, tilted
+turn, idle — against the swapped-axis device model and requires it to solve.
+
+Not verified on hardware: this solver on the target phone. The bar for the
+next run: put the phone down at Start (4-5 s, not 25), two casual left-hand
+circles, and the log should show SENSOR_AXIS_SOLVE status "remapped" with
+both projections near 360.
+
+### 2026-08-13 — three axes, and the end of the precision exam
+
+Two more bundles (23:37, 23:41) and still no survey. Five clean turns across
+them, every one refused. The operator's verdict was correct and worth writing
+down: *"these tests are done by human beings not robots, you need to accept
+some error and not deal with these tests as absolute truth."*
+
+Three things were wrong, and only the third was subtle.
+
+1. The stillness timer only armed once the phone had been UN-still. Set it
+   down before tapping Start — the careful thing to do — and it waited out the
+   full 25 s fallback and then said "never settled" at a phone reading 0.02°/s
+   of noise. One line.
+
+2. The upright turn had been mislabelled "pitch" in the guidance. Upright, top
+   at the zenith, turning on the spot is rotation about the phone's LONG axis,
+   which is roll. Pitch is the only motion that had never been tested, because
+   pitch requires going end over end.
+
+3. That omission mattered far more than the naming. During both turns about
+   vertical, gravity sits still in the device frame, so those motions can only
+   ever say "the rotation was about the up axis" — never which way it pointed,
+   and never how big a degree is. Everything else was being reconstructed from
+   the assumption that the operator turned exactly 360° exactly counter-
+   clockwise, which is the assumption that made the whole thing feel like an
+   exam. In an end-over-end tumble gravity SWEEPS through the device frame,
+   and that sweep is ground truth.
+
+So calibration is now three motions, one per device axis, named as the
+standard phone diagram names them — yaw about Z, roll about Y, pitch about X —
+and each is shown as a drawn figure of the phone in its pose, because "upright"
+and "end over end" do not survive being written down.
+
+The solver was rewritten around one equation of rigid-body kinematics:
+
+    du/dt = -(ω × u)
+
+where u is world-up in the device frame. Every motion sample is one equation;
+u comes from the orientation stream and ω from the gyro, two independent
+sensors that must agree, so where they disagree IS the frame error. All 48
+signed permutations are scored on total violation, normalised by rotation.
+On the field phone's y/z swap the correct map scores 0.007 against 0.51 for
+the next-best axis order — a factor of seventy, from motions with ±9°/s of
+simulated hand wobble and circles of 340° and 385°.
+
+What this bought, concretely:
+
+- **No target angle.** 250° and 470° circles solve identically. Nothing is
+  scaled from "that was meant to be 360°" any more.
+- **Gyro scale measured, not assumed.** The tumble's gravity sweep is the
+  reference: a gyro reading 10% high is recovered as 0.9092 against a true
+  0.9091, from ragged circles that were never near 360°.
+- **No pose requirement.** The flat/tilted pair that produced five straight
+  "poses-too-similar" refusals now solves at residual 0.007. The flatness
+  gates are gone entirely.
+- **Turning the wrong way stops being a failure.** Any real hold wobbles, and
+  two degrees per second is enough for the kinematics to fix every sign on its
+  own; the direction turned is then merely noted in the log. Only on a hold
+  steady enough to have no wobble at all do the signs genuinely tie, and there
+  the map leans on the instruction and says so (`assumedDirection`).
+- **No test passes or fails alone.** Evidence is collected from all three and
+  judged once. The Finish button is never disabled.
+
+Honest limits, since they are real. Two turns about vertical with zero wobble
+are mathematically indistinguishable from the same turns the other way with
+two axes inverted — no cleverness recovers that, only the instruction. And a
+browser whose sensor fusion cannot track a fast tumble will produce a large
+residual for every candidate and be told "unsolved, turn more slowly", which
+is why the figure asks for a few seconds per turn.
+
+Not verified on hardware: all of the above is simulator work, against a
+rigid-body model integrating a quaternion so the gyro reading and the gravity
+direction come from one consistent state. The bar for the next field run is a
+log line reading `SENSOR_AXIS_SOLVE` with status remapped, `decidedBy`
+kinematics, and a residual under about 0.2.

@@ -11,6 +11,7 @@ import { ScanDirector, PHASE } from './guide.js';
 import { Pipeline } from './pipeline.js';
 import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
 import { drawRing, drawProfile, drawOverlay } from './render.js';
+import { calibrationFigure } from './calfigures.js';
 import * as store from './storage.js';
 import * as out from './exporters.js';
 import {
@@ -440,6 +441,44 @@ function currentHeading() {
 
 /* ------------------------------------------------------------- calibration */
 
+/**
+ * The three rotation tests, one per device axis, named as the standard phone
+ * yaw/pitch/roll diagram names them.
+ *
+ * Together they exercise every reported gyro component, which is what lets the
+ * solver work out which one is which. The tumble is last and is the important
+ * one: it is the only motion where gravity travels through the phone's frame,
+ * and that travel is ground truth for the axis, its direction, and the gyro's
+ * scale — none of which then depend on the operator hitting a target angle.
+ */
+const ROTATION_TESTS = [
+  {
+    stage: 'yaw-spin', kind: 'yaw', axis: 'Z', title: 'Yaw', figure: 'yaw',
+    headline: 'Test 1 of 3 — yaw',
+    detail: 'Phone FLAT, screen up — table, ground, or your open palm. Spin it to your LEFT, roughly one full circle, like a record on a turntable.',
+    wants: 'about-vertical'
+  },
+  {
+    stage: 'roll-spin', kind: 'roll', axis: 'Y', title: 'Roll', figure: 'roll',
+    headline: 'Test 2 of 3 — roll',
+    detail: 'Phone UPRIGHT, top edge at the sky, screen facing you — the survey pose. Turn yourself to your LEFT, roughly one full circle.',
+    wants: 'about-vertical'
+  },
+  {
+    stage: 'pitch-spin', kind: 'pitch', axis: 'X', title: 'Pitch', figure: 'pitch',
+    headline: 'Test 3 of 3 — pitch',
+    detail: 'Hold it in front of you, screen facing you, and tumble it END OVER END — tip the top edge away from you and keep going right around. Slowly, a few seconds per turn.',
+    wants: 'tumble'
+  }
+];
+const rotationTest = stage => ROTATION_TESTS.find(t => t.stage === stage);
+const MOTION_WORDS = {
+  'about-vertical': 'a turn about vertical',
+  'tumble': 'an end-over-end tumble',
+  'mixed': 'part turn, part tumble',
+  'too-little': 'almost no movement'
+};
+
 function finishStationary(now) {
   const r = orientation.finishStationaryDiagnostic();
   log(r.biasApplied ? 'info' : 'warn', 'SENSOR_STATIONARY', JSON.stringify(r));
@@ -452,8 +491,9 @@ function finishStationary(now) {
   if (!r.biasApplied) {
     log('warn', `Gyro bias NOT applied (${r.biasRefusedReason}). Zero bias is safer than a bias measured from a moving phone; loop closure will absorb the resulting drift.`);
   }
-  orientation.beginSpinDiagnostic();
-  state.sensorCal = { stage: 'spin', startedAt: now };
+  orientation.resetSpinEvidence();
+  orientation.beginSpinDiagnostic(ROTATION_TESTS[0].kind);
+  state.sensorCal = { stage: ROTATION_TESTS[0].stage, startedAt: now };
   director.calibrationProgress = 0;
   syncControls();
 }
@@ -468,7 +508,11 @@ function tickCalibration(now) {
     // hand-tremor "bias" of 8.6°/s got locked in. `flat === null` must WAIT,
     // not pass — no gravity reading means we know nothing yet.
     const stillNow = flat !== null && flat <= 15 && orientation.stillness > 0.7;
+    // Arm the timer on the FIRST still tick too — a phone set down before the
+    // operator tapped Start is still from tick one, and the 2026-08-12 run
+    // showed the unarmed timer silently waiting out the full 25 s fallback.
     if (!stillNow) state.sensorCal.stillSince = now;
+    else if (state.sensorCal.stillSince == null) state.sensorCal.stillSince = now;
     const heldMs = now - (state.sensorCal.stillSince ?? now);
     director.calibrationProgress = clamp(heldMs / 4000, 0, 1);
     const enoughSamples = orientation.stationarySampleCount >= 40;
@@ -497,7 +541,7 @@ function tickCalibration(now) {
     return;
   }
 
-  if (state.sensorCal.stage === 'spin' || state.sensorCal.stage === 'upright-spin') {
+  if (rotationTest(state.sensorCal.stage)) {
     director.calibrationProgress = clamp(Math.abs(orientation.spinProgress()) / 360, 0, 1);
     return;
   }
@@ -559,127 +603,97 @@ function finishCalibration() {
   syncControls();
 }
 
-function finishSpinDiagnostic() {
-  if (state.sensorCal.stage !== 'spin') return;
+/** Finish whichever rotation test is running and move to the next, or solve.
+ *
+ *  No test passes or fails on its own. A single motion cannot prove anything
+ *  about the axis map by itself, and gating on each one in turn was what made
+ *  calibration feel like an exam: five clean turns in the 2026-08-12 field run
+ *  were each rejected in isolation. Evidence is collected here and judged once,
+ *  at the end, by solveRotationTests. */
+function finishRotationTest() {
+  const test = rotationTest(state.sensorCal.stage);
+  if (!test) return;
   const r = orientation.finishSpinDiagnostic();
   if (!r) return;
-  log(r.scaleApplied ? 'info' : 'warn', 'SENSOR_360', JSON.stringify(r));
-  log(r.scaleApplied ? 'info' : 'warn',
-    `360 test: gyroscope measured ${r.measuredDeg.toFixed(2)}° in ${(r.durationMs / 1000).toFixed(1)} s; `
-    + `proposed scale ${Number.isFinite(r.proposedScale) ? r.proposedScale.toFixed(5) : 'unavailable'}`
-    + `${r.scaleApplied ? ' (applied)' : ' (not applied — outside conservative 0.8–1.2 range)'}; `
-    + `compass closure ${Number.isFinite(r.compassClosureDeg) ? r.compassClosureDeg.toFixed(2) + '°' : 'unavailable'}; `
-    + `flatness mean/max ${Number.isFinite(r.flatnessMeanDeg) ? r.flatnessMeanDeg.toFixed(2) : '—'}/`
-    + `${Number.isFinite(r.flatnessMaxDeg) ? r.flatnessMaxDeg.toFixed(2) : '—'}°.`);
-  if (r.trace) {
-    log('info', 'SENSOR_360_TRACE',
-      `projected signed/absolute/positive/negative ${r.trace.projectedSignedDeg.toFixed(2)}/`
-      + `${r.trace.projectedAbsoluteDeg.toFixed(2)}/${r.trace.projectedPositiveDeg.toFixed(2)}/`
-      + `${r.trace.projectedNegativeDeg.toFixed(2)}°; raw XYZ signed `
-      + `${r.trace.rawAxisSignedDeg.map(v => v.toFixed(2)).join('/') }°; raw XYZ absolute `
-      + `${r.trace.rawAxisAbsoluteDeg.map(v => v.toFixed(2)).join('/') }°; orientation alpha travel `
-      + `${r.trace.orientationAlphaTravel.toFixed(2)}°; dt accepted/rejected `
-      + `${r.trace.acceptedDt}/${r.trace.rejectedDt}; rate min/max `
-      + `${r.trace.rateMin?.toFixed(2) ?? '—'}/${r.trace.rateMax?.toFixed(2) ?? '—'}°/s.`);
-  }
-  orientation.beginSpinDiagnostic('upright');
-  state.sensorCal = { stage: 'upright-spin', startedAt: performance.now() };
-  director.calibrationProgress = 0;
-  syncControls();
-}
-
-function finishUprightSpinDiagnostic() {
-  if (state.sensorCal.stage !== 'upright-spin') return;
-  const r = orientation.finishSpinDiagnostic();
-  if (!r) return;
-  log('info', 'SENSOR_UPRIGHT_360', JSON.stringify(r));
-  if (r.trace) {
-    log('info', 'SENSOR_UPRIGHT_360_TRACE',
-      `raw XYZ signed ${r.trace.rawAxisSignedDeg.map(v => v.toFixed(2)).join('/')}°; `
-      + `raw XYZ absolute ${r.trace.rawAxisAbsoluteDeg.map(v => v.toFixed(2)).join('/')}°; `
-      + `projected signed/absolute ${r.trace.projectedSignedDeg.toFixed(2)}/${r.trace.projectedAbsoluteDeg.toFixed(2)}°; `
-      + `dt accepted/rejected ${r.trace.acceptedDt}/${r.trace.rejectedDt}; `
-      + `rate min/max ${r.trace.rateMin?.toFixed(2) ?? '—'}/${r.trace.rateMax?.toFixed(2) ?? '—'}°/s.`);
+  log('info', `SENSOR_TEST_${test.kind.toUpperCase()}`, JSON.stringify(r));
+  log('info',
+    `${test.title} test (about device ${test.axis}): turned ${r.totalRotDeg.toFixed(0)}° in `
+    + `${(r.durationMs / 1000).toFixed(1)} s, gravity swept ${r.sweepDeg.toFixed(0)}° through the phone `
+    + `— reads as ${MOTION_WORDS[r.motion] || r.motion}. Reported axis totals `
+    + `${r.trace ? r.trace.rawAxisSignedDeg.map(v => v.toFixed(0)).join(' / ') : '—'}°.`);
+  // Say when a motion did not look like the one that was asked for, but never
+  // stop for it — the solver reads what actually happened, not what was meant,
+  // and a mislabelled motion still carries usable evidence.
+  if (r.motion !== test.wants && r.motion !== 'mixed') {
+    log('warn', `That read as ${MOTION_WORDS[r.motion] || r.motion} rather than ${MOTION_WORDS[test.wants]}. Carrying on — the solver uses the motion as measured, not as labelled.`);
   }
 
-  const flat = orientation.flatSpinDiagnostic;
-  const dominant = result => {
-    const axes = result?.trace?.rawAxisSignedDeg || [0, 0, 0];
-    let index = 0;
-    for (let i = 1; i < axes.length; i++) if (Math.abs(axes[i]) > Math.abs(axes[index])) index = i;
-    return { index, axis: ['x', 'y', 'z'][index], degrees: axes[index] };
-  };
-  const flatAxis = dominant(flat);
-  const uprightAxis = dominant(r);
-  const flatValid = Math.abs(flatAxis.degrees) >= 270 && Math.abs(flatAxis.degrees) <= 450;
-  const uprightRawValid = Math.abs(uprightAxis.degrees) >= 270 && Math.abs(uprightAxis.degrees) <= 450;
-  const uprightProjectedValid = Math.abs(r.measuredDeg) >= 270 && Math.abs(r.measuredDeg) <= 450;
-  const uprightClosureValid = !Number.isFinite(r.orientationClosureDeg) || Math.abs(r.orientationClosureDeg) <= 30;
-  const counterClockwiseSignValid = r.measuredDeg <= -270;
-  const uprightValid = uprightRawValid && uprightProjectedValid && uprightClosureValid && counterClockwiseSignValid;
-  const uniqueAxes = flatAxis.index !== uprightAxis.index;
-  log(uprightValid ? (flatValid && uniqueAxes ? 'info' : 'warn') : 'error', 'SENSOR_AXIS_MAP',
-    JSON.stringify({
-      flat: flatAxis, upright: uprightAxis, uniqueAxes, flatValid,
-      uprightRawValid, uprightProjectedValid, uprightClosureValid, counterClockwiseSignValid, uprightValid
-    }));
-
-  // The upright turn is the operational test: it exercises exactly the pose
-  // and world-vertical projection used during a horizon survey. A failed flat
-  // test remains valuable diagnostic evidence, but must not veto a proven-good
-  // upright survey axis.
-  if (!uprightValid) {
-    // The single most common way this test "fails" is the operator turning
-    // clockwise. Magnitude, raw axis and closure all check out, only the sign
-    // is positive — that is a wrong-way turn, not a broken sensor, and it
-    // deserves a one-tap redo of just this step rather than a dead end.
-    const wrongDirection = uprightRawValid && uprightProjectedValid && uprightClosureValid
-      && r.measuredDeg >= 270;
-    if (wrongDirection) {
-      log('warn', 'SENSOR_AXIS_TEST_WRONG_DIRECTION',
-        `The upright rotation measured +${r.measuredDeg.toFixed(0)}° — a full clockwise turn where counter-clockwise was needed. The sensor looks fine; redo just this step turning the other way (to your left).`);
-      state.sensorCal = { stage: 'failed', reason: 'wrong-direction', startedAt: performance.now() };
-    } else {
-      // Before declaring the sensor broken, try solving the axis mapping. Some
-      // devices report rotationRate components transposed relative to their own
-      // orientation frame; both spins showing clean full turns on the WRONG raw
-      // axes is the signature (field case 2026-08-12: flat on y, upright on z).
-      const solved = orientation.solveGyroAxisMap();
-      if (solved.status === 'remapped') {
-        log('warn', 'SENSOR_AXIS_MAP_SOLVED', JSON.stringify({
-          perm: solved.perm, signs: solved.signs,
-          residualDeg: Number(solved.residualDeg.toFixed(2)),
-          projections: solved.projections.map(p => Number(p.toFixed(1))),
-          leftHanded: solved.leftHanded
-        }));
-        log('warn',
-          `This phone reports its gyroscope axes in a non-standard order${solved.leftHanded ? ' (mirrored)' : ''}. `
-          + `Solved the mapping from your two turns: once remapped, the flat turn projects to ${solved.projections[0].toFixed(0)}° and the upright turn to ${solved.projections[1].toFixed(0)}° (residual ${solved.residualDeg.toFixed(1)}°). Applying it. `
-          + `This assumes both turns were counter-clockwise as instructed — if they were not, azimuth will run backwards, which the landmark check will expose.`);
-        const scale = 360 / Math.abs(solved.projections[0]);
-        if (scale >= 0.8 && scale <= 1.2) {
-          orientation.gyroScale = scale;
-          log('info', `Gyro scale ${scale.toFixed(3)} adopted from the remapped flat turn.`);
-        }
-        state.sensorCal = { stage: 'settle', startedAt: performance.now() };
-        state.calibStart = performance.now();
-        state.calibFirstTry = 0;
-        director.calibrationProgress = 0;
-        syncControls();
-        return;
-      }
-      log('error', 'SENSOR_AXIS_TEST_FAILED',
-        `The upright counter-clockwise rotation did not produce about -360° in projected survey yaw, a matching raw-axis turn, and closure near its starting orientation, and the axis-map solver could not recover it (${solved.status}). Survey capture is blocked.`);
-      state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', startedAt: performance.now() };
-    }
-    state.paused = true;
+  const next = ROTATION_TESTS[ROTATION_TESTS.indexOf(test) + 1];
+  if (next) {
+    orientation.beginSpinDiagnostic(next.kind);
+    state.sensorCal = { stage: next.stage, startedAt: performance.now() };
     director.calibrationProgress = 0;
     syncControls();
     return;
   }
-  state.sensorCal = { stage: 'settle', startedAt: performance.now() };
-  state.calibStart = performance.now();
-  state.calibFirstTry = 0;
+  solveRotationTests();
+}
+
+/** Judge all three motions at once. */
+function solveRotationTests() {
+  const solved = orientation.solveGyroAxisMap();
+  const ok = solved.status === 'identity' || solved.status === 'remapped';
+  log(ok ? 'info' : 'error', 'SENSOR_AXIS_SOLVE', JSON.stringify(solved));
+
+  if (ok) {
+    const how = solved.decidedBy === 'kinematics'
+      ? 'from the way gravity moved through the phone alone — no assumption about which way you turned'
+      : 'from the axes plus the direction you were asked to turn';
+    if (solved.status === 'identity') {
+      log('info', `Rotation tests passed: this phone reports its gyroscope axes exactly as the spec says. Solved ${how} (residual ${solved.resid}).`);
+    } else {
+      log('warn',
+        `This phone reports its gyroscope axes in a non-standard order${solved.leftHanded ? ' and mirrored' : ''}: `
+        + `reported [x,y,z] → [${solved.perm.map((p, i) => `${solved.signs[i] < 0 ? '-' : ''}${'xyz'[p]}`).join(', ')}]. `
+        + `Solved ${how} (residual ${solved.resid}, next-best axis order ${solved.margin}). Applying it.`);
+    }
+    if (solved.turnedClockwise) {
+      log('info', 'Both circles went clockwise rather than left. No problem — the axes were settled from the way gravity moved, so the direction you turned did not matter.');
+    }
+    if (solved.assumedDirection) {
+      log('warn', 'The phone was held steady enough that the sensors could not tell which way it turned, so the axis directions rest on the instruction to turn LEFT. If you turned right, azimuth will run backwards — the landmark check will expose it.');
+    }
+    if (solved.scaleApplied) {
+      log('info', `Gyro scale ${solved.scaleFromSweep} — measured against the angle gravity swept during the tumble, so it owes nothing to how close your circles were to 360°.`);
+    } else if (solved.scaleFromSweep !== null) {
+      log('warn', `Tumble implied a gyro scale of ${solved.scaleFromSweep}, too far from 1 to trust. Leaving the scale at 1; loop closure will absorb the difference.`);
+    }
+    state.sensorCal = { stage: 'settle', startedAt: performance.now() };
+    state.calibStart = performance.now();
+    state.calibFirstTry = 0;
+    director.calibrationProgress = 0;
+    syncControls();
+    return;
+  }
+
+  const why = {
+    'wrong-direction': 'The turns went clockwise. Nothing is wrong with the phone — the direction is the one thing the sensors cannot infer, so redo the tests turning to your LEFT.',
+    'mixed-direction': 'The two circles went opposite ways round, which leaves the direction genuinely undecidable. Redo them both turning to your LEFT.',
+    'ambiguous': 'The three motions did not separate the axes — they were too alike. Make sure each test turns about a different axis: flat spin, upright circle, then end over end.',
+    'no-direction-evidence': 'Neither circle registered as a turn about vertical, so there is nothing to fix the direction against. Redo the first two tests turning on the spot.',
+    'unsolved': 'The gyroscope and the orientation sensor disagree about how the phone moved. Turn slowly and steadily — a few seconds per circle — rather than whipping it round, and retry.',
+    'too-little-rotation': 'Barely any rotation was recorded. Each test needs a real turn, though it need not be a precise one.',
+    'insufficient-data': 'Not enough usable sensor samples arrived during the tests.'
+  }[solved.status] || 'The three motions could not be reconciled.';
+  log('error', 'SENSOR_AXIS_TEST_FAILED', `${why} (${solved.status})`);
+  state.sensorCal = {
+    stage: 'failed',
+    reason: solved.status === 'wrong-direction' || solved.status === 'mixed-direction'
+      ? 'wrong-direction' : 'bad-axis-map',
+    why,
+    startedAt: performance.now()
+  };
+  state.paused = true;
   director.calibrationProgress = 0;
   syncControls();
 }
@@ -691,15 +705,14 @@ function retrySensorTest() {
   const reason = state.sensorCal.reason;
   state.paused = false;
   director.calibrationProgress = 0;
-  if (reason === 'wrong-direction') {
-    orientation.beginSpinDiagnostic('upright');
-    state.sensorCal = { stage: 'upright-spin', startedAt: performance.now() };
-    log('info', 'Retrying the upright test only. Rotate counter-clockwise — to your LEFT.');
-  } else {
-    orientation.beginSpinDiagnostic();
-    state.sensorCal = { stage: 'spin', startedAt: performance.now() };
-    log('info', 'Retrying the rotation tests from the flat spin.');
-  }
+  // Start from clean evidence: a half-remembered set of motions from the
+  // previous attempt would be solved together with the new ones.
+  orientation.resetSpinEvidence();
+  orientation.beginSpinDiagnostic(ROTATION_TESTS[0].kind);
+  state.sensorCal = { stage: ROTATION_TESTS[0].stage, startedAt: performance.now() };
+  log('info', reason === 'wrong-direction'
+    ? 'Retrying all three tests. Turn to your LEFT on both circles this time.'
+    : 'Retrying the three rotation tests from the flat spin.');
   syncControls();
 }
 
@@ -892,39 +905,33 @@ function renderLive() {
       progress: director.calibrationProgress,
       arrow: null
     };
-  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') {
+  } else if (director.phase === PHASE.CALIBRATING && rotationTest(state.sensorCal.stage)) {
+    const test = rotationTest(state.sensorCal.stage);
     const travelled = Math.abs(orientation.spinProgress());
     d = {
       tone: travelled >= 270 ? 'good' : 'work',
-      headline: 'Rotate once counter-clockwise',
-      detail: `${travelled.toFixed(0)}° measured. Keep the screen face up and turn the phone counter-clockwise (to your LEFT) roughly one full circle, then press Finish. It does not need to be exact — direction matters, precision does not.`,
+      headline: test.headline,
+      detail: `${test.detail} Roughly one circle is all this needs — ${travelled.toFixed(0)}° so far. Precision is not required and nothing here is graded on its own.`,
       progress: clamp(travelled / 360, 0, 1),
-      arrow: -1
+      arrow: test.kind === 'pitch' ? null : -1,
+      figure: test.figure
     };
-    $('primaryBtn').textContent = `Finish 360° test — ${travelled.toFixed(0)}°`;
-    $('primaryBtn').disabled = travelled < 270 && performance.now() - state.sensorCal.startedAt < 8000;
-  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'upright-spin') {
-    const travelled = Math.abs(orientation.spinProgress());
-    d = {
-      tone: travelled >= 270 ? 'good' : 'work',
-      headline: 'Sweep upright counter-clockwise',
-      detail: `${travelled.toFixed(0)}° measured. Hold the phone upright as you will during the survey and turn yourself counter-clockwise (to your LEFT) through roughly one full circle, then press Finish. A rough circle is fine — direction matters, precision does not.`,
-      progress: clamp(travelled / 360, 0, 1),
-      arrow: -1
-    };
-    $('primaryBtn').textContent = `Finish upright test — ${travelled.toFixed(0)}°`;
-    $('primaryBtn').disabled = travelled < 270 && performance.now() - state.sensorCal.startedAt < 8000;
+    // Never disabled. Being locked out of the button while the app disagreed
+    // about whether a turn had happened was the field failure; if the operator
+    // finishes early the solver simply says so and the test can be redone.
+    $('primaryBtn').textContent = `Finish ${test.title.toLowerCase()} test — ${travelled.toFixed(0)}°`;
+    $('primaryBtn').disabled = false;
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'settle') {
     d.detail = 'Now lift the phone into its normal upright scanning position and hold it still. This final step establishes the survey datum.';
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
     const reason = state.sensorCal.reason;
     const texts = {
       'wrong-direction': ['Turned the wrong way',
-        'That was a full clockwise turn — the sensor looks fine. Press Retry and rotate the other way: counter-clockwise, to your LEFT.'],
-      'bad-axis-map': ['360° sensor test failed',
-        'The gyroscope produced samples but did not integrate one physical turn correctly. Retry the rotation tests (turn smoothly, keep the pose steady), or continue with azimuth unverified and check it against landmarks afterwards.'],
-      'bad-lap': ['360° sensor test failed',
-        'The gyroscope produced samples but did not integrate one physical turn correctly. Retry the rotation tests (turn smoothly, keep the pose steady), or continue with azimuth unverified and check it against landmarks afterwards.'],
+        `${state.sensorCal.why || 'The circles went clockwise.'} The phone is fine — direction is the one thing its sensors cannot work out on their own.`],
+      'bad-axis-map': ['Rotation test failed',
+        `${state.sensorCal.why || 'The gyroscope produced samples but the turns could not be reconciled.'} Retry, or continue with azimuth unverified and check it against landmarks afterwards.`],
+      'bad-lap': ['Rotation test failed',
+        `${state.sensorCal.why || 'The gyroscope produced samples but the turns could not be reconciled.'} Retry, or continue with azimuth unverified and check it against landmarks afterwards.`],
       'no-samples': ['Motion sensors unavailable',
         'Chrome returned no orientation or gyroscope samples. Enable Motion sensors for this site in Chrome settings, check Android sensor privacy, then press Reload and retry. No survey data was recorded.']
     };
@@ -987,6 +994,15 @@ function renderLive() {
   $('directiveHead').textContent = d.headline;
   $('directiveDetail').textContent = d.detail;
   $('directiveBar').style.width = `${((d.progress ?? director.verifiedFraction()) * 100).toFixed(1)}%`;
+
+  // Only rewrite the figure when it actually changes; this runs every frame.
+  const figure = $('directiveFigure');
+  if (figure.dataset.figure !== (d.figure || '')) {
+    figure.dataset.figure = d.figure || '';
+    const svg = d.figure ? calibrationFigure(d.figure) : null;
+    figure.innerHTML = svg || '';
+    figure.hidden = !svg;
+  }
 
   if (d.arrow) {
     $('turnCue').hidden = false;
@@ -1137,14 +1153,10 @@ function syncControls() {
   sec.textContent = state.paused ? 'Resume' : 'Pause';
 
   if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
-  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') {
-    btn.textContent = 'Finish 360° test';
-    btn.disabled = orientation.gyroSamples > 20;
-    return;
-  }
-  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'upright-spin') {
-    btn.textContent = 'Finish upright test';
-    btn.disabled = orientation.gyroSamples > 20;
+  const rt = p === PHASE.CALIBRATING ? rotationTest(state.sensorCal.stage) : null;
+  if (rt) {
+    btn.textContent = `Finish ${rt.title.toLowerCase()} test`;
+    btn.disabled = false;
     return;
   }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
@@ -1158,7 +1170,7 @@ function syncControls() {
       btn.textContent = 'Reload and retry sensors';
       sec.hidden = true;
     } else {
-      btn.textContent = reason === 'wrong-direction' ? 'Retry upright test (turn LEFT)' : 'Retry rotation tests';
+      btn.textContent = reason === 'wrong-direction' ? 'Retry the tests (turn LEFT)' : 'Retry rotation tests';
       // The escape hatch: only offered while the gyro is producing samples —
       // with no sensors there is nothing to proceed with.
       sec.hidden = false;
@@ -1191,8 +1203,7 @@ function onPrimary() {
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
     return state.sensorCal.reason === 'no-samples' ? location.reload() : retrySensorTest();
   }
-  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'spin') return finishSpinDiagnostic();
-  if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'upright-spin') return finishUprightSpinDiagnostic();
+  if (p === PHASE.CALIBRATING && rotationTest(state.sensorCal.stage)) return finishRotationTest();
   if (p === PHASE.PASS1) return finishPass1();
   if (p === PHASE.PASS2) return finishSurvey();
   if (p === PHASE.COMPLETE) return resetSurvey();
