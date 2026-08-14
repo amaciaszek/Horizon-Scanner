@@ -164,7 +164,13 @@ export class ScanDirector {
     }
 
     if (this.phase === PHASE.CALIBRATING) {
-      if (Math.abs(ctx.roll) > M.rollLimitCal) return say('fix', 'Level the phone', `Roll is ${ctx.roll.toFixed(0)}°. Bring it within ±${M.rollLimitCal}°.`);
+      // No roll requirement. However the operator chooses to hold the device
+      // IS level as far as this app is concerned: the projection carries roll
+      // through the full quaternion, so a rotated hold changes nothing about
+      // the geometry. The check only ever existed as a tidiness heuristic, and
+      // on 2026-08-14 an iPad whose screen angle was misreported showed a
+      // permanent -85° and could not start a scan at all. Never block a person
+      // on a derived angle that has already been observed to be wrong.
       if (ctx.stillness < 0.6) {
         // Distinguish "you are moving" from "the sensor is noisy". Telling a
         // person to hold still when they are already on a tripod is useless.
@@ -183,7 +189,6 @@ export class ScanDirector {
       if (this.pass1Travel > 12) {
         return say('fix', 'Turn counter-clockwise', 'The survey is accumulating in the clockwise direction. Reverse direction and continue counter-clockwise.', -1);
       }
-      if (Math.abs(ctx.roll) > M.rollLimitScan) return say('fix', 'Level the phone', `Roll ${ctx.roll.toFixed(0)}°. Keep the horizon square in the frame.`);
 
       if (ctx.overlap != null && ctx.overlap < M.minOverlap) {
         const back = Math.max(4, Math.round((M.targetOverlap - ctx.overlap) * ctx.hfovDeg));

@@ -398,7 +398,10 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
   if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
   if (state.frameStatus !== 'ok') return;
   const probe = state.obstructionProbe;
-  if (!probe.active && Math.abs(att.roll) > 20) return;
+  // Roll is deliberately NOT a reason to reject a keyframe. It is carried
+  // through the projection quaternion like every other part of the attitude,
+  // and rejecting on it threw away every frame of an iPad session whose screen
+  // angle was misreported.
   if (Math.abs(orientation.rotationRate) > (probe.active ? 3 : 18)) return;
 
   const stepDeg = Math.max(4, camera.hfovDeg * 0.35);
@@ -644,10 +647,6 @@ function tickCalibration(now) {
   // was stuck for 56 seconds with no way out that the interface admitted to.
   // A stage whose only job is to hold still must not be gated on a derived
   // angle that can be wrong.
-  if (!state.rolledNoteShown && Math.abs(att.roll) > 35) {
-    state.rolledNoteShown = true;
-    log('info', `Holding at ${att.roll.toFixed(0)}° of roll. That is fine — the projection carries roll through — and is noted only because a large value can also mean the screen orientation was misread.`);
-  }
 
   // Calibration exists only to fix the compass yaw datum, and the compass is
   // the input this design already treats as suspect — the mount supplies the
@@ -789,6 +788,14 @@ function solveRotationTests() {
       log('info', `Gyro scale ${solved.scaleFromSweep} — measured against the angle gravity actually swept, so it owes nothing to how far you turned.`);
     } else if (solved.scaleFromSweep !== null) {
       log('warn', `The motion implied a gyro scale of ${solved.scaleFromSweep}, too far from 1 to trust. Leaving it at 1; loop closure will absorb the difference.`);
+    }
+    // If the lens is already known for this device there is nothing to
+    // measure, and asking anyway would be busywork with a worse answer.
+    if (camera.focalSource === 'known-device' || camera.focalSource === 'manual') {
+      const i = camera.intrinsics();
+      log('info', `Skipping the lens step — this device's lens is already pinned at ${i.hfovDeg.toFixed(1)}° x ${i.vfovDeg.toFixed(1)}° (${camera.focalSource}).`);
+      brief('settle');
+      return;
     }
     brief(LENS_STAGE);
     return;

@@ -12,6 +12,33 @@ export const LUMA_W = 160, LUMA_H = 120;   // registration base frame
  * rotation is auto-detected from the track aspect ratio versus the screen, and
  * can be overridden in the field.
  */
+
+/**
+ * Lenses we simply know, and therefore refuse to guess at.
+ *
+ * Focal length in VIDEO pixels, because that is the form that survives
+ * rotation, cropping and rescaling. Added because measurement kept failing on
+ * real hardware and a known device does not need measuring — an operator with
+ * an identified iPad should not be made to sweep a garden to discover a number
+ * Apple already published.
+ *
+ * The iPad Air 5 figure: the 12MP rear camera covers about 70 deg diagonally
+ * on its 4:3 sensor, giving 58.5 deg across the full width; a 1080x1920
+ * portrait stream is a 9:16 crop of that, keeping 0.75 of the width, so the
+ * 1080-pixel axis spans 45.6 deg and the focal length is 540/tan(22.8) px.
+ * That sits between the two independent measurements this device produced in
+ * the field, 41.7 and 49.2 deg, which is the best corroboration available.
+ */
+const KNOWN_LENSES = [
+  {
+    label: 'iPad (12MP rear, 1080x1920 stream)',
+    match: s => /Macintosh|iPad/.test(navigator.userAgent)
+      && (navigator.maxTouchPoints || 0) > 0
+      && Math.min(s.width, s.height) === 1080 && Math.max(s.width, s.height) === 1920,
+    focalVideoPx: 540 / Math.tan(22.8 * Math.PI / 180)
+  }
+];
+
 export class CameraSource {
   constructor(videoEl, log) {
     this.video = videoEl;
@@ -156,6 +183,7 @@ export class CameraSource {
     this.activeDeviceId = this.settings.deviceId || deviceId || null;
     this._startSwapWatch();
     this.detectRotation();
+    this._pinKnownLens();
     return this.settings;
   }
 
@@ -224,6 +252,7 @@ export class CameraSource {
       if (rotatedOnly) {
         this.log('info', `Camera stream re-oriented: ${prev.width}x${prev.height} -> ${cur.width}x${cur.height}. Same lens, so the intrinsics are kept.`);
         this.detectRotation(this._lastScreenAngle || 0);
+        this._applySensorFocal();
         prev = cur;
         return;
       }
@@ -235,6 +264,7 @@ export class CameraSource {
         this.focalPx = null;
         this.focalSource = 'default';
         this.measuredFocalV = null;
+        this.sensorFocalPx = null;
         this.log('warn', `Camera changed underneath the survey: ${prev.width}x${prev.height} -> ${cur.width}x${cur.height}. Intrinsics discarded. Pin a lens under Advanced to stop this.`);
         if (this.onLensSwap) this.onLensSwap(prev, cur);
         prev = cur;
@@ -408,6 +438,57 @@ export class CameraSource {
     this.hfovDeg = 2 * Math.atan((WORK_W / 2) / focalH) * RAD;
     this.measuredFocalV = Number.isFinite(focalV) && focalV > 40 ? focalV : null;
     this.focalSource = 'measured';
+    return true;
+  }
+
+
+  /** Pin a lens from the table if this device is one we know. */
+  _pinKnownLens() {
+    if (!this.settings) return false;
+    const hit = KNOWN_LENSES.find(k => { try { return k.match(this.settings); } catch (_) { return false; } });
+    if (!hit) return false;
+    if (this.setSensorFocalPx(hit.focalVideoPx, 'known-device')) {
+      this.log('info', `Lens known for this device (${hit.label}): ${this.hfovDeg.toFixed(1)}° across the working frame, ${this.intrinsics().vfovDeg.toFixed(1)}° down it. Not measured and not guessed — pinned. Override under Advanced if it looks wrong.`);
+      return true;
+    }
+    return false;
+  }
+
+  /** Pin the lens from a known focal length in VIDEO pixels.
+   *
+   * Focal length in pixels is the one description of a lens that survives
+   * everything this pipeline does to a frame: rotating it swaps the axes but
+   * not the number, cropping it removes pixels but does not change the angle
+   * each remaining pixel subtends, and rescaling it multiplies focal and image
+   * size together. So a device whose lens is known can be pinned once here and
+   * stay correct through every rotation and re-orientation the platform throws
+   * at it — which on an iPad is several per session.
+   *
+   * Everything else in this file tries to MEASURE the lens. This does not: it
+   * is a hardcoded fact about a known device, and it wins over every estimator.
+   */
+  setSensorFocalPx(focalVideoPx, label) {
+    if (!Number.isFinite(focalVideoPx) || focalVideoPx <= 0) return false;
+    this.sensorFocalPx = focalVideoPx;
+    this.sensorFocalLabel = label || 'pinned';
+    return this._applySensorFocal();
+  }
+
+  /** Recompute the working-frame focal from the pinned sensor focal and the
+   *  cover-fit scale currently in force. Called whenever the stream changes. */
+  _applySensorFocal() {
+    if (!this.sensorFocalPx) return false;
+    const vw = this.video?.videoWidth, vh = this.video?.videoHeight;
+    if (!vw || !vh) return false;
+    const swapped = this.frameRotation === 90 || this.frameRotation === 270;
+    const srcW = swapped ? vh : vw, srcH = swapped ? vw : vh;
+    // The same cover fit _drawRotated performs. Resampling scales the focal
+    // length by exactly the factor it scales the image by.
+    const scale = Math.max(WORK_W / srcW, WORK_H / srcH);
+    this.focalPx = this.sensorFocalPx * scale;
+    this.hfovDeg = 2 * Math.atan((WORK_W / 2) / this.focalPx) * RAD;
+    this.measuredFocalV = this.focalPx;      // square pixels: one focal, both axes
+    this.focalSource = this.sensorFocalLabel;
     return true;
   }
 

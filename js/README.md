@@ -1378,3 +1378,46 @@ including the retry path — routes through one.
 Checked that every stage `brief()` targets has both a briefing and a starter,
 that the tick short-circuits, and that the longest briefing still fits over the
 camera view on a phone-sized stage (135 px of a 390 px stage) with its figure.
+
+### 2026-08-14, late — the app stops arguing with the operator
+
+Two instructions, both correct, both taken literally.
+
+**"If the person is holding it steady that is what level is."** Every roll gate
+is gone. Not relaxed — gone. `guide.js` no longer has a "Level the phone"
+directive in either calibration or scanning, and `maybeKeyframe` no longer
+rejects on roll. The justification was always weak and is now indefensible:
+roll is carried through the projection quaternion like every other part of the
+attitude, so a rotated hold changes nothing about the geometry. It was a
+tidiness heuristic, and on an iPad whose screen angle the browser misreports it
+showed a permanent -85° and made the app unusable — refusing to start a scan,
+then discarding every frame. A person should never be blocked by a derived
+angle that has already been observed to be wrong on their hardware.
+
+**"You know my model of iPad, hardcode that."** Also right, and it exposes a
+wrong assumption running through all of this: that the lens must be measured.
+For an identified device it must not — Apple published the number, and no
+amount of sweeping a garden beats it.
+
+`KNOWN_LENSES` pins the lens as a focal length in VIDEO pixels, which is the
+one description that survives what this pipeline does to a frame. Rotating
+swaps the axes but not the number; cropping removes pixels without changing the
+angle each remaining pixel subtends; rescaling multiplies focal and image size
+together. So one constant stays correct through every re-orientation the
+platform performs, and iPadOS performs several a session.
+
+The iPad Air 5 entry: the 12MP rear covers about 70° diagonally on its 4:3
+sensor, so 58.5° across the full width; a 1080x1920 stream is a 9:16 crop
+keeping 0.75 of that width, so the 1080-pixel axis spans 45.6° and the focal is
+540/tan(22.8) = 1284.6 px. It lands between the two independent measurements
+this very device produced in the field, 41.7° and 49.2°, which is the only
+corroboration worth having.
+
+Verified through the real camera object in all three stream orientations it has
+been seen delivering: 45.6° x 35.0° portrait, 58.5° x 45.6° once re-oriented,
+identical for a native landscape stream — and in every case the vertical is
+exactly `(WORK_H/2)/focal`, one focal length serving both axes, which is the
+invariant that distinguishes a pinhole model from a derived guess.
+
+Consequences: the lens step is skipped outright on a device with a pinned lens,
+the pin survives re-orientation, and only a genuine lens change clears it.
