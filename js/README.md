@@ -1194,3 +1194,120 @@ Still not verified on hardware — in particular whether the registration worker
 reports vertical shift as cleanly as horizontal, since nothing has needed `dy`
 before now. If the vertical never reaches ready in the field, that is where to
 look first.
+
+### 2026-08-14 — retracting the field-of-view diagnosis
+
+The operator's instinct that the field-of-view work had made things worse was
+right to be suspicious, and the log settles it. It did not corrupt any data —
+but the diagnosis behind it was unsound and I stated it far too confidently.
+
+`visualScale`, the estimator the whole 27.6° claim rested on, read **2.642** at
+23:06 and **0.426** at 23:33 on the same phone. A factor of 6.2. One run said
+the lens was far narrower than the assumed 66°, the next said far wider. That
+is not a measurement, and no conclusion should ever have been drawn from a
+single reading of it.
+
+Three separate faults, worth keeping apart:
+
+1. **The claim was unfounded.** Retracted. The 66° default may well be fine;
+   the honest position is that the field of view is still unknown. The report
+   line now prints the ratio and the range it wandered over during the scan,
+   labelled diagnostic only, and instructs nothing.
+2. **A bug I introduced.** The report's "measured field of view" used
+   `camera.focalPx`, which is `null` until something sets it — so the arithmetic
+   was `atan(192/0)`, and that is where the alarming "180.0° horizontal" in the
+   bundle came from. Gone with the claim.
+3. **The guided measurement never ran.** It rejected **335 of about 440** frames
+   on `quality >= 0.45` and timed out after a full minute with 20 pairs. That
+   phone's matcher runs at 0.25-0.31, so the gate was unreachable and the step
+   could not have succeeded on this hardware at all. Gating on match quality was
+   the wrong instinct: quality is a proxy, and this fit has a far better arbiter
+   in the uncertainty of its own answer. Threshold dropped to 0.2, with the
+   weighted median and the uncertainty gate doing the real work. Simulated at
+   0.28 quality, it now measures a 66° lens 10 times out of 10.
+
+Also added, because it is the difference between a measurement and an
+assertion: the two halves are compared against each other. Focal length in
+pixels is ONE number for both axes on a square-pixel sensor, so the horizontal
+(measured against the gyroscope) and the vertical (measured against gravity)
+must agree — two different sensors converging on one lens. `squarePixelRatio`
+reports it, and the log says plainly whether they agreed or not. Had this
+existed earlier it would have caught the bad claim on its own.
+
+What is still unexplained, and should not be attributed to the lens until
+something actually measures it: maximum spread of 50-64° with 51-82 spike bins,
+persisting across runs where the projection was byte-identical. Worth noting
+that "maximum spread" is a worst-case over 720 bins and a single bad bin sets
+it — at the vertical edge of a close tall house the true skyline falls 45° in
+about three degrees of azimuth, so a couple of degrees of pointing error there
+produces exactly this. A median and a 90th percentile would say far more about
+whether the profile is sound than the maximum does.
+
+The next idea worth trying is matcher-free and uses data the survey already
+has: choose the field of view that MINIMISES the disagreement between
+overlapping observations of the same bin. A wrong focal length makes the same
+skyline point read differently depending on where in the frame it fell, so the
+spread itself is a function of the field of view with a minimum at the truth.
+It needs no visual matcher, runs offline against stored keyframes, and would
+optimise exactly the quantity that is currently failing.
+
+### 2026-08-14 — an iPad could not finish calibration, and the reason was one number
+
+The operator moved to an iPad (A2588) to get away from the multi-lens problem
+and could not get past "hold still upright". The bundle shows why, and it is a
+better bug than the one they were escaping.
+
+Safari reported `screen.orientation.angle = 90` while the viewport was plainly
+**820x1180 — portrait**. That angle is measured from each platform's own idea of
+a natural orientation, and tablets do not agree with phones about what that is.
+Nothing about it is cosmetic:
+
+    screenQuat(q, 90)  maps screen-right onto device -Y
+    device -Y's tilt out of horizontal IS beta
+    => roll = -beta, exactly, at every sample in the log
+
+Both snapshots confirm it to fifteen decimal places. And roll is what two gates
+are built on:
+
+- the settle stage needed `|roll| <= 12`, so it could only be satisfied lying
+  flat, screen up — while the instruction on screen said to hold it upright;
+- its own 12-second escape hatch ALSO tested level, so there was no way out
+  that the interface admitted to. The operator was stuck for 56 seconds;
+- `maybeKeyframe` rejects above 20°, so once pass 1 finally started, **every
+  frame was thrown away — keyframes 0, coverage 0**.
+
+Fixed in two places, deliberately:
+
+1. **Root cause.** `_onScreen` now cross-checks the reported angle against the
+   viewport and trusts the viewport, because a viewport's shape is a
+   measurement and an angle is a convention. Only the portrait direction is
+   corrected — a portrait viewport means the angle is 0 or 180 and 0 is
+   overwhelmingly the common case, whereas 90 and 270 are indistinguishable
+   from shape and guessing could turn the picture upside down. It says so in
+   the log when it intervenes.
+2. **Defence in depth.** The settle stage no longer tests level at all, nor
+   does its escape hatch. Collecting compass samples while the device is held
+   steady has nothing to do with how it is rotated about its own view axis —
+   roll is carried through the full quaternion by every projection downstream.
+   A stage whose only job is to hold still must not be gated on a derived angle
+   that can be wrong.
+
+Verified against the iPad's own logged attitudes: at 22:48:59 roll goes from
+-60.1° to 10.0°, at 22:50:08 from -20.9° to -15.2°, elevation unchanged in
+both. Both now clear the settle and keyframe gates. Checked that a device
+genuinely in landscape (90 or 270 with a landscape viewport) is left alone, and
+that the Android phone's 0°/portrait case is untouched.
+
+Worth recording separately, because it is the best news in the file: **the
+iPad's compass is good.** 27 rejects out of 1584, datum spread 8.3°, bearing
+datum ±4°. The Android phone has been rejecting 8404 of 8448 with an 84° spread
+and a ±42° datum. If absolute bearings matter — and for a telescope horizon
+they do — the iPad is the better instrument by a wide margin, and it has one
+rear camera. The axis solve also came out cleaner there: residual 0.117 against
+the phone's 0.208-0.249, and the gyro scale passed its spread guard for the
+first time at 0.9857.
+
+The lens step timed out again at 681 quality rejections, but that bundle
+predates the threshold fix, so it is not yet evidence either way. Its partial
+answer is at least self-consistent: focalH 98.9 against focalV 99.7, a
+square-pixel ratio of 1.0085, which is the cross-check working as intended.

@@ -274,28 +274,15 @@ async function processFrame() {
             state.visualScale = state.visualScale === null
               ? ratio : 0.98 * state.visualScale + 0.02 * ratio;
             state.visualScaleN = (state.visualScaleN || 0) + 1;
-          }
-          // The image and the gyroscope are measuring the same rotation, so
-          // their ratio IS the field-of-view error — and the field of view
-          // multiplies every ALTITUDE this survey reports. Worse, the error
-          // grows toward the frame edges, so the same skyline read twice
-          // disagrees with itself; that is what a large "maximum spread" is
-          // made of. This was a quiet line in the report while the profile
-          // looked plausible, which is the worst way for it to fail.
-          if (!state.warnedFov && state.visualScaleN > 120
-              && (state.visualScale > 1.25 || state.visualScale < 0.8)) {
-            state.warnedFov = true;
-            const trueHfov = 2 * Math.atan((WORK_W / 2) / (camera.focalPx * state.visualScale)) * RAD;
-            log('warn', 'FOV_MISMATCH', JSON.stringify({
-              visualScale: Number(state.visualScale.toFixed(3)),
-              assumedHfovDeg: Number(camera.hfovDeg.toFixed(1)),
-              measuredHfovDeg: Number(trueHfov.toFixed(1)),
-              samples: state.visualScaleN
-            }));
-            log('warn',
-              `The camera's field of view is wrong. The imagery and the gyroscope agree the frame spans about ${trueHfov.toFixed(0)}°, not the ${camera.hfovDeg.toFixed(0)}° being assumed. `
-              + `Every ALTITUDE is therefore off by roughly ${state.visualScale.toFixed(1)}x, and by more toward the edges of the frame, which is what inflates the altitude spread. `
-              + `Azimuth is unaffected — it comes from the gyroscope. Set ${trueHfov.toFixed(0)}° under Advanced, or run Scan lenses, then press Recompute from keyframes.`);
+            // Track how far this running estimate wanders. It is the only
+            // thing standing between the number and a claim about the lens,
+            // and it has earned that scrutiny: across two field runs 27
+            // minutes apart on the same phone it read 2.642 and then 0.426, a
+            // factor of 6.2, once saying the lens was far narrower than
+            // assumed and once far wider. An estimator that inconsistent may
+            // be reported, but it may not conclude anything.
+            state.visualScaleMin = Math.min(state.visualScaleMin ?? ratio, ratio);
+            state.visualScaleMax = Math.max(state.visualScaleMax ?? ratio, ratio);
           }
           // Opposed signs on a confident match means one of them is wrong;
           // trust neither for this frame rather than averaging them.
@@ -600,8 +587,29 @@ function tickCalibration(now) {
   if (state.sensorCal.stage === 'failed') return;
 
   const att = orientation.attitude();
-  const level = Math.abs(att.roll) <= 12;
   const still = orientation.stillness > 0.6;
+
+  // This stage used to also demand |roll| <= 12, and that requirement was both
+  // unnecessary and capable of deadlocking calibration outright.
+  //
+  // Unnecessary because all this stage does is collect compass samples for the
+  // yaw datum while the device is held steady. Roll is carried through the full
+  // quaternion by every projection downstream, so how the device is rotated
+  // about its own view axis simply does not enter into it.
+  //
+  // Deadlocking because `roll` is derived through screenQuat, and on a device
+  // reporting a 90° screen angle the screen's right axis maps onto device -Y,
+  // whose tilt out of horizontal IS beta. An iPad on 2026-08-14 therefore
+  // reported roll = -beta exactly, so "level" could only be satisfied lying
+  // flat, screen up — while the instruction on screen was to hold it upright.
+  // Worse, the 12-second escape hatch below ALSO tested level, so the operator
+  // was stuck for 56 seconds with no way out that the interface admitted to.
+  // A stage whose only job is to hold still must not be gated on a derived
+  // angle that can be wrong.
+  if (!state.rolledNoteShown && Math.abs(att.roll) > 35) {
+    state.rolledNoteShown = true;
+    log('info', `Holding at ${att.roll.toFixed(0)}° of roll. That is fine — the projection carries roll through — and is noted only because a large value can also mean the screen orientation was misread.`);
+  }
 
   // Calibration exists only to fix the compass yaw datum, and the compass is
   // the input this design already treats as suspect — the mount supplies the
@@ -609,7 +617,7 @@ function tickCalibration(now) {
   // never produce a quiet magnetometer, so refusing to start the survey over it
   // blocks the whole tool on the one number that does not have to be right.
   // After 12 s of trying, proceed on a relative datum and say so.
-  if (!state.calibGaveUp && now - (state.calibFirstTry || now) > 12000 && level && orientation.lastEventAt) {
+  if (!state.calibGaveUp && now - (state.calibFirstTry || now) > 12000 && orientation.lastEventAt) {
     state.calibGaveUp = true;
     log('warn', `Sensor never settled — orientation jitter ±${(orientation.jitterDeg / 2).toFixed(1)}°, turn rate ${orientation.rotationRate.toFixed(1)}°/s. Continuing on a relative azimuth datum; set the offset from mount calibration after export.`);
     orientation.compassReliability = 'poor';
@@ -618,7 +626,7 @@ function tickCalibration(now) {
   }
   if (!state.calibFirstTry) state.calibFirstTry = now;
 
-  if (!level || !still || !orientation.lastEventAt) {
+  if (!still || !orientation.lastEventAt) {
     director.calibrationProgress = Math.max(0, director.calibrationProgress - 0.02);
     state.calibStart = now;
     return;
@@ -814,12 +822,20 @@ function finishLens(r) {
       focalV: Number(r.focalV.toFixed(1)),
       uncertaintyH: Number((r.uncertaintyH * 100).toFixed(2)),
       uncertaintyV: Number((r.uncertaintyV * 100).toFixed(2)),
+      squarePixelRatio: Number(r.squarePixelRatio.toFixed(3)),
       nPan: r.nPan, nTilt: r.nTilt, rejected: r.rejected
     }));
-    log('info',
+    // The two halves were measured against different sensors — yaw against the
+    // gyroscope, tilt against gravity — and on a square-pixel sensor they must
+    // arrive at the same focal length in pixels. Saying whether they did is
+    // the difference between a measurement and an assertion.
+    const agree = Math.abs(r.squarePixelRatio - 1) < 0.12;
+    log(agree ? 'info' : 'warn',
       `Lens measured: ${r.hfovDeg.toFixed(1)}° across the frame and ${r.vfovDeg.toFixed(1)}° down it, `
       + `to about ±${(Math.max(r.uncertaintyH, r.uncertaintyV) * 100).toFixed(1)}%, from ${r.nPan} pan and ${r.nTilt} tilt pairs. `
-      + `The vertical was measured against gravity rather than assumed from the horizontal, which is what altitudes actually depend on.`);
+      + (agree
+        ? `The two halves were measured against different sensors — sideways against the gyroscope, up-and-down against gravity — and agree on the same lens to ${Math.abs(r.squarePixelRatio - 1) * 100 < 1 ? 'under 1' : (Math.abs(r.squarePixelRatio - 1) * 100).toFixed(0)}%, which is the cross-check that makes this a measurement rather than a guess.`
+        : `But they DISAGREE by ${((r.squarePixelRatio - 1) * 100).toFixed(0)}% about the same lens, which on a square-pixel sensor they should not. Treat this with suspicion and check it against a landmark of known height before trusting altitudes.`));
     syncFovReadout();
   } else {
     log('warn', 'LENS_NOT_MEASURED', JSON.stringify(r || {}));
@@ -984,7 +1000,9 @@ function resetSurvey() {
   state.announcedSource = false;
   state.visualScale = null;
   state.visualScaleN = 0;
-  state.warnedFov = false;
+  state.visualScaleMin = null;
+  state.visualScaleMax = null;
+  state.rolledNoteShown = false;
   state.prevElevation = null;
   lensCal.reset();
   state.calibFirstTry = 0;
@@ -1260,17 +1278,15 @@ function reportText(r) {
   lines.push('');
   lines.push(`Rotation source        ${h.gyro === 'available' ? 'gyroscope (metric)' : 'visual only (scaled by field of view)'}`);
   if (state.visualScale !== null) {
-    // State the consequence, not the ratio. This line used to read
-    // "field of view is understated by 164%", which is both ambiguous about
-    // direction and silent about the fact that it invalidates every altitude.
-    const measured = 2 * Math.atan((WORK_W / 2) / (camera.focalPx * state.visualScale)) * RAD;
-    const bad = state.visualScale > 1.25 || state.visualScale < 0.8;
-    lines.push(`Field of view measured ${measured.toFixed(1)}° horizontal, from imagery against the gyroscope`
-      + (bad ? ` — DISAGREES WITH THE ${camera.hfovDeg.toFixed(0)}° IN USE` : ' (agrees)'));
-    if (bad) {
-      lines.push(`  consequence          every altitude is out by about ${state.visualScale.toFixed(1)}x, more toward the frame edges;`);
-      lines.push('                       azimuth is unaffected. Set the measured value and recompute.');
-    }
+    // A raw diagnostic, deliberately drawing no conclusion. An earlier version
+    // of this line announced a measured field of view and told the operator to
+    // adopt it; two field runs then produced 2.642 and 0.426 from the same
+    // phone, so the announcement was worthless and the instruction was worse.
+    // The spread across the run is printed beside it so the number can be
+    // judged rather than believed.
+    const spread = (state.visualScaleMax ?? 0) - (state.visualScaleMin ?? 0);
+    lines.push(`Visual/gyro ratio      ${state.visualScale.toFixed(2)} (ranged ${(state.visualScaleMin ?? 0).toFixed(2)}-${(state.visualScaleMax ?? 0).toFixed(2)} during the scan)`);
+    lines.push(`                       diagnostic only${spread > 0.5 ? ' — too unstable to infer a field of view from' : ''}`);
   }
   lines.push(`Capture mode           ${director.mode.label}`);
   if (survey.lensChanges.length) {

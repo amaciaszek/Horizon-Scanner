@@ -316,10 +316,41 @@ export class OrientationSource {
     }
   }
 
+  /**
+   * Which way the interface is rotated, cross-checked against the viewport.
+   *
+   * `screen.orientation.angle` is measured from each platform's own idea of a
+   * "natural" orientation, and tablets do not agree with phones about what that
+   * is. An iPad on 2026-08-14 reported angle 90 while its viewport was plainly
+   * portrait at 820x1180, and the consequences were not cosmetic: the screen
+   * angle rotates the frame, and it feeds screenQuat, which is where the roll
+   * used by every hold-steady and keyframe check comes from. With the angle
+   * wrong, roll came out equal to beta, the settle stage became unsatisfiable
+   * while the operator was being told to hold the device upright, and every
+   * keyframe was rejected for excess roll — the survey recorded nothing.
+   *
+   * The viewport's shape is not a convention, it is a measurement, so when the
+   * two disagree the viewport wins. Only the portrait direction is corrected:
+   * a viewport reporting portrait means the angle can only be 0 or 180, and 0
+   * is the overwhelmingly common case. Landscape is left alone because 90 and
+   * 270 are genuinely indistinguishable from shape and guessing could turn the
+   * picture upside down.
+   */
   _onScreen() {
-    this.screenAngle = (screen.orientation && Number.isFinite(screen.orientation.angle))
+    const reported = (screen.orientation && Number.isFinite(screen.orientation.angle))
       ? screen.orientation.angle
       : (Number(window.orientation) || 0);
+    const w = window.innerWidth, h = window.innerHeight;
+    const reportedLandscape = reported === 90 || reported === 270 || reported === -90;
+    if (reportedLandscape && w > 0 && h > w) {
+      if (this.screenAngle !== 0 || !this._screenAngleWarned) {
+        this._screenAngleWarned = true;
+        this.log('warn', `The browser reports a screen angle of ${reported}° but the viewport is ${w}x${h}, which is portrait. Trusting the viewport and using 0°. Left uncorrected this makes the device look permanently rolled, which blocks the hold-steady step and rejects every keyframe.`);
+      }
+      this.screenAngle = 0;
+      return;
+    }
+    this.screenAngle = reported;
   }
 
   _onOrientation(e) {

@@ -48,7 +48,18 @@ const RAD = 180 / Math.PI;
 const MIN_ANGLE_DEG = 0.35;
 const MAX_ANGLE_DEG = 9;
 const MIN_SHIFT_PX = 2;
-const MIN_QUALITY = 0.45;
+/**
+ * Deliberately low, because match quality is a PROXY and this fit has a much
+ * better arbiter available: the uncertainty of its own answer.
+ *
+ * Set at 0.45 this rejected 335 of about 440 frames during a field attempt —
+ * the operator swept for a full minute and the measurement timed out with 20
+ * pairs. That phone's matcher simply runs at 0.25-0.31, so the threshold was
+ * unreachable and the step could never have succeeded on it. A weak match is
+ * not a wrong match, only a noisier one, and noise is what the weighted median
+ * and the uncertainty gate below are for.
+ */
+const MIN_QUALITY = 0.2;
 /**
  * Enough pairs to be worth quoting, and an uncertainty small enough to adopt.
  *
@@ -185,11 +196,14 @@ export class LensCalibrator {
       panReady,
       tiltReady,
       ready: panReady && tiltReady,
-      // How far the vertical disagrees with what a square-pixel camera would
-      // predict from the horizontal. Near 1 means the simple model was right
-      // all along; far from 1 means deriving one from the other was the bug.
-      aspectRatio: (h.value && v.value)
-        ? (v.value / h.value) / 1 : null,
+      // Focal length in pixels is the SAME number for both axes on a
+      // square-pixel sensor — tanHalfH = (W/2)/f and tanHalfV = (H/2)/f share
+      // that f. So this ratio is an independent check on the whole
+      // measurement, not just a curiosity: near 1 says the two halves, taken
+      // against two different sensors, agree about the same lens. Far from 1
+      // says either the pixels are not square after the crop, or one of the
+      // halves is wrong — and the scatter figures say which.
+      squarePixelRatio: (h.value && v.value) ? v.value / h.value : null,
       rejected: { ...this.rejected }
     };
   }

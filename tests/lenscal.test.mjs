@@ -36,7 +36,7 @@ const rng = s => () => {
  * is the fraction of frames where the matcher locks onto the wrong thing.
  */
 function sweepSession(cal, { hfov, vfov, seconds = 12, seed = 1, noisePx = 0.6,
-                             outlier = 0, quality = 0.8, elevationDeg = 0 } = {}) {
+                             outlier = 0, quality = 0.28, elevationDeg = 0 } = {}) {
   const rnd = rng(seed);
   const fH = focalFor(hfov, WORK_W), fV = focalFor(vfov, WORK_H);
   const dt = 1 / 30;
@@ -74,6 +74,11 @@ console.log('=== Recovers the lens the 2026-08-13 field run actually had ===');
   check('and it disagrees loudly with the assumed 66°', Math.abs(r.hfovDeg - 66) > 30);
   check('and it says how well it knows the answer', r.uncertaintyH < 0.015 && r.uncertaintyV < 0.015,
     `+/-${(r.uncertaintyH * 100).toFixed(2)}% horizontal, +/-${(r.uncertaintyV * 100).toFixed(2)}% vertical`);
+  // Focal length in pixels is one number for both axes on a square-pixel
+  // sensor, so the two halves — measured against two different sensors —
+  // agreeing is an independent check that neither is quietly wrong.
+  check('the two halves agree about the same lens', Math.abs(r.squarePixelRatio - 1) < 0.05,
+    `vertical/horizontal focal ${r.squarePixelRatio?.toFixed(3)}`);
 }
 
 console.log('=== Recovers an ordinary lens too, so it is not tuned to one answer ===');
@@ -125,6 +130,26 @@ console.log('=== Tilted panning still works, because the cosine is corrected ===
   const r = cal.result();
   check('panning at 25° of tilt still recovers the lens', Math.abs(r.hfovDeg - TRUE_H) < 1.5,
     `${r.hfovDeg?.toFixed(2)}° against ${TRUE_H}°`);
+}
+
+console.log('=== Works at the match quality this phone actually produces ===');
+{
+  // The 2026-08-13 attempt rejected 335 of ~440 frames on a 0.45 quality gate
+  // and timed out with 20 pairs. Nothing about a 0.28 match is wrong, only
+  // noisier, so the fit must survive it.
+  const TRUE_H = 66, TRUE_V = 2 * Math.atan(Math.tan(66 / 2 * DEG) * (WORK_H / WORK_W)) * RAD;
+  let ready = 0, worst = 0;
+  for (let seed = 1; seed <= 10; seed++) {
+    const cal = new LensCalibrator(WORK_W, WORK_H);
+    sweepSession(cal, { hfov: TRUE_H, vfov: TRUE_V, seed, quality: 0.28, noisePx: 1.0 });
+    const r = cal.result();
+    if (r.ready) ready++;
+    if (r.hfovDeg) worst = Math.max(worst, Math.abs(r.hfovDeg - TRUE_H));
+  }
+  check('a 0.28-quality matcher still measures the lens', ready === 10,
+    `${ready}/10 ready, worst error ${worst.toFixed(2)}°`);
+  check('and no rejections are attributed to quality',
+    new LensCalibrator(WORK_W, WORK_H).result().rejected.quality === 0);
 }
 
 console.log('=== Refuses rather than guessing when the evidence is thin ===');
