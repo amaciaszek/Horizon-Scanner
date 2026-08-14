@@ -1311,3 +1311,70 @@ The lens step timed out again at 681 quality rejections, but that bundle
 predates the threshold fix, so it is not yet evidence either way. Its partial
 answer is at least self-consistent: focalH 98.9 against focalV 99.7, a
 square-pixel ratio of 1.0085, which is the cross-check working as intended.
+
+### 2026-08-14, 23:04 — three bugs behind one bad screenshot
+
+The operator's description was exact: "it thinks the iPad is not vertical", and
+the overlay scribbling vertical streaks across the picture. Both are the same
+fault, and my previous fix for it was real but did not survive contact.
+
+1. **The screen-angle correction fired once and was then lost.** iOS dispatches
+   `orientationchange` BEFORE the viewport metrics update, so a later event read
+   stale landscape dimensions and waved the bad 90° straight back through. The
+   log shows the warning at 23:02:10 and `screenAngle: 90` at the end, with
+   roll = -beta again (-82° while held upright). Now re-derived from live values
+   every 400 ms during normal orientation samples rather than latched at event
+   time, so a stale reading corrects itself on the next sample instead of
+   poisoning the session. Verified against the race directly: the bad value gets
+   in, and is gone one sample later. Roll at the operator's actual pose goes
+   from -82° to -0.6°, which clears the keyframe gate that had been discarding
+   every frame.
+
+2. **A rotation was being called a lens swap.** "Camera changed underneath the
+   survey: 1080x1920 -> 1920x1080" fired twice, each time discarding the
+   intrinsics — including a focal length the app had just self-calibrated to
+   49.2°. A pure width/height SWAP with the same deviceId is the platform
+   re-orienting one sensor; the lens is identified by its id and its pixel
+   count, neither of which a rotation changes. Now recognised and kept.
+
+3. **The lens measurement converged and was thrown away.** The quality-threshold
+   fix worked — 273 pan and 191 tilt pairs against 20 and 15 before — and it
+   missed `ready` by six ten-thousandths: uncertainty 0.0156 against a threshold
+   of 0.015 that was an arbitrary round number. A minute of the operator's
+   effort discarded to fall back on a guess. Threshold moved to 2% (about one
+   degree on a 50° lens), and a timeout now keeps a measurement that merely ran
+   out of time if it is within 4%.
+
+Two independent estimates of this iPad's lens now roughly agree and both sit
+well below the 66° default: passive self-calibration said 49.2°, the guided
+measurement said 41.7° x 30.1° with a square-pixel ratio of 1.06. Consistent in
+direction, not yet consistent enough to adopt on their own — but this is the
+first evidence for the default being wrong that does not come from the
+estimator already retracted.
+
+And the compass on this iPad is extraordinary: **datum spread 0.2°**, bearing
+datum ±0°, 12 rejects in 1446. The Android phone was ±42°.
+
+### 2026-08-14, later — nothing is measured until the operator says go
+
+*"maybe before each step have a next button so i am not holding it wrong for
+the beginning of the test."* Correct, and it had been costing real data at
+every stage.
+
+Each measuring stage used to begin the instant the previous one ended, so the
+operator was always getting into position while recording was already running.
+That is not cosmetic. The stationary test takes its gyro bias from exactly
+those first seconds — and refused the bias twice in the field for movement that
+was the operator picking the device up. The wave takes its axis evidence from
+them. The lens sweep spends them on frames pointed at wherever the device
+happened to be facing while being raised.
+
+There is now a briefing before each: what is about to happen, the figure for
+it, and a Start button. `tickCalibration` returns immediately while one is up,
+so nothing at all is recorded. The four are set-it-down, wave-it-about,
+measure-the-lens and hold-as-you-will-scan, and every automatic transition —
+including the retry path — routes through one.
+
+Checked that every stage `brief()` targets has both a briefing and a starter,
+that the tick short-circuits, and that the longest briefing still fits over the
+camera view on a phone-sized stage (135 px of a 390 px stage) with its figure.

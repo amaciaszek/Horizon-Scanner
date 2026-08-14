@@ -342,11 +342,26 @@ export class OrientationSource {
       : (Number(window.orientation) || 0);
     const w = window.innerWidth, h = window.innerHeight;
     const reportedLandscape = reported === 90 || reported === 270 || reported === -90;
-    if (reportedLandscape && w > 0 && h > w) {
-      if (this.screenAngle !== 0 || !this._screenAngleWarned) {
+    const viewportPortrait = w > 0 && h > w;
+
+    if (reportedLandscape && viewportPortrait) {
+      // Latch it. iOS fires orientationchange BEFORE the viewport metrics
+      // update, so a single event-time reading can catch stale dimensions and
+      // wave the bad angle straight through — which is exactly what happened
+      // on 2026-08-14: the correction fired once at startup, then a later
+      // event restored 90 and the whole session ran rolled by 80°, painting
+      // the skyline overlay as vertical streaks across the picture.
+      this._screenAngleUntrusted = true;
+      if (!this._screenAngleWarned) {
         this._screenAngleWarned = true;
-        this.log('warn', `The browser reports a screen angle of ${reported}° but the viewport is ${w}x${h}, which is portrait. Trusting the viewport and using 0°. Left uncorrected this makes the device look permanently rolled, which blocks the hold-steady step and rejects every keyframe.`);
+        this.log('warn', `The browser reports a screen angle of ${reported}° but the viewport is ${w}x${h}, which is portrait. Trusting the viewport and using 0°. Left uncorrected this makes the device look permanently rolled, which blocks the hold-steady step, rejects every keyframe, and scribbles the skyline overlay across the picture.`);
       }
+      this.screenAngle = 0;
+      return;
+    }
+    // Once a device has been caught misreporting, a landscape claim is only
+    // believed when the viewport agrees with it.
+    if (this._screenAngleUntrusted && reportedLandscape && !viewportPortrait && h === 0) {
       this.screenAngle = 0;
       return;
     }
@@ -356,6 +371,15 @@ export class OrientationSource {
   _onOrientation(e) {
     const now = performance.now();
     if (!Number.isFinite(e.alpha) && !Number.isFinite(e.beta)) return;
+
+    // Re-derive the screen angle from live values rather than trusting the one
+    // latched at the last orientationchange. Two property reads, and it means a
+    // reading taken while the viewport metrics were mid-update corrects itself
+    // on the next sample instead of poisoning the rest of the session.
+    if (now - (this._screenCheckedAt || 0) > 400) {
+      this._screenCheckedAt = now;
+      this._onScreen();
+    }
 
     this._rateWindow.push(now);
     while (this._rateWindow.length && now - this._rateWindow[0] > 1000) this._rateWindow.shift();

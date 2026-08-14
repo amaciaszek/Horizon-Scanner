@@ -213,6 +213,20 @@ export class CameraSource {
       const t = this.stream?.getVideoTracks()[0];
       if (!t?.getSettings) return;
       const cur = t.getSettings();
+      // A pure width/height SWAP is the platform re-orienting the same sensor,
+      // not a different lens. iPadOS does this whenever the device turns, and
+      // treating it as a lens change threw away the intrinsics twice in one
+      // session on 2026-08-14 — including a focal length that had just been
+      // self-calibrated. The lens is identified by its deviceId and by the
+      // number of pixels it delivers, neither of which a rotation alters.
+      const rotatedOnly = cur.deviceId === prev.deviceId
+        && cur.width === prev.height && cur.height === prev.width;
+      if (rotatedOnly) {
+        this.log('info', `Camera stream re-oriented: ${prev.width}x${prev.height} -> ${cur.width}x${cur.height}. Same lens, so the intrinsics are kept.`);
+        this.detectRotation(this._lastScreenAngle || 0);
+        prev = cur;
+        return;
+      }
       const changed = cur.deviceId !== prev.deviceId
         || cur.width !== prev.width
         || cur.height !== prev.height;
@@ -220,7 +234,7 @@ export class CameraSource {
         this.lensSwaps++;
         this.focalPx = null;
         this.focalSource = 'default';
-    this.measuredFocalV = null;
+        this.measuredFocalV = null;
         this.log('warn', `Camera changed underneath the survey: ${prev.width}x${prev.height} -> ${cur.width}x${cur.height}. Intrinsics discarded. Pin a lens under Advanced to stop this.`);
         if (this.onLensSwap) this.onLensSwap(prev, cur);
         prev = cur;
@@ -252,6 +266,7 @@ export class CameraSource {
 
   /** Guess the image->screen rotation from the delivered frame shape. */
   detectRotation(screenAngle = 0) {
+    this._lastScreenAngle = screenAngle;
     if (!this.autoRotation || !this.video.videoWidth) return this.frameRotation;
     const imageLandscape = this.video.videoWidth >= this.video.videoHeight;
     const screenLandscape = screenAngle === 90 || screenAngle === -90 || screenAngle === 270;

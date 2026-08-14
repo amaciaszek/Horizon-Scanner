@@ -505,6 +505,46 @@ const FREEFORM_STAGE = 'freeform';
  * but it is the half that matters, so it is worth doing them together.
  */
 const LENS_STAGE = 'lens';
+
+/**
+ * Every measuring stage is now preceded by a briefing the operator dismisses.
+ *
+ * Until this existed each stage began recording the instant the previous one
+ * ended, so the operator was always getting into position while the
+ * measurement was already running — holding it wrong for the beginning of
+ * every test, as they put it. That is not a small thing: the stationary test
+ * takes its gyro bias from those first seconds, the wave takes its axis
+ * evidence from them, and the lens sweep spends them on frames pointed at
+ * whatever the device happened to be facing. Nothing is measured now until
+ * the operator says they are ready.
+ */
+const BRIEF_STAGE = 'brief';
+const BRIEFS = {
+  stationary: {
+    headline: 'Next: set it down',
+    detail: 'Put the device on a table, a wall, or the ground — screen up — and take your hands off it. Four seconds of stillness measures the gyroscope\'s bias. Press Start once it is down, not before.',
+    figure: null,
+    button: 'Start — it is down'
+  },
+  [FREEFORM_STAGE]: {
+    headline: 'Next: wave it about',
+    detail: 'Pick it up and turn and tip it every which way, like rolling a dice in your hand. Briskly, but not frantically. It works out the sensor axes and stops on its own — about ten seconds. No direction is wrong.',
+    figure: 'freeform',
+    button: 'Start waving'
+  },
+  [LENS_STAGE]: {
+    headline: 'Next: measure the lens',
+    detail: 'Point at anything with detail in it — a tree, a fence, a wall — then sweep slowly left and right, and afterwards up and down. Nothing needs to be in focus on a particular thing; it just needs texture to track. This measures how wide the frame really is, which sets every altitude.',
+    figure: 'lens',
+    button: 'Start sweeping'
+  },
+  settle: {
+    headline: 'Next: hold it as you will scan',
+    detail: 'Raise it into the pose you will survey in — upright, camera at the skyline — and hold it steady for a moment. This fixes the compass datum. Nothing needs to be level.',
+    figure: null,
+    button: 'Start — I am in position'
+  }
+};
 /** Give up asking after this and let the operator proceed unverified rather
  *  than trapping them in front of a featureless wall. */
 const LENS_TIMEOUT_MS = 60000;
@@ -524,11 +564,7 @@ function finishStationary(now) {
   if (!r.biasApplied) {
     log('warn', `Gyro bias NOT applied (${r.biasRefusedReason}). Zero bias is safer than a bias measured from a moving phone; loop closure will absorb the resulting drift.`);
   }
-  orientation.resetSpinEvidence();
-  orientation.beginSpinDiagnostic('yaw');
-  state.sensorCal = { stage: FREEFORM_STAGE, startedAt: now };
-  director.calibrationProgress = 0;
-  syncControls();
+  brief(FREEFORM_STAGE);
 }
 
 function tickCalibration(now) {
@@ -573,6 +609,8 @@ function tickCalibration(now) {
     }
     return;
   }
+
+  if (state.sensorCal.stage === BRIEF_STAGE) return;   // waiting on the operator
 
   if (state.sensorCal.stage === FREEFORM_STAGE) {
     pollFreeform(now);
@@ -752,7 +790,7 @@ function solveRotationTests() {
     } else if (solved.scaleFromSweep !== null) {
       log('warn', `The motion implied a gyro scale of ${solved.scaleFromSweep}, too far from 1 to trust. Leaving it at 1; loop closure will absorb the difference.`);
     }
-    beginLensMeasurement();
+    brief(LENS_STAGE);
     return;
   }
 
@@ -773,6 +811,35 @@ function solveRotationTests() {
   log('error', 'SENSOR_AXIS_TEST_FAILED', `${why} (${solved.status})`);
   state.sensorCal = { stage: 'failed', reason: 'bad-axis-map', why, startedAt: performance.now() };
   state.paused = true;
+  director.calibrationProgress = 0;
+  syncControls();
+}
+
+/** Show what is about to happen and wait. Nothing is recorded until Start. */
+function brief(next) {
+  state.sensorCal = { stage: BRIEF_STAGE, next, startedAt: performance.now() };
+  director.calibrationProgress = 0;
+  syncControls();
+}
+
+/** Begin whichever stage the briefing was for, now that the operator is set. */
+function startBriefedStage() {
+  const next = state.sensorCal.next;
+  if (next === 'stationary') {
+    brief('stationary');
+    state.calibStart = performance.now();
+  } else if (next === FREEFORM_STAGE) {
+    orientation.resetSpinEvidence();
+    orientation.beginSpinDiagnostic('yaw');
+    state.sensorCal = { stage: FREEFORM_STAGE, startedAt: performance.now() };
+  } else if (next === LENS_STAGE) {
+    beginLensMeasurement();
+    return;
+  } else {
+    state.sensorCal = { stage: 'settle', startedAt: performance.now() };
+    state.calibStart = performance.now();
+    state.calibFirstTry = 0;
+  }
   director.calibrationProgress = 0;
   syncControls();
 }
@@ -799,6 +866,15 @@ function pollLens(now) {
   if (r.ready) { finishLens(r); return; }
   if (now - state.sensorCal.startedAt > LENS_TIMEOUT_MS) {
     log('warn', 'LENS_MEASURE_TIMEOUT', JSON.stringify(r));
+    // Keep a measurement that merely ran out of time over a default that was
+    // never measured at all. Throwing away 273 pan and 191 tilt pairs because
+    // the uncertainty sat at 1.56% rather than 1.5% is not caution, it is
+    // waste — and it hands the survey back to a guessed field of view.
+    if (r.salvageable) {
+      log('warn', `Time is up, but the measurement had converged well enough to keep (±${(Math.max(r.uncertaintyH, r.uncertaintyV) * 100).toFixed(1)}%). Using it.`);
+      finishLens(r);
+      return;
+    }
     finishLens(null);
   }
 }
@@ -814,7 +890,7 @@ function lensHint(r) {
 }
 
 function finishLens(r) {
-  if (r && r.ready && camera.setMeasuredLens(r.focalH, r.focalV)) {
+  if (r && (r.ready || r.salvageable) && camera.setMeasuredLens(r.focalH, r.focalV)) {
     log('info', 'LENS_MEASURED', JSON.stringify({
       hfovDeg: Number(r.hfovDeg.toFixed(2)),
       vfovDeg: Number(r.vfovDeg.toFixed(2)),
@@ -844,11 +920,7 @@ function finishLens(r) {
       + 'Altitudes are only as good as that figure, and if it is wrong they are wrong by the same factor and by more toward the frame edges. '
       + 'Azimuth is unaffected. You can measure it later from Advanced and press Recompute from keyframes.');
   }
-  state.sensorCal = { stage: 'settle', startedAt: performance.now() };
-  state.calibStart = performance.now();
-  state.calibFirstTry = 0;
-  director.calibrationProgress = 0;
-  syncControls();
+  brief('settle');
 }
 
 /** Re-run a failed rotation test in place. A field reload costs the camera
@@ -859,11 +931,8 @@ function retrySensorTest() {
   director.calibrationProgress = 0;
   // Start from clean evidence: the previous attempt's samples would otherwise
   // be solved together with the new ones.
-  orientation.resetSpinEvidence();
-  orientation.beginSpinDiagnostic('yaw');
-  state.sensorCal = { stage: FREEFORM_STAGE, startedAt: performance.now() };
   log('info', 'Waving again from scratch.');
-  syncControls();
+  brief(FREEFORM_STAGE);
 }
 
 /** Proceed past a failed rotation test without pretending it passed.
@@ -896,8 +965,7 @@ async function startCapture() {
     store.requestPersistence().then(ok => ok && log('info', 'Storage marked persistent.'));
     state.sessionId = state.sessionId || `s${Date.now().toString(36)}`;
     director.beginCalibration();
-    orientation.beginStationaryDiagnostic();
-    state.sensorCal = { stage: 'stationary', startedAt: performance.now() };
+    brief('stationary');
     state.calibStart = performance.now();
     setChip($('contextChip'), `${camera.settings.width}×${camera.settings.height}`, '');
     syncControls();
@@ -1074,6 +1142,18 @@ function renderLive() {
     // There is no pass mark to be locked out of, so the button is only an
     // escape hatch for someone who wants to stop early.
     $('primaryBtn').textContent = 'Use what I have';
+    $('primaryBtn').disabled = false;
+  } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === BRIEF_STAGE) {
+    const b = BRIEFS[state.sensorCal.next] || BRIEFS.stationary;
+    d = {
+      tone: 'work',
+      headline: b.headline,
+      detail: `${b.detail} Nothing is being measured yet.`,
+      progress: 0,
+      arrow: null,
+      figure: b.figure
+    };
+    $('primaryBtn').textContent = b.button;
     $('primaryBtn').disabled = false;
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === LENS_STAGE) {
     const r = state.sensorCal.lens;
@@ -1339,6 +1419,11 @@ function syncControls() {
   sec.textContent = state.paused ? 'Resume' : 'Pause';
 
   if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === BRIEF_STAGE) {
+    btn.textContent = (BRIEFS[state.sensorCal.next] || BRIEFS.stationary).button;
+    btn.disabled = false;
+    return;
+  }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === FREEFORM_STAGE) {
     btn.textContent = 'Use what I have';
     btn.disabled = false;
@@ -1393,12 +1478,13 @@ function onPrimary() {
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
     return state.sensorCal.reason === 'no-samples' ? location.reload() : retrySensorTest();
   }
+  if (p === PHASE.CALIBRATING && state.sensorCal.stage === BRIEF_STAGE) return startBriefedStage();
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === FREEFORM_STAGE) return finishFreeform();
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === LENS_STAGE) {
     // Skipping is allowed but never silent: the consequence is stated in the
     // log and carried into the report.
     const r = lensCal.result();
-    return finishLens(r.ready ? r : null);
+    return finishLens((r.ready || r.salvageable) ? r : null);
   }
   if (p === PHASE.PASS1) return finishPass1();
   if (p === PHASE.PASS2) return finishSurvey();

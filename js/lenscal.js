@@ -72,7 +72,17 @@ const MIN_QUALITY = 0.2;
  * long ones, where the pixel shifts happen to be large.
  */
 const READY_N = 45;
-const READY_UNCERTAINTY = 0.015;
+/**
+ * 2%, not the 1.5% this started at. On a 50° lens 2% is about one degree,
+ * which is nothing beside the discrepancies this exists to catch — and 1.5%
+ * was an arbitrary round number that cost a real measurement: a field attempt
+ * on 2026-08-14 converged to 0.0156 with 273 pan and 191 tilt pairs and was
+ * thrown away entire, after the operator had swept for a full minute.
+ */
+const READY_UNCERTAINTY = 0.02;
+/** On timeout, a measurement this good is still worth keeping rather than
+ *  discarding a minute of the operator's effort and falling back to a guess. */
+const SALVAGE_UNCERTAINTY = 0.04;
 
 /** Weighted median of {v, w}, and the weighted interquartile half-spread. */
 function robust(samples) {
@@ -196,6 +206,12 @@ export class LensCalibrator {
       panReady,
       tiltReady,
       ready: panReady && tiltReady,
+      // Good enough to adopt if time runs out, though not good enough to stop
+      // early for. Reported separately so the caller decides, not this class.
+      salvageable: h.value !== null && v.value !== null
+        && h.used >= READY_N && v.used >= READY_N
+        && uH !== null && uV !== null
+        && uH <= SALVAGE_UNCERTAINTY && uV <= SALVAGE_UNCERTAINTY,
       // Focal length in pixels is the SAME number for both axes on a
       // square-pixel sensor — tanHalfH = (W/2)/f and tanHalfV = (H/2)/f share
       // that f. So this ratio is an independent check on the whole
