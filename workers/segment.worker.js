@@ -129,8 +129,18 @@ function analyse(data, width, height) {
       const i = y * hw + x;
       const nl = (score[i] - lumMin) / lumSpan;
       const nb = Math.max(0, Math.min(1, blueness[i] * 2.2 + 0.28));
+      // A dense white cloud is sky, and it used to collect only the blueness
+      // FLOOR while the blue beside it collected full marks — so cloud and sky
+      // ended up nearly as far apart in this score as sky and ground are. With
+      // one threshold to give, that invites the split to land between cloud and
+      // sky rather than between sky and ground, which puts the traced horizon
+      // on a cloud's underside. Whiteness is therefore counted as sky colour in
+      // its own right: bright and unsaturated. Foliage, brick and roofing are
+      // none of those things, so nothing on the ground gains from it.
+      const nw = Math.min(1, Math.max(0, (nl - 0.55) / 0.35) * (1 - Math.min(1, Math.abs(blueness[i]) * 4)));
+      const nc = Math.max(nb, nw);
       const nt = Math.min(1, texture[i] * 3.2);
-      score[i] = 0.42 * nl + 0.26 * nb + 0.24 * (1 - nt) + 0.08 * (1 - y / hh);
+      score[i] = 0.42 * nl + 0.26 * nc + 0.24 * (1 - nt) + 0.08 * (1 - y / hh);
     }
   }
 

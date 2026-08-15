@@ -1446,3 +1446,49 @@ branches. It fails loudly on the bug as it shipped.
 The lesson is narrow and worth keeping: a bulk edit that rewrites a pattern
 will also rewrite the new code written to replace that pattern, and a state
 machine needs a test that traverses it rather than one that inspects it.
+
+### 2026-08-15 — the best run so far, and why its panorama was blank
+
+Every calibration number came out right: axis solve residual **0.092** against
+0.626 for the next axis order (the best margin yet), gyro scale 0.9988 applied,
+bearing datum **±0°** from a compass scattering 0.1°, the lens pinned from the
+device table so the lens step was skipped entirely, the screen-angle correction
+firing and HOLDING at 0 through two stream re-orientations that no longer
+discard intrinsics. Maximum spread fell to **35.4°** from 64.5°, spike bins to
+32 from 87, with 7976 observations over 359° of the circle.
+
+Two things the operator hit.
+
+**"It says I need to tick a box to collect PNGs. I don't see it, and I should
+not have to."** Right on both counts, and the message was simply wrong.
+Keyframe photos are already captured unconditionally during a survey; the
+checkbox it pointed at, "Embed keyframe images in archive", governs what goes
+into an exported archive and has nothing to do with capture. No permission is
+involved either — these are the survey's own frames going into its own storage.
+
+The actual cause was worse than a wrong message. `putKeyframeThumb` resolved
+only on `oncomplete` and had no `onerror` or `onabort`, so a transaction that
+failed **never settled either way**: no rejection, no log line, no thumbnails,
+no explanation. That is how a browser refusing to store blobs produced
+"imagery for 0 of 22" in total silence. It now rejects, and the failure is
+reported once with what it means. Beyond that, thumbnails are held in memory
+for the session as well, so the stitched view no longer depends on the database
+agreeing to keep them.
+
+**"Big dense puffy white clouds are being confused for the horizon."**
+`tests/sim13.mjs` builds that scene against known ground truth — dense cumulus
+over a treeline, one cloud filling most of the sky, cloud resting directly on a
+roofline, a low cloud overlapping the treetops, and the case that ought to be
+worst: sunlit foliage under a hazy sky, where the cloud/sky edge is the
+strongest gradient in the frame and the treeline the weakest. Every one passes,
+to within a pixel. **So the model of this failure is wrong**, and rather than
+guess a third time the right move is to get the operator's actual frames — which
+is precisely what the thumbnail fix delivers.
+
+One change was worth making regardless, because it is indefensible on its own
+terms: a dense white cloud collected only the blueness FLOOR in the sky score
+while the blue beside it collected full marks, leaving cloud and sky nearly as
+far apart as sky and ground. With a single threshold to give, that invites the
+split to land in the wrong gap. Whiteness — bright and unsaturated — now counts
+as sky colour in its own right, which foliage, brick and roofing cannot claim.
+All 23 test files pass; segmentation cost 10.5 -> 12.0 ms per frame.

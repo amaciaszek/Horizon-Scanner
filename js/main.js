@@ -1704,7 +1704,13 @@ function newThumbBudget() {
   return {
     stored: 0, bytes: 0, pending: 0,
     maxFrames: 600, maxBytes: 40e6,
-    warned: false, storeWarned: false
+    warned: false, storeWarned: false,
+    // Held in memory as well as written to IndexedDB. The stitched view is the
+    // one diagnostic that shows an operator WHERE the traced line went wrong,
+    // and on 2026-08-15 it came back with imagery for 0 of 22 keyframes and a
+    // message pointing at an unrelated checkbox. A survey's own pictures should
+    // never be hostage to whether a browser felt like persisting them.
+    mem: new Map()
   };
 }
 
@@ -1731,11 +1737,11 @@ function captureThumb(kf) {
     b.pending--;
     if (!blob || !state.sessionId) return;
     b.stored++; b.bytes += blob.size;
+    b.mem.set(kf.index, blob);
     store.putKeyframeThumb(state.sessionId, kf.index, blob).catch(e => {
-      b.stored--; b.bytes -= blob.size;
       if (!b.storeWarned) {
         b.storeWarned = true;
-        log('warn', `Could not store a keyframe image: ${e && e.message || e}. The survey continues; the stitched view will be incomplete.`);
+        log('warn', `This browser will not persist keyframe images (${e && e.message || e}). They are being kept in memory instead, so the stitched view still works for this session — it just will not survive a reload.`);
       }
     });
   }).catch(() => { b.pending--; });
@@ -1758,10 +1764,12 @@ async function loadKeyframeSources(keyframes) {
   try {
     records = await store.getKeyframeThumbs(state.sessionId);
   } catch (e) {
-    log('warn', `Could not read keyframe thumbnails: ${e && e.message || e}`);
-    return { sources: [], found: 0 };
+    log('warn', `Could not read stored keyframe thumbnails: ${e && e.message || e}`);
   }
   const byIndex = new Map(records.map(r => [r.index, r.blob]));
+  // Whatever this session captured wins over whatever the database managed to
+  // keep, so a browser that silently refuses to persist costs nothing here.
+  for (const [i, blob] of (state.thumbBudget?.mem || [])) byIndex.set(i, blob);
   const scratch = document.createElement('canvas');
   const sctx = scratch.getContext('2d', { willReadFrequently: true });
   const sources = [];
@@ -1844,7 +1852,7 @@ async function buildPanorama() {
     const coverage = mosaic.painted / (mosaic.width * mosaic.height) * 100;
     status.textContent = found
       ? `${kfs.length} keyframes, ${found} with imagery, ${coverage.toFixed(0)}% of the sky panel painted, ${ms.toFixed(0)} ms.`
-      : `${kfs.length} keyframes, geometry only — no stored photos for this session. Tick "Embed thumbnails" before the next survey to get imagery here.`;
+      : `${kfs.length} keyframes, geometry only — no photos were captured this session. Images are collected automatically during a survey; if this says zero, the camera was not delivering frames when the keyframes were taken. ("Embed keyframe images in archive", under Advanced, is a different thing — it only controls what goes into an exported archive.)`;
 
     $('panoFindings').textContent = panoramaFindings(dis, mosaic, found, kfs);
     log('info', `Diagnostic panorama built: ${kfs.length} keyframes, imagery for ${found}, ${coverage.toFixed(1)}% painted, ${ms.toFixed(0)} ms.`);

@@ -70,7 +70,15 @@ export async function putKeyframeThumb(sessionId, index, blob) {
   const db = await open();
   const t = tx(db, ['keyframes'], 'readwrite');
   t.objectStore('keyframes').put({ sessionId, index, blob });
-  return new Promise(res => { t.oncomplete = () => res(true); });
+  // Reject on failure instead of hanging. Resolving only on `oncomplete` meant
+  // an aborted transaction never settled either way, so a browser that would
+  // not store the blob produced no error, no thumbnails, and no explanation —
+  // which is exactly what an iPad did on 2026-08-15.
+  return new Promise((res, rej) => {
+    t.oncomplete = () => res(true);
+    t.onerror = () => rej(t.error || new Error('keyframe store failed'));
+    t.onabort = () => rej(t.error || new Error('keyframe store aborted'));
+  });
 }
 
 export async function getKeyframeThumbs(sessionId) {
