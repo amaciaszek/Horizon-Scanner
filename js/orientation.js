@@ -142,6 +142,10 @@ export class OrientationSource {
     this.lastGyroRaw = null;
     this.lastGyroMapped = null;
     this.lastGyroAt = null;
+    // Short raw/mapped motion history for interpolating a saved photograph onto
+    // the sensor clock offline. Three seconds is hundreds of times more than a
+    // camera/worker delay but remains tiny in memory.
+    this.motionHistory = [];
     this._lastMotionAt = 0;
     this._onMotion = this._onMotion.bind(this);
     this.eventDt = 0;
@@ -568,10 +572,43 @@ export class OrientationSource {
         }
       }
     }
+    this.motionHistory.push({
+      performanceMs: now,
+      dtSec: dt,
+      rawRateDeviceDegPerSec: rawW.slice(),
+      mappedRateDeviceDegPerSec: w.slice(),
+      gravityDeviceMPerSec2: gravity ? gravity.slice() : null,
+      worldUpDevice: up.slice(),
+      yawRateDegPerSec: this.gyroYawRate,
+      integratedYawDeg: this.gyroYaw,
+      orientationQuaternion: Array.from(this.quat)
+    });
+    const keepAfter = now - 3000;
+    while (this.motionHistory.length && this.motionHistory[0].performanceMs < keepAfter) {
+      this.motionHistory.shift();
+    }
     if (this.gyroSamples > 20 && !this.gyroAvailable) {
       this.gyroAvailable = true;
       if (this.log) this.log('info', 'Gyroscope samples are arriving via devicemotion. Rotation scale and sign are not trusted until the physical 360° test passes.');
     }
+  }
+
+  /** Raw sensor samples surrounding one captured video frame. */
+  motionWindow(centerPerformanceMs, beforeMs = 350, afterMs = 350) {
+    if (!Number.isFinite(centerPerformanceMs)) return [];
+    const lo = centerPerformanceMs - beforeMs;
+    const hi = centerPerformanceMs + afterMs;
+    return this.motionHistory
+      .filter(sample => sample.performanceMs >= lo && sample.performanceMs <= hi)
+      .map(sample => ({
+        ...sample,
+        offsetFromFrameMs: sample.performanceMs - centerPerformanceMs,
+        rawRateDeviceDegPerSec: sample.rawRateDeviceDegPerSec.slice(),
+        mappedRateDeviceDegPerSec: sample.mappedRateDeviceDegPerSec.slice(),
+        gravityDeviceMPerSec2: sample.gravityDeviceMPerSec2?.slice() || null,
+        worldUpDevice: sample.worldUpDevice.slice(),
+        orientationQuaternion: sample.orientationQuaternion.slice()
+      }));
   }
 
   beginStationaryDiagnostic() {

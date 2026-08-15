@@ -70,6 +70,7 @@ function serialiseFrame(kf, photo, photoName, yawDatumDeg, azimuthOffsetDeg) {
       width: finite(kf.photoWidth),
       height: finite(kf.photoHeight)
     } : null,
+    captureTiming: kf.captureTiming || null,
     pointing: {
       centerAltitudeDeg: round(kf.elevation),
       rollDeg: round(kf.roll),
@@ -111,6 +112,9 @@ function serialiseFrame(kf, photo, photoName, yawDatumDeg, azimuthOffsetDeg) {
 function framesCsv(frames) {
   const columns = [
     'index', 'photo', 'captured_at', 'timestamp_ms', 'pass', 'capture_kind',
+    'capture_performance_ms', 'video_current_time_sec', 'video_frame_media_time_sec',
+    'video_capture_time_ms', 'video_presentation_time_ms', 'processing_latency_ms',
+    'source_width', 'source_height', 'frame_rotation_deg',
     'capture_azimuth_deg', 'stitched_azimuth_deg', 'output_azimuth_deg',
     'center_altitude_deg', 'roll_deg', 'compass_deg',
     'gyro_available', 'gyro_integrated_yaw_deg', 'gyro_yaw_rate_deg_per_sec',
@@ -124,8 +128,13 @@ function framesCsv(frames) {
   ];
   const rows = frames.map(frame => {
     const gyro = frame.gyroscope || {};
+    const timing = frame.captureTiming || {};
+    const videoFrame = timing.videoFrame || {};
     const values = [
       frame.index, frame.photo?.path, frame.capturedAt, frame.timestampMs, frame.pass, frame.captureKind,
+      timing.performanceMs, timing.videoCurrentTimeSec, videoFrame.mediaTimeSec,
+      videoFrame.captureTimeMs, videoFrame.presentationTimeMs, timing.processingLatencyMs,
+      timing.sourceWidth, timing.sourceHeight, timing.frameRotationDeg,
       frame.pointing.captureAzimuthDeg, frame.pointing.stitchedAzimuthDeg, frame.pointing.outputAzimuthDeg,
       frame.pointing.centerAltitudeDeg, frame.pointing.rollDeg, frame.pointing.compassDeg,
       gyro.available, gyro.integratedYawDeg, gyro.yawRateDegPerSec,
@@ -152,7 +161,7 @@ function readme(photoCount, keyframeCount, missing) {
     '',
     'photos/ contains the source JPEGs used to build the stitched panorama.',
     'metadata/keyframes.csv is a quick per-photo table for spreadsheets.',
-    'metadata/keyframes.json contains the full per-photo orientation, gyro snapshot, camera geometry, skyline boundary, confidence, flags, and directly projected azimuth/altitude for every skyline column.',
+    'metadata/keyframes.json contains the full per-photo exposure timing, orientation, gyro snapshot, camera geometry, skyline boundary, confidence, flags, and directly projected azimuth/altitude for every skyline column.',
     'metadata/session.json contains session/site/report/device data and explains missing photos.',
     'metadata/project.horizon-project is the normal recomputable project archive without duplicate embedded images.',
     'logs/field-log.txt is the complete in-app field log at export time.',
@@ -163,7 +172,8 @@ function readme(photoCount, keyframeCount, missing) {
     '- stitchedAzimuthDeg also includes the per-frame loop/bundle correction used for placement.',
     '- outputAzimuthDeg additionally includes the operator-entered azimuth offset.',
     '',
-    'Gyroscope data is the instantaneous sensor snapshot saved with each keyframe, not a continuous raw motion stream.',
+    'Each photo, analysis frame and sensor snapshot now come from one synchronized capture record. Browser/video timing fields are included when the platform exposes them.',
+    'Gyroscope data includes the exposure snapshot plus a short surrounding sample window; it is not a continuous full-session raw stream.',
     'Older saved sessions may show null for fields that were not recorded by their app version.',
     ''
   ].join('\n');

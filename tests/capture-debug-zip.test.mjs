@@ -34,6 +34,19 @@ const keyframes = [0, 1].map(index => ({
   focalPx: 384,
   photoWidth: 640,
   photoHeight: 480,
+  captureTiming: {
+    performanceMs: 1234.5 + index,
+    videoCurrentTimeSec: 8.25 + index,
+    sourceWidth: 1080,
+    sourceHeight: 1920,
+    frameRotationDeg: 0,
+    processingLatencyMs: 42,
+    videoFrame: {
+      mediaTimeSec: 8.2 + index,
+      captureTimeMs: 1200 + index,
+      presentationTimeMs: 1230 + index
+    }
+  },
   quat: [1, 0, 0, 0],
   screenAngle: 0,
   yawRaw: index * 15,
@@ -47,7 +60,8 @@ const keyframes = [0, 1].map(index => ({
     available: true,
     integratedYawDeg: index * 15.25,
     yawRateDegPerSec: 2.5,
-    rawRateDeviceDegPerSec: [1, 2, 3]
+    rawRateDeviceDegPerSec: [1, 2, 3],
+    motionWindow: [{ performanceMs: 1234, offsetFromFrameMs: -0.5, yawRateDegPerSec: 2.5 }]
   },
   visualQuality: 0.9,
   skyFraction: 0.5,
@@ -79,12 +93,18 @@ check('central directory follows stored entries', parsed.centralSignature === 0x
 check('source JPEG is present', parsed.files.has('photos/keyframe-0000.jpg'));
 check('missing source JPEG is not fabricated', !parsed.files.has('photos/keyframe-0001.jpg'));
 check('field log is present', new TextDecoder().decode(parsed.files.get('logs/field-log.txt')).includes('FIELD LOG'));
-check('CSV is present', new TextDecoder().decode(parsed.files.get('metadata/keyframes.csv')).includes('gyro_yaw_rate_deg_per_sec'));
+const csv = new TextDecoder().decode(parsed.files.get('metadata/keyframes.csv'));
+check('CSV is present', csv.includes('gyro_yaw_rate_deg_per_sec'));
+check('CSV carries video/exposure timing', csv.includes('video_frame_media_time_sec') && csv.includes('processing_latency_ms'));
 
 const frames = JSON.parse(new TextDecoder().decode(parsed.files.get('metadata/keyframes.json')));
 check('capture azimuth is associated with the photo', frames[0].pointing.captureAzimuthDeg === 10);
 check('output azimuth includes the operator offset', frames[0].pointing.outputAzimuthDeg === 8);
 check('altitude and gyro snapshot survive', frames[0].pointing.centerAltitudeDeg === 3.5 && frames[0].gyroscope.yawRateDegPerSec === 2.5);
+check('surrounding raw motion samples survive', frames[0].gyroscope.motionWindow.length === 1
+  && frames[0].gyroscope.motionWindow[0].offsetFromFrameMs === -0.5);
+check('capture timing stays attached to its photo', frames[0].captureTiming.videoFrame.mediaTimeSec === 8.2
+  && frames[0].captureTiming.processingLatencyMs === 42);
 check('full skyline evidence survives', frames[0].analysis.boundary.length === 2 && frames[0].analysis.flags[1] === 1);
 check('skyline columns include projected angles', frames[0].analysis.skylineSamples.length === 2
   && Number.isFinite(frames[0].analysis.skylineSamples[0].azimuthDeg)

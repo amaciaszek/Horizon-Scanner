@@ -59,6 +59,9 @@ export class CameraSource {
     this.keyCanvas = document.createElement('canvas');
     this.keyCanvas.width = 640; this.keyCanvas.height = 480;
     this.keyCtx = this.keyCanvas.getContext('2d');
+    this._captureSerial = 0;
+    this._videoFrameRequest = null;
+    this._lastVideoFrame = null;
 
     // Intrinsics: horizontal half-FOV tangent. Starts from a sane phone default
     // and is replaced by the self-calibrated value once the scan produces one.
@@ -164,6 +167,7 @@ export class CameraSource {
     this.video.setAttribute('playsinline', '');
     this.video.muted = true;
     await this.video.play();
+    this._startVideoFrameClock();
 
     const track = this.stream.getVideoTracks()[0];
     this.settings = track.getSettings ? track.getSettings() : {};
@@ -275,8 +279,43 @@ export class CameraSource {
   stop() {
     clearInterval(this._watch);
     this._watch = null;
+    if (this._videoFrameRequest !== null && this.video.cancelVideoFrameCallback) {
+      this.video.cancelVideoFrameCallback(this._videoFrameRequest);
+    }
+    this._videoFrameRequest = null;
+    this._lastVideoFrame = null;
     if (this.stream) this.stream.getTracks().forEach(t => t.stop());
     this.stream = null;
+  }
+
+  /**
+   * Keep the browser's best timestamp for the decoded video frame. Safari does
+   * not expose a camera exposure timestamp on every release, but
+   * requestVideoFrameCallback still gives us the media time and presentation
+   * clock. Saving every field that exists lets an offline stitcher interpolate
+   * the gyro onto the photograph instead of assuming "sensor now" == "camera
+   * now".
+   */
+  _startVideoFrameClock() {
+    if (!this.video.requestVideoFrameCallback) return;
+    const sample = (now, meta = {}) => {
+      if (!this.stream) return;
+      const finite = value => Number.isFinite(value) ? value : null;
+      this._lastVideoFrame = {
+        callbackPerformanceMs: finite(now),
+        mediaTimeSec: finite(meta.mediaTime),
+        expectedDisplayTimeMs: finite(meta.expectedDisplayTime),
+        presentationTimeMs: finite(meta.presentationTime),
+        captureTimeMs: finite(meta.captureTime),
+        receiveTimeMs: finite(meta.receiveTime),
+        processingDurationSec: finite(meta.processingDuration),
+        presentedFrames: finite(meta.presentedFrames),
+        width: finite(meta.width),
+        height: finite(meta.height)
+      };
+      if (this.stream) this._videoFrameRequest = this.video.requestVideoFrameCallback(sample);
+    };
+    this._videoFrameRequest = this.video.requestVideoFrameCallback(sample);
   }
 
   /** Mean luminance of the working frame, 0-255. Used to refuse to segment a
@@ -348,6 +387,63 @@ export class CameraSource {
       out[i] = 0.299 * d[p] + 0.587 * d[p + 1] + 0.114 * d[p + 2];
     }
     return out;
+  }
+
+  /**
+   * Capture one decoded video frame, then derive every representation from that
+   * one canvas. Previously work pixels, luma and the archived JPEG each drew
+   * the live video separately; while turning they could describe three
+   * different exposures even though they became one keyframe record.
+   */
+  grabSynchronizedFrame() {
+    if (!this.ready) return null;
+    const performanceMs = performance.now();
+    const wallClockMs = Date.now();
+    const videoCurrentTimeSec = Number.isFinite(this.video.currentTime)
+      ? this.video.currentTime : null;
+
+    this._drawRotated(this.keyCtx, this.keyCanvas.width, this.keyCanvas.height);
+    this.workCtx.drawImage(this.keyCanvas, 0, 0, WORK_W, WORK_H);
+    this.lumaCtx.drawImage(this.keyCanvas, 0, 0, LUMA_W, LUMA_H);
+
+    const workFrame = this.workCtx.getImageData(0, 0, WORK_W, WORK_H);
+    const rgba = this.lumaCtx.getImageData(0, 0, LUMA_W, LUMA_H).data;
+    const luma = new Float32Array(LUMA_W * LUMA_H);
+    for (let i = 0, p = 0; i < luma.length; i++, p += 4) {
+      luma[i] = 0.299 * rgba[p] + 0.587 * rgba[p + 1] + 0.114 * rgba[p + 2];
+    }
+
+    const serial = ++this._captureSerial;
+    const settings = this.settings || {};
+    return {
+      serial,
+      workFrame,
+      luma,
+      timing: {
+        wallClockMs,
+        performanceMs,
+        videoCurrentTimeSec,
+        videoFrame: this._lastVideoFrame ? { ...this._lastVideoFrame } : null,
+        sourceWidth: this.video.videoWidth || null,
+        sourceHeight: this.video.videoHeight || null,
+        savedWidth: this.keyCanvas.width,
+        savedHeight: this.keyCanvas.height,
+        frameRotationDeg: this.frameRotation,
+        track: {
+          width: settings.width || null,
+          height: settings.height || null,
+          frameRate: settings.frameRate || null,
+          facingMode: settings.facingMode || null,
+          resizeMode: settings.resizeMode || null
+        }
+      }
+    };
+  }
+
+  /** Encode the key canvas belonging to packet without drawing the live video. */
+  async encodeSynchronizedFrame(packet, quality = 0.72) {
+    if (!packet || packet.serial !== this._captureSerial) return null;
+    return new Promise(res => this.keyCanvas.toBlob(b => res(b), 'image/jpeg', quality));
   }
 
   /** JPEG thumbnail for the project archive. */

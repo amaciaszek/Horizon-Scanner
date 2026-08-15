@@ -16,6 +16,7 @@ import { LensCalibrator } from './lenscal.js';
 import * as store from './storage.js';
 import * as out from './exporters.js';
 import { buildCaptureDebugZip } from './diagnostic-export.js';
+import { keyframeStepDeg, keyframeMotionAccepted } from './capture-policy.js';
 import {
   buildMosaic, skylineTracks, drawPanorama, disagreementByBin,
   pixelToAzAlt, landmarkResiduals
@@ -150,14 +151,53 @@ async function processFrame() {
   if (state.processing || !camera.ready) return;
   state.processing = true;
   try {
-    const workFrame = camera.grabWorkFrame();
-    const luma = camera.grabLuma();
-    if (!workFrame || !luma) return;
+    const capturedFrame = camera.grabSynchronizedFrame();
+    if (!capturedFrame) return;
+    const { workFrame, luma } = capturedFrame;
 
     const att = orientation.attitude();
     const rawYaw = orientation.rawYaw();
     const quat = screenQuat(orientation.quat, orientation.screenAngle);
-    const t = performance.now();
+    const t = capturedFrame.timing.performanceMs;
+    // Freeze every sensor field that belongs to this decoded video frame before
+    // the segmentation/registration workers run. Reading orientation again
+    // after their await paired a later gyro pose with an earlier photograph.
+    const pose = {
+      att: { elevation: att.elevation, roll: att.roll },
+      rawYaw,
+      quat: Array.from(quat),
+      screenAngle: orientation.screenAngle,
+      compassHeading: orientation.compassHeading,
+      compassReliability: orientation.compassReliability,
+      jitterDeg: orientation.jitterDeg,
+      orientationSample: {
+        alpha: orientation.alpha,
+        beta: orientation.beta,
+        gamma: orientation.gamma,
+        absolute: orientation.absolute
+      },
+      gyro: {
+        available: orientation.gyroAvailable,
+        integratedYawDeg: orientation.gyroYaw,
+        yawRateDegPerSec: orientation.gyroYawRate,
+        rotationRateDegPerSec: orientation.rotationRate,
+        tiltRateDegPerSec: orientation.tiltRate,
+        stillness: orientation.stillness,
+        sampleCount: orientation.gyroSamples,
+        scale: orientation.gyroScale,
+        biasDegPerSec: orientation.gyroBias.slice(),
+        axisMap: orientation.gyroAxisMap ? {
+          ...orientation.gyroAxisMap,
+          perm: orientation.gyroAxisMap.perm.slice(),
+          signs: orientation.gyroAxisMap.signs.slice()
+        } : null,
+        rawRateDeviceDegPerSec: orientation.lastGyroRaw?.slice() || null,
+        mappedRateDeviceDegPerSec: orientation.lastGyroMapped?.slice() || null,
+        gravityDeviceMPerSec2: orientation.lastGravity?.slice() || null,
+        sampleAgeMs: Number.isFinite(orientation.lastGyroAt)
+          ? Math.max(0, t - orientation.lastGyroAt) : null
+      }
+    };
     const highElevation = Math.abs(att.elevation) > VISUAL_YAW_MAX_ELEVATION ||
       state.obstructionProbe.active;
     state.frameCount++;
@@ -186,13 +226,13 @@ async function processFrame() {
     // while the phone sits still. Only fall back to it when there is no
     // gyroscope at all AND the compass has not been condemned.
     let dGyro, gyroTrusted;
-    if (orientation.gyroAvailable) {
-      dGyro = state.prevGyroYaw === null ? 0 : orientation.gyroYaw - state.prevGyroYaw;
-      state.prevGyroYaw = orientation.gyroYaw;
+    if (pose.gyro.available) {
+      dGyro = state.prevGyroYaw === null ? 0 : pose.gyro.integratedYawDeg - state.prevGyroYaw;
+      state.prevGyroYaw = pose.gyro.integratedYawDeg;
       gyroTrusted = true;
     } else {
       dGyro = state.prevRawYaw === null ? 0 : angDiff(rawYaw, state.prevRawYaw);
-      gyroTrusted = orientation.compassReliability !== 'poor';
+      gyroTrusted = pose.compassReliability !== 'poor';
     }
     if (vis && vis.result) {
       const r = vis.result;
@@ -312,7 +352,7 @@ async function processFrame() {
       // While the phone is supposed to be still, however, a large residual
       // image shift is useful evidence that the operator translated the phone
       // and introduced parallax.
-      if (state.obstructionProbe.active && orientation.stillness > 0.65 &&
+      if (state.obstructionProbe.active && pose.gyro.stillness > 0.65 &&
           r.quality > 0.45 && Math.abs(dGyro) < 0.5 &&
           Math.hypot(r.dx, r.dy) > 3.5) {
         state.obstructionProbe.parallax = true;
@@ -335,9 +375,9 @@ async function processFrame() {
     // scan will trust rather than against a separate estimate.
     if (preflight.active) {
       preflight.add({
-        compass: orientation.compassHeading,
+        compass: pose.compassHeading,
         integrated: state.fusedYaw,
-        jitter: orientation.jitterDeg,
+        jitter: pose.jitterDeg,
         quality: state.visualQuality ?? 0
       });
     }
@@ -371,7 +411,7 @@ async function processFrame() {
       state.overlap = 1;
     }
 
-    maybeKeyframe({ seg, quat, rawYaw, att, t });
+    maybeKeyframe({ seg, pose, capturedFrame, t });
 
     // Adopt the self-calibrated focal length once it settles — but never over a
     // deliberate measurement. The passive estimator runs on whatever the survey
@@ -394,7 +434,7 @@ async function processFrame() {
   }
 }
 
-function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
+function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   if (!seg || seg.error) return;
   if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
   if (state.frameStatus !== 'ok') return;
@@ -403,16 +443,24 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
   // through the projection quaternion like every other part of the attitude,
   // and rejecting on it threw away every frame of an iPad session whose screen
   // angle was misreported.
-  if (Math.abs(orientation.rotationRate) > (probe.active ? 3 : 18)) return;
+  const instantRate = Number.isFinite(pose.gyro.yawRateDegPerSec)
+    ? Math.abs(pose.gyro.yawRateDegPerSec)
+    : Math.abs(pose.gyro.rotationRateDegPerSec);
+  if (!keyframeMotionAccepted(instantRate, {
+    probe: probe.active, mode: director.mode.id
+  })) return;
 
-  const stepDeg = Math.max(4, camera.hfovDeg * 0.35);
+  // 80% horizontal overlap gives the visual solver roughly forty views per
+  // lap on the iPad instead of twenty-one. Every physical edge now appears
+  // near the optical centre in several frames.
+  const stepDeg = keyframeStepDeg(camera.hfovDeg);
   const last = survey.keyframes[survey.keyframes.length - 1];
   let accept = false;
 
   if (probe.active) {
-    accept = Math.abs(att.elevation) >= 20 &&
-      Math.abs(att.elevation) <= ELEVATION_WARN_DEG &&
-      orientation.stillness > 0.65 &&
+    accept = Math.abs(pose.att.elevation) >= 20 &&
+      Math.abs(pose.att.elevation) <= ELEVATION_WARN_DEG &&
+      pose.gyro.stillness > 0.65 &&
       (t - probe.lastCaptureAt) > 500;
   } else if (!last) accept = true;
   else if (director.phase === PHASE.PASS1) {
@@ -421,14 +469,15 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
     // Pass 2 collects confirmation frames while the operator holds on target.
     const onTarget = director.target &&
       Math.abs(angDiff(wrap360(director.target.fromDeg + director.target.widthDeg / 2), currentHeading())) < 6;
-    accept = onTarget && orientation.stillness > 0.5 && (t - state.lastKeyframeAt) > 380;
+    accept = onTarget && pose.gyro.stillness > 0.5 && (t - state.lastKeyframeAt) > 380;
   }
   if (!accept) return;
 
   const intr = camera.intrinsics();
   const captureYaw = probe.active ? probe.anchorYaw : state.fusedYaw;
+  const motionWindow = orientation.motionWindow(t);
   const kf = survey.addKeyframe({
-    t: Date.now(),
+    t: capturedFrame.timing.wallClockMs,
     pass: director.phase === PHASE.PASS2 ? 2 : 1,
     // Stamp the intrinsics in force right now. If the platform swaps lenses
     // later, frames captured before the swap keep the geometry they were
@@ -436,46 +485,27 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
     tanHalfH: intr.tanHalfH,
     tanHalfV: intr.tanHalfV,
     focalPx: camera.focalPx,
-    quat,
-    screenAngle: orientation.screenAngle,
-    yawRaw: rawYaw,
+    quat: pose.quat,
+    screenAngle: pose.screenAngle,
+    yawRaw: pose.rawYaw,
     yawFused: captureYaw,
-    yawBase: angDiff(captureYaw, rawYaw),
+    yawBase: angDiff(captureYaw, pose.rawYaw),
     captureKind: probe.active ? 'obstruction-probe' : 'sweep',
-    elevation: att.elevation,
-    roll: att.roll,
-    compass: orientation.compassHeading,
-    // Sensor snapshots travel with the photo for offline diagnosis. None of
-    // these fields feed projection, fusion, or panorama stitching.
-    photoWidth: camera.keyCanvas.width,
-    photoHeight: camera.keyCanvas.height,
-    orientationSample: {
-      alpha: orientation.alpha,
-      beta: orientation.beta,
-      gamma: orientation.gamma,
-      absolute: orientation.absolute
+    elevation: pose.att.elevation,
+    roll: pose.att.roll,
+    compass: pose.compassHeading,
+    // The exposure snapshot and short surrounding motion window travel with
+    // the photo for offline diagnosis. None of these fields feed the browser's
+    // projection, fusion, or panorama stitching.
+    photoWidth: capturedFrame.timing.savedWidth,
+    photoHeight: capturedFrame.timing.savedHeight,
+    captureTiming: {
+      ...capturedFrame.timing,
+      processingLatencyMs: Math.max(0, performance.now() - capturedFrame.timing.performanceMs),
+      motionSampleCount: motionWindow.length
     },
-    gyro: {
-      available: orientation.gyroAvailable,
-      integratedYawDeg: orientation.gyroYaw,
-      yawRateDegPerSec: orientation.gyroYawRate,
-      rotationRateDegPerSec: orientation.rotationRate,
-      tiltRateDegPerSec: orientation.tiltRate,
-      stillness: orientation.stillness,
-      sampleCount: orientation.gyroSamples,
-      scale: orientation.gyroScale,
-      biasDegPerSec: orientation.gyroBias.slice(),
-      axisMap: orientation.gyroAxisMap ? {
-        ...orientation.gyroAxisMap,
-        perm: orientation.gyroAxisMap.perm.slice(),
-        signs: orientation.gyroAxisMap.signs.slice()
-      } : null,
-      rawRateDeviceDegPerSec: orientation.lastGyroRaw?.slice() || null,
-      mappedRateDeviceDegPerSec: orientation.lastGyroMapped?.slice() || null,
-      gravityDeviceMPerSec2: orientation.lastGravity?.slice() || null,
-      sampleAgeMs: Number.isFinite(orientation.lastGyroAt)
-        ? Math.max(0, performance.now() - orientation.lastGyroAt) : null
-    },
+    orientationSample: pose.orientationSample,
+    gyro: { ...pose.gyro, motionWindow },
     visualQuality: state.visualQuality,
     skyFraction: seg.skyFraction,
     height: WORK_H,
@@ -501,7 +531,7 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
   // with the box unticked could not be diagnosed afterwards at all. Storage and
   // export are now separate concerns: this always records, and the checkbox
   // only decides whether the images travel inside the .horizon-project file.
-  captureThumb(kf);
+  captureThumb(kf, capturedFrame);
 
   if (director.phase === PHASE.PASS2) {
     director.refreshTargets();
@@ -1758,7 +1788,7 @@ function newThumbBudget() {
  * silently filled the origin's quota would take the profile down with it. The
  * cap is therefore stated and reported rather than discovered.
  */
-function captureThumb(kf) {
+function captureThumb(kf, capturedFrame = null) {
   if (!state.sessionId) return;
   const b = state.thumbBudget || (state.thumbBudget = newThumbBudget());
   if (b.stored + b.pending >= b.maxFrames || b.bytes >= b.maxBytes) {
@@ -1769,7 +1799,9 @@ function captureThumb(kf) {
     return;
   }
   b.pending++;
-  const task = camera.grabKeyframeThumb().then(blob => {
+  const task = (capturedFrame
+    ? camera.encodeSynchronizedFrame(capturedFrame)
+    : camera.grabKeyframeThumb()).then(blob => {
     if (!blob || !state.sessionId) return;
     b.stored++; b.bytes += blob.size;
     b.mem.set(kf.index, blob);

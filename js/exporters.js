@@ -150,6 +150,7 @@ export function buildProject(survey, meta, report, extras = {}) {
       focalPx: Number.isFinite(kf.focalPx) ? kf.focalPx : null,
       photoWidth: Number.isFinite(kf.photoWidth) ? kf.photoWidth : null,
       photoHeight: Number.isFinite(kf.photoHeight) ? kf.photoHeight : null,
+      captureTiming: kf.captureTiming || null,
       quat: kf.quat.map(v => Number(v.toFixed(6))),
       screenAngle: kf.screenAngle,
       yawRaw: Number(kf.yawRaw.toFixed(3)),
