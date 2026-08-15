@@ -1421,3 +1421,28 @@ invariant that distinguishes a pinhole model from a derived guess.
 
 Consequences: the lens step is skipped outright on a device with a pinned lens,
 the pin survives re-orientation, and only a genuine lens change clears it.
+
+### 2026-08-14, later — the Start button did nothing
+
+Self-inflicted, and worth recording because of how it got through. Adding the
+briefings involved a bulk find-and-replace that rewrote every
+`beginStationaryDiagnostic(); stage = 'stationary'` into `brief('stationary')`
+— including the one inside `startBriefedStage`, which had just been written and
+whose entire job was to LEAVE the briefing. Pressing Start re-showed the same
+briefing, forever. To the operator that is simply a dead button.
+
+Every static check passed it: the module parsed, all 21 tests were green, every
+`brief()` target had a briefing and a starter, and grep found the starter
+present. None of them asked the only question that mattered — *where do you end
+up after pressing the button?*
+
+`tests/calibration-flow.test.mjs` now asks exactly that. It extracts the
+transition table from the source and walks it: each briefing target, pressed,
+must land on its own stage and never back on a briefing; each starter must arm
+the measurement it is about to take; the tick must record nothing while a
+briefing is up; and the handler must reach the starter before the later phase
+branches. It fails loudly on the bug as it shipped.
+
+The lesson is narrow and worth keeping: a bulk edit that rewrites a pattern
+will also rewrite the new code written to replace that pattern, and a state
+machine needs a test that traverses it rather than one that inspects it.

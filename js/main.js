@@ -833,7 +833,10 @@ function brief(next) {
 function startBriefedStage() {
   const next = state.sensorCal.next;
   if (next === 'stationary') {
-    brief('stationary');
+    // NOT brief('stationary'). A bulk edit put a briefing call here, so the
+    // Start button re-showed the same briefing forever and read as dead.
+    orientation.beginStationaryDiagnostic();
+    state.sensorCal = { stage: 'stationary', startedAt: performance.now() };
     state.calibStart = performance.now();
   } else if (next === FREEFORM_STAGE) {
     orientation.resetSpinEvidence();
