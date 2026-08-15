@@ -1492,3 +1492,112 @@ far apart as sky and ground. With a single threshold to give, that invites the
 split to land in the wrong gap. Whiteness — bright and unsaturated — now counts
 as sky colour in its own right, which foliage, brick and roofing cannot claim.
 All 23 test files pass; segmentation cost 10.5 -> 12.0 ms per frame.
+
+### 2026-08-15, 20:05 — the first usable horizon, and what the imagery revealed
+
+The stitched view came back with imagery for all 23 keyframes, and it settled
+two questions that no amount of reasoning had.
+
+**The trees are traced correctly.** Across roughly 210-330° the line sits on
+the treetops. That was never the problem.
+
+**The house was.** The profile plateaus at 50-55° from about 55° to 140°, which
+matches the ridge in the imagery, so the bulk of it is right — but the edges
+spike and 20 bins are marked as spikes.
+
+The operator's guess was that clouds were involved and that the whiteness term
+added the previous round had caused it. Building the case properly —
+`tests/sim13.mjs`, a pale roof with white trim under a cumulus, ground truth
+known per column — showed the line landing **84 px below the ridge**, at the
+BOTTOM of the house. Disabling the whiteness term changed that number not at
+all. The failure predates it, and the guess was wrong.
+
+The real cause is arithmetic. Sky luminance in that scene is 161; a sunlit pale
+wall is **211**. Brightness carried 0.42 of the sky score, so the wall out-read
+the sky it stood against, cleared the Otsu threshold at 0.49, and the whole
+house was classified as sky. Smoothness — the only property a cloud has and
+shingles, siding and window frames do not — was worth just 0.24 and could not
+overcome it.
+
+So brightness now SATURATES at sky level: past that, brighter is not more
+sky-like. Weights move from 0.42/0.26/0.24 to 0.26/0.28/0.38, with the extra
+going to smoothness. The pale roof goes from **84 px off to 0.6 px**, every
+other scene is unchanged, all 23 test files pass, and segmentation gets
+marginally faster. With the reweighting the whiteness term does now earn its
+place — disabling it degrades the roof and low-cloud cases — so it stays, gated
+on smoothness so masonry cannot claim it.
+
+Also changed, because it has been misreporting every survey: "maximum spread"
+is a worst case over 720 bins, and at the vertical edge of a close building the
+true skyline falls forty degrees within two or three degrees of azimuth, so a
+couple of degrees of pointing error there sets a huge maximum while the other
+seven hundred bins are sound. The report and the acceptance line now give
+median, 90th percentile, worst, and how many bins exceed 5°. The pass condition
+is unchanged; what changed is that a usable profile no longer reads as a
+uniform failure.
+
+### 2026-08-15, later — the panorama becomes the product
+
+A deliberate change of what this software is for. The operator's framing:
+
+> "with a more accurate panorama the user can then better draw the line with
+> their fingers to correct things... still compute the horizon and draw the
+> lines, but now it isn't as critical. What becomes much more critical is the
+> seamless panorama with very internally consistent azimuth (this matters more
+> than accuracy) and keeping track of when the phone is tilted."
+
+That reprioritisation is worth stating precisely, because it changes what is
+worth optimising. INTERNAL consistency means every frame that can see the same
+chimney draws it in the same place. ABSOLUTE accuracy means the whole picture
+points at the right compass bearing. The first is what makes an image you can
+trace a line on; the second is a separate offset that two landmarks fix
+afterwards. They are not the same problem and the first is now the one that
+matters.
+
+`js/bundle.js` is rotation-only bundle adjustment over the keyframes. Features
+are matched between overlapping frames and every frame's rotation is nudged
+until matched features agree on a world direction. Three decisions carry it:
+
+**Gravity is not negotiable.** The correction is split into a turn about world
+vertical and a tilt away from it; tilt is held fifty times more stiffly than
+yaw. Which way is down comes from the accelerometer and is the best number in
+the device, while azimuth comes from an integrated gyroscope and is the one that
+drifts. So vision is allowed to fix the azimuths and forbidden to tip the
+horizon over. Measured: yaw corrections of 3.2° with tilt held to 0.23°.
+
+**Clouds do not count**, exactly as the operator asked. Features come only from
+below each frame's own detected skyline, which the survey already computes.
+Cloud moves between frames, so matching on it would drag the geometry toward a
+fiction. Verified directly: with a cloud band rendered DIFFERENTLY in every
+frame, zero features are taken from it and the solve is unaffected.
+
+**One rotation per pair, enforced.** Descriptor similarity alone is not enough
+on clapboard, shingles and fence palings, which are periodic; a patch matches
+its neighbour's neighbour with total confidence. Every pair is fitted to a
+single relative rotation and whatever disagrees is discarded.
+
+Three bugs found on the way, each of which had pinned the result:
+
+- The outlier tolerance was `max(tol, median × 3)`, which is backwards — when a
+  pair is polluted the median is large, so the cut GROWS and the pollution is
+  kept. Replaced with a schedule that only ever tightens.
+- Integer-pixel matching was the entire remaining residual. Sub-pixel parabola
+  fitting took mean disagreement from 0.246° to 0.154°.
+- And the test world itself was wrong: pure periodic texture, on which whole
+  pairs lock onto the wrong period self-consistently, which no verification can
+  detect. That is a harder problem than reality, not an easier one. Rebuilt
+  from 1400 distinct objects at random directions, which is what a real horizon
+  is — window corners, branch junctions, chimney edges. Worst-case disagreement
+  fell from 6.55° to under 1°.
+
+Result on a ring of twelve frames with 0.55°/frame of accumulated yaw drift:
+mean pairwise disagreement **0.575° -> 0.154°, which is 0.68 of a pixel** at the
+test's resolution. On the real 640x480 thumbnails a pixel is 0.07°, so the
+figure that transfers is the sub-pixel one. Cross-band alignment between a level
+sweep and a 22°-tilted one is honestly weaker — a few pixels, improving better
+than twofold — and is reported as such rather than dressed up.
+
+Built and tested here: the estimator. NOT yet wired into the mosaic build, and
+the feathered blending and two-sweep capture flow the operator asked for are
+still to come. The next step is to run this over real keyframes at Build time
+and reproject from the refined rotations.

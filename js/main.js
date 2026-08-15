@@ -15,6 +15,7 @@ import { calibrationFigure } from './calfigures.js';
 import { LensCalibrator } from './lenscal.js';
 import * as store from './storage.js';
 import * as out from './exporters.js';
+import { buildCaptureDebugZip } from './diagnostic-export.js';
 import {
   buildMosaic, skylineTracks, drawPanorama, disagreementByBin,
   pixelToAzAlt, landmarkResiduals
@@ -444,6 +445,37 @@ function maybeKeyframe({ seg, quat, rawYaw, att, t }) {
     elevation: att.elevation,
     roll: att.roll,
     compass: orientation.compassHeading,
+    // Sensor snapshots travel with the photo for offline diagnosis. None of
+    // these fields feed projection, fusion, or panorama stitching.
+    photoWidth: camera.keyCanvas.width,
+    photoHeight: camera.keyCanvas.height,
+    orientationSample: {
+      alpha: orientation.alpha,
+      beta: orientation.beta,
+      gamma: orientation.gamma,
+      absolute: orientation.absolute
+    },
+    gyro: {
+      available: orientation.gyroAvailable,
+      integratedYawDeg: orientation.gyroYaw,
+      yawRateDegPerSec: orientation.gyroYawRate,
+      rotationRateDegPerSec: orientation.rotationRate,
+      tiltRateDegPerSec: orientation.tiltRate,
+      stillness: orientation.stillness,
+      sampleCount: orientation.gyroSamples,
+      scale: orientation.gyroScale,
+      biasDegPerSec: orientation.gyroBias.slice(),
+      axisMap: orientation.gyroAxisMap ? {
+        ...orientation.gyroAxisMap,
+        perm: orientation.gyroAxisMap.perm.slice(),
+        signs: orientation.gyroAxisMap.signs.slice()
+      } : null,
+      rawRateDeviceDegPerSec: orientation.lastGyroRaw?.slice() || null,
+      mappedRateDeviceDegPerSec: orientation.lastGyroMapped?.slice() || null,
+      gravityDeviceMPerSec2: orientation.lastGravity?.slice() || null,
+      sampleAgeMs: Number.isFinite(orientation.lastGyroAt)
+        ? Math.max(0, performance.now() - orientation.lastGyroAt) : null
+    },
     visualQuality: state.visualQuality,
     skyFraction: seg.skyFraction,
     height: WORK_H,
@@ -1341,6 +1373,7 @@ function updateReport() {
   $('exportHznBtn').disabled = !(complete && (gated || forced));
   $('exportHzn2Btn').disabled = !(survey.coverage().observedBins > 0);
   $('exportProjectBtn').disabled = survey.keyframes.length === 0 && survey.coverage().observedBins === 0;
+  $('exportCaptureZipBtn').disabled = survey.keyframes.length === 0;
   $('exportHint').textContent = !complete
     ? 'Some bins hold no altitude yet. Fill the gaps or finish the survey before writing a .hzn.'
     : gated ? 'The survey passes its acceptance rules. Safe to write.'
@@ -1362,7 +1395,9 @@ function reportText(r) {
   lines.push(`Verified samples       ${c.verifiedBins} / ${BIN_COUNT}`);
   lines.push(`Median observations    ${c.medianObservations} per sample`);
   lines.push(`Total observations     ${c.totalObservations}`);
-  lines.push(`Maximum spread         ${c.maxSpread.toFixed(2)}°`);
+  // Distribution, not just the worst bin — see Survey.coverage for why.
+  lines.push(`Altitude spread        median ${c.medianSpread.toFixed(2)}°, 90th pct ${c.p90Spread.toFixed(2)}°, worst ${c.maxSpread.toFixed(2)}°`);
+  lines.push(`  bins disagreeing >5° ${c.spreadOver5} of ${c.observedBins} observed`);
   lines.push(`Mean segmentation conf ${(c.meanConfidence * 100).toFixed(1)}%`);
   lines.push(`Visual loop error      ${survey.loopClosed ? survey.loopError.toFixed(2) + '°' : 'not measured'}`);
   lines.push('');
@@ -1705,6 +1740,7 @@ function newThumbBudget() {
     stored: 0, bytes: 0, pending: 0,
     maxFrames: 600, maxBytes: 40e6,
     warned: false, storeWarned: false,
+    tasks: new Set(),
     // Held in memory as well as written to IndexedDB. The stitched view is the
     // one diagnostic that shows an operator WHERE the traced line went wrong,
     // and on 2026-08-15 it came back with imagery for 0 of 22 keyframes and a
@@ -1733,8 +1769,7 @@ function captureThumb(kf) {
     return;
   }
   b.pending++;
-  camera.grabKeyframeThumb().then(blob => {
-    b.pending--;
+  const task = camera.grabKeyframeThumb().then(blob => {
     if (!blob || !state.sessionId) return;
     b.stored++; b.bytes += blob.size;
     b.mem.set(kf.index, blob);
@@ -1744,7 +1779,11 @@ function captureThumb(kf) {
         log('warn', `This browser will not persist keyframe images (${e && e.message || e}). They are being kept in memory instead, so the stitched view still works for this session — it just will not survive a reload.`);
       }
     });
-  }).catch(() => { b.pending--; });
+  }).catch(() => {}).finally(() => {
+    b.pending--;
+    b.tasks.delete(task);
+  });
+  b.tasks.add(task);
 }
 
 /* ------------------------------------------------------ diagnostic panorama */
@@ -1758,18 +1797,37 @@ let panoBuilt = false;
  * skyline tracks and their disagreement are the diagnostic and the imagery is
  * only what makes it legible.
  */
-async function loadKeyframeSources(keyframes) {
-  if (!state.sessionId) return { sources: [], found: 0 };
+async function loadKeyframeBlobs({ waitForPending = false } = {}) {
+  if (waitForPending && state.thumbBudget?.tasks) {
+    // A tap immediately after the last keyframe must still include that frame.
+    while (state.thumbBudget.tasks.size) {
+      await Promise.allSettled(Array.from(state.thumbBudget.tasks));
+    }
+  }
+
   let records = [];
-  try {
-    records = await store.getKeyframeThumbs(state.sessionId);
-  } catch (e) {
-    log('warn', `Could not read stored keyframe thumbnails: ${e && e.message || e}`);
+  if (state.sessionId) {
+    try {
+      records = await store.getKeyframeThumbs(state.sessionId);
+    } catch (e) {
+      log('warn', `Could not read stored keyframe thumbnails: ${e && e.message || e}`);
+    }
   }
   const byIndex = new Map(records.map(r => [r.index, r.blob]));
+  // A loaded project may already carry embedded keyframe images.
+  for (const kf of survey.keyframes) {
+    if (!byIndex.has(kf.index) && typeof kf.thumb === 'string' && kf.thumb.startsWith('data:')) {
+      try { byIndex.set(kf.index, await (await fetch(kf.thumb)).blob()); } catch (_) { /* optional image */ }
+    }
+  }
   // Whatever this session captured wins over whatever the database managed to
   // keep, so a browser that silently refuses to persist costs nothing here.
   for (const [i, blob] of (state.thumbBudget?.mem || [])) byIndex.set(i, blob);
+  return byIndex;
+}
+
+async function loadKeyframeSources(keyframes) {
+  const byIndex = await loadKeyframeBlobs();
   const scratch = document.createElement('canvas');
   const sctx = scratch.getContext('2d', { willReadFrequently: true });
   const sources = [];
@@ -1977,6 +2035,7 @@ function currentProject(includeThumbs = false) {
     intrinsics: camera.intrinsics(),
     sensorHealth: orientation.health(),
     mode: { id: director.mode.id, label: director.mode.label, minOverlap: director.mode.minOverlap, maxRate: director.mode.maxRate, rollLimitScan: director.mode.rollLimitScan },
+    yawDatumDeg: survey.yawDatum || 0,
     thumbs: includeThumbs ? state.thumbs : null,
     generator: 'Horizon Survey 2.0 (browser)'
   });
@@ -2005,6 +2064,51 @@ function buildDebugBundle() {
     L.dump() || '(empty)'
   ];
   return lines.join('\n');
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+async function exportCaptureDebugZip() {
+  const btn = $('exportCaptureZipBtn');
+  const label = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Building ZIP...';
+  try {
+    const photos = await loadKeyframeBlobs({ waitForPending: true });
+    const usedPhotos = survey.keyframes.filter(kf => photos.has(kf.index)).length;
+    log('info', `CAPTURE_DEBUG_EXPORT collecting ${usedPhotos} photo(s) for ${survey.keyframes.length} keyframe(s).`);
+    const snapshot = debugSnapshot();
+    const project = currentProject(false);
+    const result = await buildCaptureDebugZip({
+      siteName: $('siteName').value,
+      sessionId: state.sessionId,
+      keyframes: survey.keyframes,
+      photos,
+      yawDatumDeg: survey.yawDatum || 0,
+      azimuthOffsetDeg: Number($('azOffset').value) || 0,
+      project,
+      snapshot,
+      debugText: buildDebugBundle(),
+      logText: L.dump()
+    });
+    downloadBlob(result.blob, result.filename);
+    const missing = result.keyframeCount - result.photoCount;
+    log(missing ? 'warn' : 'info', `Wrote ${result.filename}, ${(result.blob.size / 1e6).toFixed(1)} MB: ${result.photoCount}/${result.keyframeCount} source photos plus metadata and logs${missing ? ` (${missing} photo(s) unavailable)` : ''}.`);
+  } catch (err) {
+    log('error', 'Could not build capture debug ZIP:', err);
+  } finally {
+    btn.textContent = label;
+    btn.disabled = survey.keyframes.length === 0;
+  }
 }
 
 async function shareDebugBundle() {
@@ -2244,6 +2348,7 @@ function wire() {
     const size = out.downloadProject(project, $('siteName').value);
     log('info', `Wrote project archive, ${(size / 1024).toFixed(0)} kB, ${survey.keyframes.length} keyframes.`);
   });
+  $('exportCaptureZipBtn').addEventListener('click', exportCaptureDebugZip);
 
   $('openProjectInput').addEventListener('change', async e => {
     const file = e.target.files[0];

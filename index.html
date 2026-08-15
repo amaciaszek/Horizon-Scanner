@@ -212,6 +212,11 @@
     <button id="exportProjectBtn" class="btn">Save .horizon-project</button>
   </div>
 
+  <div class="row">
+    <button id="exportCaptureZipBtn" class="btn" disabled>Download source photos + debug ZIP</button>
+  </div>
+  <p class="hint">One ZIP containing every stored panorama keyframe photo, per-photo azimuth/altitude/orientation and gyro snapshots, the recomputable project, and the complete field log.</p>
+
   <label class="toggle danger"><input type="checkbox" id="forceExport" /> <span>Export unverified profile</span></label>
   <p class="hint" id="exportHint">The controller format cannot represent a missing sample, so an incomplete survey would silently become a 0° horizon. Finish the survey or tick the override.</p>
 </section>

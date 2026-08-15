@@ -55,7 +55,17 @@ function scene(cfg) {
       const p = (y * W + x) * 4;
       const horizon = treeRow(x);
       let r, g, b;
-      if (y > horizon) {
+      const roofTop = cfg.roof ? cfg.roof(x) : null;
+      if (roofTop !== null && y > roofTop) {
+        // A pale roof and painted wall: bright and nearly colourless, exactly
+        // like a cloud on every axis except one — it is covered in shingles,
+        // siding lines and window frames, so it is not SMOOTH.
+        const shingle = ((y % 4) < 2 ? 1 : 0) * 16 + ((x % 7) < 3 ? 1 : 0) * 10;
+        const wall = y > roofTop + 26;
+        const base = wall ? 206 : 188;
+        const v = base + shingle + rnd() * 6;
+        r = v * 1.02; g = v; b = v * 0.97;
+      } else if (y > horizon) {
         // Foliage. `lit` raises it toward sunlit mid-tones, which is the case
         // that actually matters: dark silhouetted trees are an easy edge, while
         // sunlit ones against hazy sky can be a WEAKER edge than a white cloud
@@ -191,6 +201,34 @@ console.log('\n=== Cloud below the treetops in the frame, the nastiest case ==='
     cloudBands: [{ cx: 96, cy: 58, rx: 70, ry: 26 }]
   });
   check('treeline still wins', r.meanErr < 8, `mean error ${r.meanErr.toFixed(1)} px`);
+}
+
+console.log('\n=== A pale roof under a cloud — the 2026-08-15 regression ===');
+{
+  // The operator's house: light grey roof, white trim, cumulus directly above
+  // it. Bright and unsaturated like the cloud, so any rule that calls
+  // "bright and colourless" sky will climb off the roof and onto the cloud.
+  const trees = x => 104 + Math.round(3 * Math.sin(x * 0.1));
+  const roofLine = x => (x > 44 && x < 150) ? 52 + Math.round(10 * Math.abs(Math.sin((x - 44) * 0.03))) : null;
+  const r = evaluate('pale roof, white trim, cloud just above the ridge', {
+    treeRow: trees,
+    roof: roofLine,
+    haze: 0.3,
+    cloudBands: [{ cx: 100, cy: 30, rx: 56, ry: 17 }]
+  });
+  // Truth is the roof where there is one, the trees elsewhere.
+  const truth = x => roofLine(x) ?? trees(x);
+  const b = r.out.boundary;
+  let worstRoof = 0, meanRoof = 0, n = 0;
+  for (let x = 50; x < 145; x++) {
+    const e = Math.abs(b[x] - truth(x));
+    worstRoof = Math.max(worstRoof, e); meanRoof += e; n++;
+  }
+  meanRoof /= n;
+  console.log(`   over the roof only: mean ${meanRoof.toFixed(1)} px, worst ${worstRoof.toFixed(1)} px`);
+  check('the line stays on the roof, not the cloud above it', meanRoof < 6,
+    `mean ${meanRoof.toFixed(1)} px off the ridge`);
+  check('no column jumps to the cloud', worstRoof < 18, `worst ${worstRoof.toFixed(1)} px`);
 }
 
 if (failures) { console.log(`\n${failures} check(s) FAILED`); process.exitCode = 1; }

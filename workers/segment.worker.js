@@ -137,10 +137,27 @@ function analyse(data, width, height) {
       // on a cloud's underside. Whiteness is therefore counted as sky colour in
       // its own right: bright and unsaturated. Foliage, brick and roofing are
       // none of those things, so nothing on the ground gains from it.
-      const nw = Math.min(1, Math.max(0, (nl - 0.55) / 0.35) * (1 - Math.min(1, Math.abs(blueness[i]) * 4)));
-      const nc = Math.max(nb, nw);
       const nt = Math.min(1, texture[i] * 3.2);
-      score[i] = 0.42 * nl + 0.26 * nc + 0.24 * (1 - nt) + 0.08 * (1 - y / hh);
+      // ...but ONLY where the region is also smooth. Without that condition
+      // this term is a menace: a pale roof and a painted wall are bright and
+      // unsaturated too, so a house started scoring as sky and the traced line
+      // fell to the BOTTOM of it — 84 px off the ridge in the case below,
+      // which is what wrecked the 2026-08-15 survey around the operator's
+      // house while the trees stayed fine. Shingles, siding lines and window
+      // frames all carry texture; the inside of a cumulus does not. Smoothness
+      // is the one axis on which cloud and masonry genuinely differ.
+      const nw = Math.max(0, (nl - 0.62) / 0.3)
+        * (1 - Math.min(1, Math.abs(blueness[i]) * 4))
+        * Math.max(0, 1 - nt * 2.4);
+      const nc = Math.max(nb, Math.min(1, nw));
+      // Brightness SATURATES once a region is as bright as sky. Being brighter
+      // still is not being more sky: a sunlit pale wall out-reads the sky it
+      // stands against — 211 against 161 in the case below — and with
+      // brightness carrying 0.42 of the score the whole house cleared the
+      // threshold and the traced line fell out of the bottom of it. Texture
+      // carries the extra weight instead, because smoothness is the one
+      // property cloud has and shingles, siding and window frames do not.
+      score[i] = 0.26 * Math.min(1, nl / 0.75) + 0.28 * nc + 0.38 * (1 - nt) + 0.08 * (1 - y / hh);
     }
   }
 

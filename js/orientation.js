@@ -136,6 +136,12 @@ export class OrientationSource {
     // y gyro axis, an upright spin on z). null means identity — trust the spec.
     this.gyroAxisMap = null;      // { perm:[i,i,i], signs:[±1,±1,±1], residualDeg }
     this.lastGravity = null;
+    // Retain the most recent instantaneous motion sample so a panorama
+    // keyframe can carry the gyro state that accompanied its exposure. This is
+    // diagnostic only; integration and fusion do not read it.
+    this.lastGyroRaw = null;
+    this.lastGyroMapped = null;
+    this.lastGyroAt = null;
     this._lastMotionAt = 0;
     this._onMotion = this._onMotion.bind(this);
     this.eventDt = 0;
@@ -506,6 +512,9 @@ export class OrientationSource {
       const m = this.gyroAxisMap;
       w = [m.signs[0] * wRaw[m.perm[0]], m.signs[1] * wRaw[m.perm[1]], m.signs[2] * wRaw[m.perm[2]]];
     }
+    this.lastGyroRaw = rawW.slice();
+    this.lastGyroMapped = w.slice();
+    this.lastGyroAt = now;
     // World up, expressed in the device frame.
     const up = quatRotate(quatConj(this.quat), [0, 0, 1]);
     this.gyroYawRate = -(w[0] * up[0] + w[1] * up[1] + w[2] * up[2]) * this.gyroScale;
