@@ -14,13 +14,12 @@ export const LUMA_W = 160, LUMA_H = 120;   // registration base frame
  */
 
 /**
- * Lenses we simply know, and therefore refuse to guess at.
+ * Device-specific lens priors used to seed the guided measurement.
  *
  * Focal length in VIDEO pixels, because that is the form that survives
- * rotation, cropping and rescaling. Added because measurement kept failing on
- * real hardware and a known device does not need measuring — an operator with
- * an identified iPad should not be made to sweep a garden to discover a number
- * Apple already published.
+ * rotation, cropping and rescaling. This gets capture guidance close on the
+ * first frame, but it is deliberately not treated as ground truth: crop and
+ * camera-selection details can differ across browser releases.
  *
  * The iPad Air 5 figure: the 12MP rear camera covers about 70 deg diagonally
  * on its 4:3 sensor, giving 58.5 deg across the full width; a 1080x1920
@@ -269,6 +268,7 @@ export class CameraSource {
         this.focalSource = 'default';
         this.measuredFocalV = null;
         this.sensorFocalPx = null;
+        this.sensorFocalVPx = null;
         this.log('warn', `Camera changed underneath the survey: ${prev.width}x${prev.height} -> ${cur.width}x${cur.height}. Intrinsics discarded. Pin a lens under Advanced to stop this.`);
         if (this.onLensSwap) this.onLensSwap(prev, cur);
         prev = cur;
@@ -321,12 +321,35 @@ export class CameraSource {
   /** Mean luminance of the working frame, 0-255. Used to refuse to segment a
    *  scene too dark for a sky boundary to exist in the imagery at all. */
   meanLuma() {
+    return this.exposureStats()?.luma ?? null;
+  }
+
+  /**
+   * Mean luminance and blown-highlight fraction of the working frame, from one
+   * pass over the same sampled pixels.
+   *
+   * The dark end was always checked; the bright end never was, and the bright
+   * end is what actually cost a survey. Panning into a low sun collapses the
+   * auto-exposure, floods the frame with flare, and the segmenter — which is
+   * looking for a contrast boundary — finds nothing it trusts. Every frame is
+   * then refused, silently, for as long as the sun is in view. Measuring the
+   * saturated fraction costs nothing here and is the difference between the app
+   * saying "no sky visible" and the app saying "the sun is in the frame".
+   */
+  exposureStats() {
     if (!this.ready) return null;
     this._drawRotated(this.workCtx, WORK_W, WORK_H);
     const d = this.workCtx.getImageData(0, 0, WORK_W, WORK_H).data;
-    let sum = 0;
-    for (let i = 0; i < d.length; i += 64) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-    return sum / (d.length / 64);
+    let sum = 0, hot = 0, n = 0;
+    for (let i = 0; i < d.length; i += 64) {
+      const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+      sum += y;
+      // Near-clipped in every channel: a true highlight, not merely a bright
+      // patch of sky. Bright overcast sits around 200-230 and must not trip it.
+      if (d[i] >= 250 && d[i + 1] >= 250 && d[i + 2] >= 250) hot++;
+      n++;
+    }
+    return n ? { luma: sum / n, saturatedFraction: hot / n } : null;
   }
 
   get ready() {
@@ -338,7 +361,15 @@ export class CameraSource {
     this._lastScreenAngle = screenAngle;
     if (!this.autoRotation || !this.video.videoWidth) return this.frameRotation;
     const imageLandscape = this.video.videoWidth >= this.video.videoHeight;
-    const screenLandscape = screenAngle === 90 || screenAngle === -90 || screenAngle === 270;
+    // iPadOS can leave screen.orientation.angle at 90 while the actual viewport
+    // and decoded video are portrait. The viewport is the physical truth for
+    // image pixels, so it wins whenever dimensions are available.
+    const viewportW = typeof window !== 'undefined' ? window.innerWidth : 0;
+    const viewportH = typeof window !== 'undefined' ? window.innerHeight : 0;
+    const viewportKnown = viewportW > 0 && viewportH > 0;
+    const screenLandscape = viewportKnown
+      ? viewportW >= viewportH
+      : screenAngle === 90 || screenAngle === -90 || screenAngle === 270;
     // If the delivered frame and the screen disagree about which way is long,
     // the sensor frame is 90° out.
     this.frameRotation = (imageLandscape !== screenLandscape) ? 90 : 0;
@@ -354,13 +385,13 @@ export class CameraSource {
   /** Draw the current video frame into ctx, rotated into screen orientation,
    *  filling the destination with a cover fit. */
   _drawRotated(ctx, dw, dh) {
-    const vw = this.video.videoWidth, vh = this.video.videoHeight;
-    const rot = this.frameRotation;
-    const swapped = rot === 90 || rot === 270;
-    const srcW = swapped ? vh : vw;
-    const srcH = swapped ? vw : vh;
-    const scale = Math.max(dw / srcW, dh / srcH);
-    const w = srcW * scale, h = srcH * scale;
+    // Revalidate immediately before every draw. A stream can re-orient between
+    // the one-second settings poll and a keyframe; carrying the stale 90 degree value
+    // is catastrophic because the photo and quaternion then differ by a full
+    // quarter-turn.
+    if (this.autoRotation) this.detectRotation(this._lastScreenAngle || 0);
+    const geometry = this._frameGeometry(dw, dh);
+    const { rotationDeg: rot, swapped, drawnWidth: w, drawnHeight: h } = geometry;
 
     ctx.save();
     ctx.translate(dw / 2, dh / 2);
@@ -368,6 +399,42 @@ export class CameraSource {
     ctx.drawImage(this.video, -(swapped ? h : w) / 2, -(swapped ? w : h) / 2,
       swapped ? h : w, swapped ? w : h);
     ctx.restore();
+    return geometry;
+  }
+
+  /** Exact pixel transform used to turn the decoded video into a saved frame. */
+  _frameGeometry(dw, dh) {
+    const vw = this.video.videoWidth, vh = this.video.videoHeight;
+    const rot = this.frameRotation;
+    const swapped = rot === 90 || rot === 270;
+    const srcW = swapped ? vh : vw;
+    const srcH = swapped ? vw : vh;
+    const scale = Math.max(dw / srcW, dh / srcH);
+    const drawnWidth = srcW * scale, drawnHeight = srcH * scale;
+    const visibleWidth = dw / scale, visibleHeight = dh / scale;
+    return {
+      sourceWidth: vw,
+      sourceHeight: vh,
+      rotationDeg: rot,
+      swapped,
+      screenAlignedSourceWidth: srcW,
+      screenAlignedSourceHeight: srcH,
+      outputWidth: dw,
+      outputHeight: dh,
+      scale,
+      drawnWidth,
+      drawnHeight,
+      visibleRectScreenAligned: {
+        x: (srcW - visibleWidth) / 2,
+        y: (srcH - visibleHeight) / 2,
+        width: visibleWidth,
+        height: visibleHeight
+      },
+      retainedFraction: {
+        width: visibleWidth / srcW,
+        height: visibleHeight / srcH
+      }
+    };
   }
 
   /** Working-resolution RGBA frame, screen-aligned. */
@@ -402,7 +469,7 @@ export class CameraSource {
     const videoCurrentTimeSec = Number.isFinite(this.video.currentTime)
       ? this.video.currentTime : null;
 
-    this._drawRotated(this.keyCtx, this.keyCanvas.width, this.keyCanvas.height);
+    const coverFit = this._drawRotated(this.keyCtx, this.keyCanvas.width, this.keyCanvas.height);
     this.workCtx.drawImage(this.keyCanvas, 0, 0, WORK_W, WORK_H);
     this.lumaCtx.drawImage(this.keyCanvas, 0, 0, LUMA_W, LUMA_H);
 
@@ -414,7 +481,10 @@ export class CameraSource {
     }
 
     const serial = ++this._captureSerial;
-    const settings = this.settings || {};
+    const track = this.stream?.getVideoTracks?.()[0] || null;
+    const liveSettings = track?.getSettings?.() || this.settings || {};
+    this.settings = { ...(this.settings || {}), ...liveSettings };
+    const settings = this.settings;
     return {
       serial,
       workFrame,
@@ -429,12 +499,27 @@ export class CameraSource {
         savedWidth: this.keyCanvas.width,
         savedHeight: this.keyCanvas.height,
         frameRotationDeg: this.frameRotation,
+        coverFit,
+        viewport: typeof window === 'undefined' ? null : {
+          width: window.innerWidth || null,
+          height: window.innerHeight || null,
+          devicePixelRatio: window.devicePixelRatio || 1
+        },
         track: {
-          width: settings.width || null,
-          height: settings.height || null,
-          frameRate: settings.frameRate || null,
-          facingMode: settings.facingMode || null,
-          resizeMode: settings.resizeMode || null
+          width: settings.width ?? null,
+          height: settings.height ?? null,
+          frameRate: settings.frameRate ?? null,
+          facingMode: settings.facingMode ?? null,
+          aspectRatio: settings.aspectRatio ?? null,
+          resizeMode: settings.resizeMode ?? null,
+          exposureMode: settings.exposureMode ?? null,
+          exposureTime: settings.exposureTime ?? null,
+          iso: settings.iso ?? null,
+          focusMode: settings.focusMode ?? null,
+          focusDistance: settings.focusDistance ?? null,
+          whiteBalanceMode: settings.whiteBalanceMode ?? null,
+          colorTemperature: settings.colorTemperature ?? null,
+          zoom: settings.zoom ?? null
         }
       }
     };
@@ -533,6 +618,18 @@ export class CameraSource {
     this.focalPx = focalH;
     this.hfovDeg = 2 * Math.atan((WORK_W / 2) / focalH) * RAD;
     this.measuredFocalV = Number.isFinite(focalV) && focalV > 40 ? focalV : null;
+    // Preserve the measurement in decoded-video pixel units so a harmless
+    // stream re-orientation can rescale it without reloading the known-device
+    // prior over the top of a value just measured in the field.
+    const vw = this.video?.videoWidth, vh = this.video?.videoHeight;
+    if (vw && vh) {
+      const swapped = this.frameRotation === 90 || this.frameRotation === 270;
+      const srcW = swapped ? vh : vw, srcH = swapped ? vw : vh;
+      const scale = Math.max(WORK_W / srcW, WORK_H / srcH);
+      this.sensorFocalPx = focalH / scale;
+      this.sensorFocalVPx = this.measuredFocalV ? this.measuredFocalV / scale : null;
+      this.sensorFocalLabel = 'measured';
+    }
     this.focalSource = 'measured';
     return true;
   }
@@ -544,7 +641,7 @@ export class CameraSource {
     const hit = KNOWN_LENSES.find(k => { try { return k.match(this.settings); } catch (_) { return false; } });
     if (!hit) return false;
     if (this.setSensorFocalPx(hit.focalVideoPx, 'known-device')) {
-      this.log('info', `Lens known for this device (${hit.label}): ${this.hfovDeg.toFixed(1)}° across the working frame, ${this.intrinsics().vfovDeg.toFixed(1)}° down it. Not measured and not guessed — pinned. Override under Advanced if it looks wrong.`);
+      this.log('info', `Lens prior loaded for this device (${hit.label}): ${this.hfovDeg.toFixed(1)}° across the working frame, ${this.intrinsics().vfovDeg.toFixed(1)}° down it. This is a starting value; the guided lens measurement will verify or replace it.`);
       return true;
     }
     return false;
@@ -560,12 +657,13 @@ export class CameraSource {
    * stay correct through every rotation and re-orientation the platform throws
    * at it — which on an iPad is several per session.
    *
-   * Everything else in this file tries to MEASURE the lens. This does not: it
-   * is a hardcoded fact about a known device, and it wins over every estimator.
+   * Known-device values arrive through here as a prior. A successful guided
+   * measurement replaces both this value and its label.
    */
   setSensorFocalPx(focalVideoPx, label) {
     if (!Number.isFinite(focalVideoPx) || focalVideoPx <= 0) return false;
     this.sensorFocalPx = focalVideoPx;
+    this.sensorFocalVPx = null;
     this.sensorFocalLabel = label || 'pinned';
     return this._applySensorFocal();
   }
@@ -583,7 +681,7 @@ export class CameraSource {
     const scale = Math.max(WORK_W / srcW, WORK_H / srcH);
     this.focalPx = this.sensorFocalPx * scale;
     this.hfovDeg = 2 * Math.atan((WORK_W / 2) / this.focalPx) * RAD;
-    this.measuredFocalV = this.focalPx;      // square pixels: one focal, both axes
+    this.measuredFocalV = (this.sensorFocalVPx || this.sensorFocalPx) * scale;
     this.focalSource = this.sensorFocalLabel;
     return true;
   }

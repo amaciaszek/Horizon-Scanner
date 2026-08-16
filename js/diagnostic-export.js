@@ -2,6 +2,7 @@
 
 import { buildZip } from './zip.js';
 import { cameraRay, quatMul, quatRotate, vecToAzAlt, yawQuat } from './math3d.js';
+import { captureGapReport } from './capture-gaps.js';
 
 const finite = value => Number.isFinite(value) ? value : null;
 const round = (value, digits = 6) => Number.isFinite(value) ? Number(value.toFixed(digits)) : null;
@@ -57,6 +58,10 @@ function serialiseFrame(kf, photo, photoName, yawDatumDeg, azimuthOffsetDeg) {
     ? kf.yawFused + yawDatumDeg
     : (finite(kf.yawRaw) ?? 0) + (finite(kf.yawBase) ?? 0) + yawDatumDeg;
   const stitchedHeading = captureHeading + (finite(kf.yawCorrection) ?? 0);
+  const placedYaw = (finite(kf.yawBase) ?? 0) + (finite(kf.yawCorrection) ?? 0) + yawDatumDeg;
+  const placedQuaternion = placedYaw
+    ? quatMul(yawQuat(placedYaw), kf.quat)
+    : kf.quat;
   return {
     index: kf.index,
     capturedAt: Number.isFinite(kf.t) ? new Date(kf.t).toISOString() : null,
@@ -83,6 +88,10 @@ function serialiseFrame(kf, photo, photoName, yawDatumDeg, azimuthOffsetDeg) {
     },
     orientation: {
       quaternion: Array.from(kf.quat || [], v => round(v, 9)),
+      placedQuaternion: Array.from(placedQuaternion || [], v => round(v, 9)),
+      visuallyRefinedQuaternion: kf.bundleQuaternion
+        ? Array.from(kf.bundleQuaternion, v => round(v, 9)) : null,
+      visualRotationMovedDeg: round(kf.bundleMovedDeg),
       screenAngleDeg: finite(kf.screenAngle),
       yawRawDeg: round(kf.yawRaw),
       yawFusedDeg: round(kf.yawFused),
@@ -162,7 +171,11 @@ function readme(photoCount, keyframeCount, missing) {
     'photos/ contains the source JPEGs used to build the stitched panorama.',
     'metadata/keyframes.csv is a quick per-photo table for spreadsheets.',
     'metadata/keyframes.json contains the full per-photo exposure timing, orientation, gyro snapshot, camera geometry, skyline boundary, confidence, flags, and directly projected azimuth/altitude for every skyline column.',
+    'metadata/stitch-manifest.json is the compact, optimizer-ready image/pose/intrinsics manifest intended for a separate Python stitcher.',
     'metadata/session.json contains session/site/report/device data and explains missing photos.',
+    'metadata/capture-gaps.json measures photo-to-photo overlap and gives the bearings that should be revisited.',
+    'metadata/capture-audit.json counts and samples accepted and rejected capture candidates, including why a photo was not taken.',
+    'metadata/panorama-optimization.json records visual matches, residuals, and any gravity-constrained rotation refinements applied in the browser.',
     'metadata/project.horizon-project is the normal recomputable project archive without duplicate embedded images.',
     'logs/field-log.txt is the complete in-app field log at export time.',
     'logs/debug-bundle.txt combines the final state snapshot, lens inventory, acceptance report, and field log.',
@@ -173,6 +186,7 @@ function readme(photoCount, keyframeCount, missing) {
     '- outputAzimuthDeg additionally includes the operator-entered azimuth offset.',
     '',
     'Each photo, analysis frame and sensor snapshot now come from one synchronized capture record. Browser/video timing fields are included when the platform exposes them.',
+    'captureTiming.coverFit is the exact rotation, scale, retained source rectangle, and output size used to make that saved photo. captureTiming.track contains the live exposure/focus settings the browser exposed.',
     'Gyroscope data includes the exposure snapshot plus a short surrounding sample window; it is not a continuous full-session raw stream.',
     'Older saved sessions may show null for fields that were not recorded by their app version.',
     ''
@@ -182,7 +196,8 @@ function readme(photoCount, keyframeCount, missing) {
 /** Build the single-download source-photo + metadata + log archive. */
 export async function buildCaptureDebugZip({
   siteName, sessionId, keyframes, photos, yawDatumDeg = 0,
-  azimuthOffsetDeg = 0, project, debugText, logText, snapshot
+  azimuthOffsetDeg = 0, project, debugText, logText, snapshot,
+  captureAudit = null, panoramaOptimization = null
 }) {
   const exportedAt = new Date();
   const photoMap = photos instanceof Map ? photos : new Map();
@@ -204,9 +219,40 @@ export async function buildCaptureDebugZip({
     frames.push(serialiseFrame(kf, photo, photoName, Number(yawDatumDeg) || 0, Number(azimuthOffsetDeg) || 0));
   }
 
+  const gaps = captureGapReport(keyframes, Number(yawDatumDeg) || 0);
+  const audit = captureAudit || { counts: {}, events: [] };
+  const optimization = panoramaOptimization || null;
+  const stitchManifest = {
+    format: 'horizon-offline-stitch-manifest',
+    version: 1,
+    coordinateSystem: 'right-handed ENU world; camera rays use u right, v up, forward -Z',
+    imageGeometry: 'Photos are already screen-aligned. captureTiming.coverFit records the exact decoded-video rotation/crop/scale used to create each saved image.',
+    posePolicy: 'placedQuaternion is the sensor pose with yaw datum and loop correction applied. rawQuaternion is the exposure sensor pose before those azimuth corrections. visuallyRefinedQuaternion, when present, is a gravity-constrained rotation-only visual refinement.',
+    yawDatumDeg: Number(yawDatumDeg) || 0,
+    outputAzimuthOffsetDeg: Number(azimuthOffsetDeg) || 0,
+    captureGaps: gaps,
+    panoramaOptimization: optimization,
+    images: frames.map(frame => ({
+      index: frame.index,
+      path: frame.photo?.path || null,
+      capturedAt: frame.capturedAt,
+      width: frame.photo?.width || frame.captureTiming?.savedWidth || null,
+      height: frame.photo?.height || frame.captureTiming?.savedHeight || null,
+      rawQuaternion: frame.orientation.quaternion,
+      placedQuaternion: frame.orientation.placedQuaternion,
+      visuallyRefinedQuaternion: frame.orientation.visuallyRefinedQuaternion,
+      tanHalfHorizontal: frame.camera.tanHalfHorizontal,
+      tanHalfVertical: frame.camera.tanHalfVertical,
+      centerAzimuthDeg: frame.pointing.stitchedAzimuthDeg,
+      centerAltitudeDeg: frame.pointing.centerAltitudeDeg,
+      rollDeg: frame.pointing.rollDeg,
+      coverFit: frame.captureTiming?.coverFit || null,
+      trackSettings: frame.captureTiming?.track || null
+    }))
+  };
   const session = {
     format: 'horizon-capture-debug',
-    version: 1,
+    version: 2,
     exportedAt: exportedAt.toISOString(),
     sessionId: sessionId || null,
     site: project?.site || { name: siteName || '' },
@@ -215,6 +261,12 @@ export async function buildCaptureDebugZip({
     photoCount: includedPhotos,
     keyframeCount: keyframes.length,
     missingPhotoIndexes: missing,
+    captureGapCount: gaps.gapCount,
+    captureAudit: {
+      counts: audit.counts || {},
+      eventCount: Array.isArray(audit.events) ? audit.events.length : 0
+    },
+    panoramaOptimization: optimization,
     finalSnapshot: snapshot || null
   };
 
@@ -223,6 +275,10 @@ export async function buildCaptureDebugZip({
     { name: 'metadata/session.json', data: json(session), modifiedAt: exportedAt },
     { name: 'metadata/keyframes.json', data: json(frames), modifiedAt: exportedAt },
     { name: 'metadata/keyframes.csv', data: framesCsv(frames), modifiedAt: exportedAt },
+    { name: 'metadata/stitch-manifest.json', data: json(stitchManifest), modifiedAt: exportedAt },
+    { name: 'metadata/capture-gaps.json', data: json(gaps), modifiedAt: exportedAt },
+    { name: 'metadata/capture-audit.json', data: json(audit), modifiedAt: exportedAt },
+    { name: 'metadata/panorama-optimization.json', data: json(optimization), modifiedAt: exportedAt },
     { name: 'metadata/project.horizon-project', data: json(project), modifiedAt: exportedAt },
     { name: 'logs/field-log.txt', data: `${logText || '(empty)'}\n`, modifiedAt: exportedAt },
     { name: 'logs/debug-bundle.txt', data: `${debugText || '(empty)'}\n`, modifiedAt: exportedAt }

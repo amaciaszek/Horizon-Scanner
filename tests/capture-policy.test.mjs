@@ -1,5 +1,6 @@
 import {
-  keyframeStepDeg, maxKeyframeYawRate, keyframeMotionAccepted
+  keyframeStepDeg, maxKeyframeYawRate, keyframeMotionAccepted,
+  pass2CaptureAccepted
 } from '../js/capture-policy.js';
 
 let failures = 0;
@@ -19,6 +20,13 @@ check('fast handheld frames are rejected using instantaneous rate',
 check('tripod and obstruction captures are stricter',
   maxKeyframeYawRate({ mode: 'tripod' }) === 20
   && maxKeyframeYawRate({ probe: true }) === 3);
+check('verification sweep accepts dense angular steps without a target hold',
+  pass2CaptureAccepted({ verificationSweep: true, angularTravelDeg: -9.2, stepDeg: 9.12 }));
+check('verification sweep still rejects insufficient overlap steps',
+  !pass2CaptureAccepted({ verificationSweep: true, angularTravelDeg: -8, stepDeg: 9.12 }));
+check('targeted cleanup retains its hold and timing gates',
+  pass2CaptureAccepted({ onTarget: true, stillness: 0.8, elapsedMs: 500 })
+  && !pass2CaptureAccepted({ onTarget: true, stillness: 0.4, elapsedMs: 500 }));
 
 console.log(failures ? `\n${failures} FAILED` : '\nall capture-policy checks passed');
 process.exitCode = failures ? 1 : 0;

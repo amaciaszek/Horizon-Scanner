@@ -16,7 +16,9 @@ import { LensCalibrator } from './lenscal.js';
 import * as store from './storage.js';
 import * as out from './exporters.js';
 import { buildCaptureDebugZip } from './diagnostic-export.js';
-import { keyframeStepDeg, keyframeMotionAccepted } from './capture-policy.js';
+import { captureGapReport } from './capture-gaps.js';
+import { optimisePanoramaRotations } from './panorama-optimize.js';
+import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted } from './capture-policy.js';
 import {
   buildMosaic, skylineTracks, drawPanorama, disagreementByBin,
   pixelToAzAlt, landmarkResiduals
@@ -63,6 +65,7 @@ const preflight = new PreflightSweep();
 
 const state = {
   sceneLuma: null,
+  glareFraction: null,
   frameCount: 0,
   prevGyroYaw: null,
   trackingLost: false,
@@ -97,7 +100,8 @@ const state = {
   obstructionProbe: {
     active: false, anchorYaw: null, startedAt: 0, frames: 0,
     lastCaptureAt: 0, parallax: false
-  }
+  },
+  captureAudit: { counts: {}, events: [], lastReason: null, lastAt: 0 }
 };
 
 const PROCESS_INTERVAL_MS = 110;
@@ -109,6 +113,37 @@ const ELEVATION_HARD_LIMIT_DEG = 78;
 /* ------------------------------------------------------------------ helpers */
 
 const fmt = (v, d = 1, suffix = '°') => Number.isFinite(v) ? `${v.toFixed(d)}${suffix}` : '—';
+
+/** Keep both aggregate rejection counts and a rate-limited event trail. */
+function recordCaptureDecision(reason, { pose = null, t = null, accepted = false, detail = null } = {}) {
+  if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
+  const audit = state.captureAudit;
+  audit.counts[reason] = (audit.counts[reason] || 0) + 1;
+  const now = Number.isFinite(t) ? t : performance.now();
+  const shouldSample = accepted || reason !== audit.lastReason || now - audit.lastAt >= 1000;
+  if (shouldSample) {
+    audit.events.push({
+      performanceMs: now,
+      wallClockMs: Date.now(),
+      phase: director.phase,
+      pass: director.phase === PHASE.PASS2 ? 2 : 1,
+      reason,
+      accepted,
+      headingDeg: currentHeading(),
+      fusedYawDeg: state.fusedYaw,
+      elevationDeg: pose?.att?.elevation ?? null,
+      rollDeg: pose?.att?.roll ?? null,
+      yawRateDegPerSec: pose?.gyro?.yawRateDegPerSec ?? null,
+      stillness: pose?.gyro?.stillness ?? null,
+      frameStatus: state.frameStatus,
+      overlap: state.overlap,
+      detail
+    });
+    if (audit.events.length > 2500) audit.events.splice(0, audit.events.length - 2500);
+    audit.lastReason = reason;
+    audit.lastAt = now;
+  }
+}
 
 function setChip(el, text, cls = '') {
   el.textContent = text;
@@ -369,6 +404,9 @@ async function processFrame() {
     state.prevRawYaw = rawYaw;
     state.fusedYaw += dFused;
     if (director.phase === PHASE.PASS1) director.notePass1Travel(dFused);
+    else if (director.phase === PHASE.PASS2 && director.verificationSweep) {
+      director.notePass2Travel(dFused);
+    }
 
     // The pre-flight sweep rides on the same fused rotation the survey uses as
     // its reference, so it is measuring the compass against exactly what the
@@ -392,7 +430,11 @@ async function processFrame() {
       // the ground carries the bright lights — so every cue the segmenter uses
       // points the wrong way, and what it draws is a trace of sensor noise in
       // black pixels. Refuse rather than produce a confident-looking wrong line.
-      if (state.frameCount % 15 === 0) state.sceneLuma = camera.meanLuma();
+      if (state.frameCount % 15 === 0) {
+        const exposure = camera.exposureStats();
+        state.sceneLuma = exposure ? exposure.luma : null;
+        state.glareFraction = exposure ? exposure.saturatedFraction : null;
+      }
       state.frameStatus = Math.abs(att.elevation) > ELEVATION_HARD_LIMIT_DEG ? 'tooHigh'
       : state.obstructionProbe.parallax ? 'parallax'
       : state.trackingLost ? 'trackingLost'
@@ -435,9 +477,19 @@ async function processFrame() {
 }
 
 function maybeKeyframe({ seg, pose, capturedFrame, t }) {
-  if (!seg || seg.error) return;
+  if (!seg || seg.error) {
+    recordCaptureDecision('segmentation-error', { pose, t, detail: seg?.error || null });
+    return;
+  }
   if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
-  if (state.frameStatus !== 'ok') return;
+  if (!capturedFrame) {
+    recordCaptureDecision('no-synchronized-frame', { pose, t });
+    return;
+  }
+  if (state.frameStatus !== 'ok') {
+    recordCaptureDecision(`frame-${state.frameStatus}`, { pose, t });
+    return;
+  }
   const probe = state.obstructionProbe;
   // Roll is deliberately NOT a reason to reject a keyframe. It is carried
   // through the projection quaternion like every other part of the attitude,
@@ -448,7 +500,10 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     : Math.abs(pose.gyro.rotationRateDegPerSec);
   if (!keyframeMotionAccepted(instantRate, {
     probe: probe.active, mode: director.mode.id
-  })) return;
+  })) {
+    recordCaptureDecision('motion-too-fast', { pose, t, detail: { instantRate } });
+    return;
+  }
 
   // 80% horizontal overlap gives the visual solver roughly forty views per
   // lap on the iPad instead of twenty-one. Every physical edge now appears
@@ -466,12 +521,28 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   else if (director.phase === PHASE.PASS1) {
     accept = Math.abs(angDiff(state.fusedYaw, state.fusedYawAtKeyframe)) >= stepDeg;
   } else {
-    // Pass 2 collects confirmation frames while the operator holds on target.
+    // A normal pass 2 is a dense second lap. Targeted holds are reserved for
+    // cleanup after at least part of the ring already has two-pass evidence.
     const onTarget = director.target &&
-      Math.abs(angDiff(wrap360(director.target.fromDeg + director.target.widthDeg / 2), currentHeading())) < 6;
-    accept = onTarget && pose.gyro.stillness > 0.5 && (t - state.lastKeyframeAt) > 380;
+      Math.abs(angDiff(wrap360(director.target.fromDeg + director.target.widthDeg / 2), currentHeading())) < 3;
+    accept = pass2CaptureAccepted({
+      verificationSweep: director.verificationSweep,
+      angularTravelDeg: angDiff(state.fusedYaw, state.fusedYawAtKeyframe),
+      stepDeg,
+      onTarget,
+      stillness: pose.gyro.stillness,
+      elapsedMs: t - state.lastKeyframeAt
+    });
   }
-  if (!accept) return;
+  if (!accept) {
+    const reason = probe.active
+      ? 'probe-not-still-or-elevation'
+      : (director.phase === PHASE.PASS2 && !director.verificationSweep
+          ? 'off-target-or-not-still'
+          : 'spacing-not-reached');
+    recordCaptureDecision(reason, { pose, t, detail: { stepDeg } });
+    return;
+  }
 
   const intr = camera.intrinsics();
   const captureYaw = probe.active ? probe.anchorYaw : state.fusedYaw;
@@ -490,7 +561,9 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     yawRaw: pose.rawYaw,
     yawFused: captureYaw,
     yawBase: angDiff(captureYaw, pose.rawYaw),
-    captureKind: probe.active ? 'obstruction-probe' : 'sweep',
+    captureKind: probe.active
+      ? 'obstruction-probe'
+      : (director.phase === PHASE.PASS2 && !director.verificationSweep ? 'targeted-cleanup' : 'sweep'),
     elevation: pose.att.elevation,
     roll: pose.att.roll,
     compass: pose.compassHeading,
@@ -513,6 +586,12 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     confidence: Float32Array.from(seg.confidence),
     flags: Uint8Array.from(seg.flags)
   });
+  recordCaptureDecision('accepted', {
+    pose,
+    t,
+    accepted: true,
+    detail: { keyframeIndex: kf.index, captureKind: kf.captureKind }
+  });
 
   if (probe.active) {
     probe.frames++;
@@ -533,7 +612,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   // only decides whether the images travel inside the .horizon-project file.
   captureThumb(kf, capturedFrame);
 
-  if (director.phase === PHASE.PASS2) {
+  if (director.phase === PHASE.PASS2 && !director.verificationSweep) {
     director.refreshTargets();
     if (!director.targets.length) log('info', 'All sectors verified.');
   }
@@ -851,11 +930,12 @@ function solveRotationTests() {
     } else if (solved.scaleFromSweep !== null) {
       log('warn', `The motion implied a gyro scale of ${solved.scaleFromSweep}, too far from 1 to trust. Leaving it at 1; loop closure will absorb the difference.`);
     }
-    // If the lens is already known for this device there is nothing to
-    // measure, and asking anyway would be busywork with a worse answer.
-    if (camera.focalSource === 'known-device' || camera.focalSource === 'manual') {
+    // A manual value is an operator decision. A known-device value is only a
+    // seed: the reconstruction showed the saved vertical angles fit a lens a
+    // few degrees away from the table value, so real captures should verify it.
+    if (camera.focalSource === 'manual') {
       const i = camera.intrinsics();
-      log('info', `Skipping the lens step — this device's lens is already pinned at ${i.hfovDeg.toFixed(1)}° x ${i.vfovDeg.toFixed(1)}° (${camera.focalSource}).`);
+      log('info', `Skipping the lens step — the operator pinned this lens at ${i.hfovDeg.toFixed(1)}° x ${i.vfovDeg.toFixed(1)}° (${camera.focalSource}).`);
       brief('settle');
       return;
     }
@@ -987,8 +1067,9 @@ function finishLens(r) {
     syncFovReadout();
   } else {
     log('warn', 'LENS_NOT_MEASURED', JSON.stringify(r || {}));
+    const prior = camera.focalSource === 'known-device' ? 'known-device prior' : 'default';
     log('warn',
-      `Lens NOT measured — continuing on the ${camera.hfovDeg.toFixed(0)}° default. `
+      `Lens NOT measured — continuing on the ${camera.hfovDeg.toFixed(0)}° ${prior}. `
       + 'Altitudes are only as good as that figure, and if it is wrong they are wrong by the same factor and by more toward the frame edges. '
       + 'Azimuth is unaffected. You can measure it later from Advanced and press Recompute from keyframes.');
   }
@@ -1024,6 +1105,23 @@ function skipSensorTest() {
 }
 
 /* -------------------------------------------------------------- transitions */
+
+function logCaptureGaps(label) {
+  const report = captureGapReport(survey.keyframes, survey.yawDatum || 0);
+  const latest = report.passes[report.passes.length - 1];
+  if (!latest?.gaps.length) {
+    log('info', `${label}: no photo-overlap gaps detected; median step ${latest?.medianStepDeg ?? '—'}°.`);
+    return report;
+  }
+  log('warn', `${label}: ${latest.gaps.length} photo-overlap gap(s) need another view.`);
+  for (const gap of latest.gaps.slice(0, 8)) {
+    log('warn',
+      `Frames ${gap.fromFrame}→${gap.toFrame} are ${gap.stepDeg.toFixed(1)}° apart with ${(gap.estimatedOverlap * 100).toFixed(0)}% estimated overlap`
+      + `${gap.uncoveredDeg > 0 ? ` and ${gap.uncoveredDeg.toFixed(1)}° with no image coverage` : ''}. `
+      + `Capture ${gap.recommendedPhotoCount} more view(s) at ${gap.recaptureLabels.join(', ')}.`);
+  }
+  return report;
+}
 
 async function startCapture() {
   try {
@@ -1099,8 +1197,27 @@ async function finishPass1() {
   }
 
   survey.reproject(camera.intrinsics());
+  logCaptureGaps('First lap');
   director.beginPass2();
   log('info', `Verification pass planned: ${director.targets.length} sector(s) need more evidence.`);
+  updateReport();
+  syncControls();
+}
+
+function finishVerificationPass() {
+  director.verificationSweep = false;
+  survey.recompute();
+  const gapReport = logCaptureGaps('Verification lap');
+  director.refreshTargets();
+  if (!director.targets.length) return finishSurvey();
+
+  const target = director.pickNearestTarget(currentHeading());
+  const photoGapCount = gapReport.passes[gapReport.passes.length - 1]?.gapCount || 0;
+  const centre = target ? wrap360(target.fromDeg + target.widthDeg / 2) : null;
+  log('warn',
+    `Verification lap finished, but ${director.targets.length} cleanup target(s) remain`
+    + `${photoGapCount ? `, including ${photoGapCount} source-photo overlap gap(s)` : ''}. `
+    + (target ? `Follow the guide to ${centre.toFixed(1)}° for the nearest one.` : ''));
   updateReport();
   syncControls();
 }
@@ -1132,6 +1249,8 @@ function resetSurvey() {
   survey.reset();
   director.phase = PHASE.IDLE;
   director.pass1Travel = 0;
+  director.pass2Travel = 0;
+  director.verificationSweep = false;
   director.targets = [];
   director.target = null;
   state.fusedYaw = 0;
@@ -1150,6 +1269,7 @@ function resetSurvey() {
   state.visualSign = null;
   state.signSamples = [];
   state.sensorCal = { stage: 'idle', startedAt: 0 };
+  state.captureAudit = { counts: {}, events: [], lastReason: null, lastAt: 0 };
   state.obstructionProbe = {
     active: false, anchorYaw: null, startedAt: 0, frames: 0,
     lastCaptureAt: 0, parallax: false
@@ -1187,7 +1307,18 @@ function renderLive() {
     visualQuality: state.visualQuality,
     jitterDeg: orientation.jitterDeg,
     calStalledMs: director.phase === 'calibrating' ? performance.now() - (state.calibStart || performance.now()) : 0,
-    hfovDeg: camera.hfovDeg
+    hfovDeg: camera.hfovDeg,
+    // Everything the live coverage-loss warning needs already existed in state;
+    // it just had to reach the director. `sinceKeyframeMs` and
+    // `travelSinceKeyframeDeg` are measured from the last ACCEPTED keyframe, so
+    // they grow for exactly as long as the gates are refusing.
+    hasAcceptedFrame: survey.keyframes.length > 0,
+    sinceKeyframeMs: state.lastKeyframeAt ? performance.now() - state.lastKeyframeAt : 0,
+    travelSinceKeyframeDeg: state.fusedYawAtKeyframe === null
+      ? 0
+      : angDiff(state.fusedYaw, state.fusedYawAtKeyframe),
+    lastRejectReason: state.captureAudit.lastReason,
+    glareFraction: state.glareFraction
   };
   let d = director.directive(ctx);
   if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
@@ -1542,7 +1673,20 @@ function syncControls() {
     return;
   }
   if (p === PHASE.ANALYSING) { btn.textContent = 'Analysing…'; btn.disabled = true; return; }
-  if (p === PHASE.PASS2) { btn.textContent = 'Finish survey'; btn.disabled = false; return; }
+  if (p === PHASE.PASS2) {
+    if (director.verificationSweep) {
+      const coverage = survey.coverage();
+      const enough = Math.abs(director.pass2Travel) >= 300 || coverage.verifiedBins >= 700;
+      btn.textContent = enough
+        ? 'Finish verification lap'
+        : `Keep turning - ${Math.abs(director.pass2Travel).toFixed(0)} degrees of 360 degrees (${coverage.verifiedBins} bins verified)`;
+      btn.disabled = !enough;
+    } else {
+      btn.textContent = 'Finish survey';
+      btn.disabled = false;
+    }
+    return;
+  }
   if (p === PHASE.COMPLETE) { btn.textContent = 'Start a new survey'; btn.disabled = false; return; }
   btn.textContent = 'Working…'; btn.disabled = true;
 }
@@ -1562,7 +1706,9 @@ function onPrimary() {
     return finishLens((r.ready || r.salvageable) ? r : null);
   }
   if (p === PHASE.PASS1) return finishPass1();
-  if (p === PHASE.PASS2) return finishSurvey();
+  if (p === PHASE.PASS2) {
+    return director.verificationSweep ? finishVerificationPass() : finishSurvey();
+  }
   if (p === PHASE.COMPLETE) return resetSurvey();
 }
 
@@ -1890,6 +2036,13 @@ async function buildPanorama() {
     status.textContent = 'No keyframes yet. Run a survey, or load a session, then build.';
     return;
   }
+  // A refinement belongs to one exact set of intrinsics and source photos.
+  // Never let diagnostics from a previous build masquerade as the pose used by
+  // a later sensor-only or failed-optimization build.
+  for (const kf of kfs) {
+    delete kf.bundleQuaternion;
+    delete kf.bundleMovedDeg;
+  }
   const label = btn.textContent;
   btn.disabled = true; btn.textContent = 'Building…';
   status.textContent = `Reprojecting ${kfs.length} keyframes…`;
@@ -1902,16 +2055,46 @@ async function buildPanorama() {
       ? await loadKeyframeSources(kfs)
       : { sources: [], found: 0 };
 
+    let renderKeyframes = kfs;
+    let renderYawDatum = survey.yawDatum || 0;
+    let optimization = { applied: false, reason: wantImagery ? 'not-run' : 'imagery-disabled' };
+    if (wantImagery && found >= 2) {
+      status.textContent = `Matching fixed features below the skyline in ${found} photos…`;
+      const refined = await optimisePanoramaRotations({
+        keyframes: kfs,
+        sources,
+        yawDatum: renderYawDatum,
+        onProgress: progress => {
+          if (progress.stage === 'features') {
+            status.textContent = `Finding fixed features below the skyline: ${progress.completed}/${progress.total} photos…`;
+          } else if (progress.stage === 'matching') {
+            status.textContent = `Checking photo overlaps: ${progress.completed}/${progress.total} pairs, ${progress.verifiedPairs} verified…`;
+          } else {
+            status.textContent = `Refining azimuth while holding elevation to gravity…`;
+          }
+        }
+      });
+      renderKeyframes = refined.keyframes;
+      renderYawDatum = refined.yawDatum;
+      optimization = refined.diagnostics;
+      if (optimization.applied) {
+        for (let i = 0; i < kfs.length; i++) {
+          kfs[i].bundleQuaternion = renderKeyframes[i].bundleQuaternion;
+          kfs[i].bundleMovedDeg = renderKeyframes[i].bundleMovedDeg;
+        }
+      }
+    }
+
     const pxPerDeg = Number($('panoScale').value) || 6;
     const maxAlt = Number($('maxAltSelect').value) || 60;
     const opts = { pxPerDeg, altMin: -10, altMax: Math.min(89, maxAlt + 2), azStart: 0 };
 
     const t0 = performance.now();
     const mosaic = buildMosaic({
-      keyframes: kfs, sources, yawDatum: survey.yawDatum || 0, ...opts
+      keyframes: renderKeyframes, sources, yawDatum: renderYawDatum, ...opts
     });
-    const tracks = skylineTracks(kfs, survey.yawDatum || 0, opts);
-    const dis = disagreementByBin(kfs, survey.yawDatum || 0);
+    const tracks = skylineTracks(renderKeyframes, renderYawDatum, opts);
+    const dis = disagreementByBin(renderKeyframes, renderYawDatum);
     const ms = performance.now() - t0;
 
     const ctx = $('pano').getContext('2d');
@@ -1926,7 +2109,10 @@ async function buildPanorama() {
       (survey.yawDatum || 0).toFixed(4),
       kfs.length,
       (kfs[0] && kfs[0].tanHalfH || 0).toFixed(5),
-      (kfs[kfs.length - 1] && kfs[kfs.length - 1].tanHalfH || 0).toFixed(5)
+      (kfs[kfs.length - 1] && kfs[kfs.length - 1].tanHalfH || 0).toFixed(5),
+      optimization.applied
+        ? `vision:${optimization.verifiedPairs}:${optimization.rmsDeg.toFixed(5)}:${optimization.maxMovedDeg.toFixed(5)}`
+        : `sensor:${optimization.reason || 'none'}`
     ].join('|');
     if (state.pano.landmarks.length && state.pano.geomKey && state.pano.geomKey !== geomKey) {
       state.pano.stale = true;
@@ -1935,17 +2121,27 @@ async function buildPanorama() {
     state.pano.geomKey = geomKey;
     state.pano.opts = opts;
     state.pano.layout = layout;
+    state.pano.optimization = optimization;
     renderLandmarks();
     panoBuilt = true;
     $('panoSaveBtn').disabled = false;
 
     const coverage = mosaic.painted / (mosaic.width * mosaic.height) * 100;
     status.textContent = found
-      ? `${kfs.length} keyframes, ${found} with imagery, ${coverage.toFixed(0)}% of the sky panel painted, ${ms.toFixed(0)} ms.`
+      ? `${kfs.length} keyframes, ${found} with imagery, ${coverage.toFixed(0)}% of the sky panel painted, ${ms.toFixed(0)} ms.${optimization.applied ? ` Vision refined ${optimization.verifiedPairs} photo pairs while limiting tilt correction to ${optimization.maxTiltMovedDeg.toFixed(2)}°.` : ''}`
       : `${kfs.length} keyframes, geometry only — no photos were captured this session. Images are collected automatically during a survey; if this says zero, the camera was not delivering frames when the keyframes were taken. ("Embed keyframe images in archive", under Advanced, is a different thing — it only controls what goes into an exported archive.)`;
 
-    $('panoFindings').textContent = panoramaFindings(dis, mosaic, found, kfs);
-    log('info', `Diagnostic panorama built: ${kfs.length} keyframes, imagery for ${found}, ${coverage.toFixed(1)}% painted, ${ms.toFixed(0)} ms.`);
+    $('panoFindings').textContent = panoramaFindings(dis, mosaic, found, renderKeyframes, optimization);
+    log('info', `Diagnostic panorama built: ${kfs.length} keyframes, imagery for ${found}, ${coverage.toFixed(1)}% painted, ${ms.toFixed(0)} ms.`, optimization);
+    const fc = optimization?.focalCheck;
+    if (fc?.measured && Math.abs(fc.scale - 1) > 0.03) {
+      log('warn', `The lens is ${((fc.scale - 1) * 100).toFixed(1)}% wider than recorded: ${fc.statedVfovDeg.toFixed(2)}° vertical was stated, ${fc.fittedVfovDeg.toFixed(2)}° measured from ${fc.pairCount} same-bearing pairs on different laps (r=${fc.correlation.toFixed(3)}). The panorama uses the measured value; the 720-bin profile still uses the stated one. Re-measure the lens under Advanced before the next survey.`, {
+        statedVfovDeg: fc.statedVfovDeg, fittedVfovDeg: fc.fittedVfovDeg,
+        scale: fc.scale, pairCount: fc.pairCount, correlation: fc.correlation
+      });
+    } else if (fc?.measured) {
+      log('info', `Lens confirmed from ${fc.pairCount} repeat views: ${fc.fittedVfovDeg.toFixed(2)}° vertical against ${fc.statedVfovDeg.toFixed(2)}° stated (r=${fc.correlation.toFixed(3)}).`);
+    }
   } catch (e) {
     status.textContent = `Could not build the panorama: ${e && e.message || e}`;
     log('error', 'Panorama build failed', { error: String(e && e.stack || e) });
@@ -1959,13 +2155,43 @@ async function buildPanorama() {
  * which fault it is, and they are deliberately stated as measurements with
  * their own caveats rather than as verdicts.
  */
-function panoramaFindings(dis, mosaic, found, kfs) {
+function panoramaFindings(dis, mosaic, found, kfs, optimization = null) {
   const lines = [];
   const spans = dis.filter(d => d.n >= 2).map(d => d.span).sort((a, b) => a - b);
   const q = f => spans.length ? spans[Math.min(spans.length - 1, Math.floor(f * (spans.length - 1)))] : NaN;
   const med = q(0.5), p95 = q(0.95);
 
   lines.push(`bins with 2+ independent looks   ${spans.length} of ${BIN_COUNT}`);
+  if (optimization?.applied) {
+    lines.push(`visual rotation refinement       ${optimization.verifiedPairs} verified photo pairs, ${optimization.verifiedMatchCount} matches`);
+    lines.push(`visual residual                  ${optimization.rmsDeg.toFixed(3)}° RMS; max yaw move ${optimization.maxYawMovedDeg.toFixed(2)}°, max tilt move ${optimization.maxTiltMovedDeg.toFixed(2)}°`);
+    lines.push('Elevation remained tied to the gravity-derived sensor pose; vision was allowed to correct mainly azimuth.');
+  } else if (found && optimization) {
+    lines.push(`visual rotation refinement       not applied (${optimization.reason})`);
+  }
+  // The lens, measured against the survey's own repeat views. This is reported
+  // whether or not it changed anything, because "we checked and it was right"
+  // is a different statement from "we did not check", and the 2026-08-15
+  // capture went out on a field of view nobody had ever checked.
+  const fc = optimization?.focalCheck;
+  if (fc && fc.measured) {
+    lines.push(`lens measured from repeat views  ${fc.statedVfovDeg.toFixed(2)}° -> ${fc.fittedVfovDeg.toFixed(2)}° vertical`);
+    lines.push(`                                 ${fc.pairCount} same-bearing pairs from different laps, r=${fc.correlation.toFixed(3)}`);
+    if (Math.abs(fc.scale - 1) > 0.03) {
+      lines.push('');
+      lines.push(`The stated field of view was out by ${((fc.scale - 1) * 100).toFixed(1)}%. That is`);
+      lines.push('worth nothing at the centre of a frame and about a degree at its');
+      lines.push('edge, which is where neighbouring frames are supposed to agree.');
+      lines.push('The panorama above uses the measured value. Re-run the guided lens');
+      lines.push('step before the next survey so the profile gets it too.');
+    }
+  } else if (fc && found) {
+    lines.push(`lens check from repeat views     not measured (${fc.reason}, ${fc.pairCount} usable pairs)`);
+    if (fc.reason === 'too-few-repeat-views') {
+      lines.push('  A second lap over the same bearings, at a slightly different');
+      lines.push('  elevation, is what makes the lens measurable from the survey.');
+    }
+  }
   if (spans.length) {
     lines.push(`inter-frame skyline disagreement median ${med.toFixed(2)}°  p95 ${p95.toFixed(2)}°`);
     // Calibrated against tests/panorama.test.mjs: correct intrinsics on
@@ -2005,6 +2231,16 @@ function panoramaFindings(dis, mosaic, found, kfs) {
   if (gaps) lines.push(`\nbins never observed             ${gaps}  (hatched in the image)`);
   const single = dis.filter(d => d.n === 1).length;
   if (single) lines.push(`bins seen by one frame only     ${single}  (no cross-check possible)`);
+
+  const photoGaps = captureGapReport(survey.keyframes, survey.yawDatum || 0);
+  if (photoGaps.gapCount) {
+    lines.push('');
+    lines.push(`source-photo overlap gaps        ${photoGaps.gapCount}`);
+    for (const gap of photoGaps.gaps.slice(0, 8)) {
+      lines.push(`  pass ${gap.pass}, frames ${gap.fromFrame}→${gap.toFrame}: ${(gap.estimatedOverlap * 100).toFixed(0)}% overlap; recapture at ${gap.recaptureLabels.join(', ')}`);
+    }
+    lines.push('These are measured from the saved photo axes and field of view, not inferred from the finished panorama.');
+  }
 
   if (!found) {
     lines.push('');
@@ -2129,6 +2365,11 @@ async function exportCaptureDebugZip() {
       azimuthOffsetDeg: Number($('azOffset').value) || 0,
       project,
       snapshot,
+      captureAudit: {
+        counts: { ...state.captureAudit.counts },
+        events: state.captureAudit.events.slice()
+      },
+      panoramaOptimization: state.pano?.optimization || null,
       debugText: buildDebugBundle(),
       logText: L.dump()
     });
@@ -2203,7 +2444,14 @@ function debugSnapshot() {
       trackingLost: state.trackingLost,
       fusedYaw: state.fusedYaw,
       pass1Travel: director.pass1Travel,
+      pass2Travel: director.pass2Travel,
       keyframes: survey.keyframes.length,
+      captureGaps: captureGapReport(survey.keyframes, survey.yawDatum || 0),
+      captureAudit: {
+        counts: { ...state.captureAudit.counts },
+        eventCount: state.captureAudit.events.length,
+        lastEvent: state.captureAudit.events[state.captureAudit.events.length - 1] || null
+      },
       keyframeSources: {
         sweep: survey.keyframes.filter(k => k.captureKind !== 'obstruction-probe').length,
         highObstruction: survey.keyframes.filter(k => k.captureKind === 'obstruction-probe').length
@@ -2216,6 +2464,7 @@ function debugSnapshot() {
       },
       coverage: survey.coverage()
     },
+    panoramaOptimization: state.pano?.optimization || null,
     preflight: preflight.result(),
     platform: {
       userAgent: navigator.userAgent,

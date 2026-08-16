@@ -1,6 +1,8 @@
 'use strict';
 import { wrap360, angDiff, clamp } from './math3d.js';
 import { BIN_STEP, BIN_COUNT, STATUS } from './survey.js';
+import { captureGapReport, bearingLabel } from './capture-gaps.js';
+import { captureStall } from './capture-policy.js';
 
 export const PHASE = {
   IDLE: 'idle',
@@ -84,6 +86,8 @@ export class ScanDirector {
     this.calibrationProgress = 0;
     this.pass1Start = null;
     this.pass1Travel = 0;
+    this.pass2Travel = 0;
+    this.verificationSweep = false;
     this.target = null;         // {fromDeg, toDeg} sector being rescanned
     this.targets = [];
     this.lastDirective = null;
@@ -112,19 +116,48 @@ export class ScanDirector {
     this.setPhase(PHASE.PASS1);
     this.pass1Start = headingDeg;
     this.pass1Travel = 0;
+    this.pass2Travel = 0;
+    this.verificationSweep = false;
     this.survey.pass = 1;
   }
 
   notePass1Travel(deltaDeg) { this.pass1Travel += deltaDeg; }
+  notePass2Travel(deltaDeg) { this.pass2Travel += deltaDeg; }
 
   beginPass2() {
     this.setPhase(PHASE.PASS2);
     this.survey.pass = 2;
+    this.pass2Travel = 0;
     this.refreshTargets();
+    // Verification requires observations from two independent passes. A
+    // normal first lap therefore has zero verified bins and needs another
+    // dense lap, not a request to hold on the centre of one 360-degree target.
+    this.verificationSweep = this.survey.coverage().verifiedBins === 0;
   }
 
   refreshTargets() {
-    this.targets = this.survey.weakSectors(1.0).slice(0, 24);
+    const weak = this.survey.weakSectors(1.0).map(target => ({ ...target, kind: 'weak-skyline' }));
+    const report = captureGapReport(this.survey.keyframes, this.survey.yawDatum || 0);
+    // Cleanup concerns the lap just completed. A gap in pass 1 that was filled
+    // during pass 2 no longer needs another visit; a gap repeated in pass 2 is
+    // exactly where an offline stitcher will be unable to connect the photos.
+    const latest = report.passes[report.passes.length - 1];
+    const photoGaps = (latest?.gaps || []).flatMap(gap =>
+      (gap.recaptureAzimuthsDeg || [gap.targetAzimuthDeg]).map((targetAzimuthDeg, targetIndex) => {
+        const widthDeg = clamp((gap.desiredMaximumStepDeg || 12) * 0.25, 6, 10);
+        const fromDeg = wrap360(targetAzimuthDeg - widthDeg / 2);
+        return {
+          kind: 'photo-gap',
+          fromDeg,
+          toDeg: wrap360(fromDeg + widthDeg),
+          widthDeg,
+          targetAzimuthDeg,
+          targetLabel: gap.recaptureLabels?.[targetIndex] || `${targetAzimuthDeg.toFixed(1)}°`,
+          gap
+        };
+      })
+    );
+    this.targets = [...photoGaps, ...weak].slice(0, 24);
     this.target = this.targets[0] || null;
     return this.targets;
   }
@@ -184,8 +217,23 @@ export class ScanDirector {
     }
 
     if (this.phase === PHASE.PASS1) {
+      // Losing coverage outranks every frame-level complaint. The frame message
+      // says what is wrong with the current view; this one says what it has
+      // already cost and where to go to get it back.
+      const stalled = this._captureStall(ctx);
+      if (stalled) return stalled;
       const blocking = this._frameProblem(ctx);
       if (blocking) return blocking;
+      // The loop-closure hunt has no upper bound of its own: when the visual
+      // match never lands, "keep turning until the view matches" is an
+      // instruction to turn forever. One field capture ran to 714 degrees on
+      // it, which put both physical laps inside pass 1 and left the survey with
+      // no independent verification at all.
+      if (Math.abs(this.pass1Travel) > 400) {
+        return say('fix', 'Stop — the lap is done',
+          `${Math.abs(this.pass1Travel).toFixed(0)}° covered, which is more than a full circle. The starting view never matched visually, so the app cannot close the loop for you. Tap the button below to close the lap and start the verification lap — turning further only adds photographs to a pass that is already complete.`,
+          0);
+      }
       if (this.pass1Travel > 12) {
         return say('fix', 'Turn counter-clockwise', 'The survey is accumulating in the clockwise direction. Reverse direction and continue counter-clockwise.', -1);
       }
@@ -220,6 +268,31 @@ export class ScanDirector {
     }
 
     if (this.phase === PHASE.PASS2) {
+      if (this.verificationSweep) {
+        const stalled = this._captureStall(ctx);
+        if (stalled) return stalled;
+        const blocking = this._frameProblem(ctx);
+        if (blocking) return blocking;
+        if (this.pass2Travel > 12) {
+          return say('fix', 'Turn counter-clockwise', 'The verification lap must continue in the same direction as the first lap.', -1);
+        }
+        if (ctx.overlap != null && ctx.overlap < M.minOverlap) {
+          const back = Math.max(4, Math.round((M.targetOverlap - ctx.overlap) * ctx.hfovDeg));
+          return say('fix', `Return ${back} degrees clockwise`, 'Insufficient overlap with the last accepted verification frame.', +back);
+        }
+        if (ctx.rotationRate > M.maxRate) {
+          return say('fix', 'Slow down', `${ctx.rotationRate.toFixed(0)} degrees/s will start to blur verification frames.`, +1);
+        }
+        const progress = clamp(Math.abs(this.pass2Travel) / 360, 0, 1);
+        const verified = this.survey.coverage().verifiedBins;
+        if (Math.abs(this.pass2Travel) >= 358) {
+          return say('good', 'Verification lap complete', `Tap Finish verification lap. ${verified} of 720 bins currently agree across both passes.`, -1, progress);
+        }
+        if (Math.abs(ctx.rotationRate) < 1.5) {
+          return say('work', 'Rotate counter-clockwise again', `${Math.abs(this.pass2Travel).toFixed(0)} degrees of the verification lap covered.`, -1, progress);
+        }
+        return say('good', 'Collecting verification lap', `${Math.abs(this.pass2Travel).toFixed(0)} degrees of 360 degrees covered; ${verified} bins verified so far.`, -1, progress);
+      }
       if (!this.targets.length) return say('good', 'All sectors verified', 'Finish the survey to generate the report.');
       const t = this.pickNearestTarget(ctx.heading);
       const centre = wrap360(t.fromDeg + t.widthDeg / 2);
@@ -231,18 +304,89 @@ export class ScanDirector {
 
       if (Math.abs(delta) > 12) {
         return say('work', `Turn ${delta > 0 ? 'right' : 'left'} ${Math.abs(delta).toFixed(0)}°`,
-          `${remaining} sector${remaining > 1 ? 's' : ''} still unverified. Next: ${t.fromDeg.toFixed(1)}°–${t.toDeg.toFixed(1)}°.`,
+          t.kind === 'photo-gap'
+            ? `${remaining} capture target${remaining > 1 ? 's' : ''} remain. The source photos across this gap have only ${(t.gap.estimatedOverlap * 100).toFixed(0)}% overlap; return to ${t.targetLabel} for another image.`
+            : `${remaining} sector${remaining > 1 ? 's' : ''} still unverified. Next: ${t.fromDeg.toFixed(1)}°–${t.toDeg.toFixed(1)}°.`,
           delta > 0 ? +Math.abs(delta) : -Math.abs(delta));
       }
       if (Math.abs(delta) > 3) {
         return say('work', `Nudge ${delta > 0 ? 'right' : 'left'} ${Math.abs(delta).toFixed(0)}°`, 'Centre the highlighted sector in the frame.', delta > 0 ? +1 : -1);
       }
       if (ctx.stillness < 0.5) return say('fix', 'Hold still', 'Collecting confirmation frames for this sector.');
-      return say('good', 'Holding on target', `Confirming ${t.fromDeg.toFixed(1)}°–${t.toDeg.toFixed(1)}°.`, 0);
+      return say('good', t.kind === 'photo-gap' ? 'Filling photo gap' : 'Holding on target',
+        t.kind === 'photo-gap'
+          ? `Capturing extra overlap at ${t.targetLabel}. Keep the phone in the same position.`
+          : `Confirming ${t.fromDeg.toFixed(1)}°–${t.toDeg.toFixed(1)}°.`, 0);
     }
 
     if (this.phase === PHASE.VALIDATING) return say('work', 'Validating', 'Checking coverage, spread, and loop closure.');
     return say('good', 'Survey complete', 'Review the report, then export.');
+  }
+
+  /**
+   * Nothing has been recorded for a while — say so, say why, and say where to
+   * go back to.
+   *
+   * The recovery bearing is the edge of what is still recoverable, not the
+   * middle of the hole. Turning back to the midpoint leaves the far side of the
+   * gap just as unmatched as it was; turning back to `returnDeg` restores
+   * overlap with the last frame that actually exists.
+   */
+  _captureStall(ctx) {
+    const stall = captureStall({
+      sinceMs: ctx.sinceKeyframeMs,
+      travelDeg: ctx.travelSinceKeyframeDeg,
+      hfovDeg: ctx.hfovDeg,
+      reason: ctx.lastRejectReason,
+      hasAcceptedFrame: ctx.hasAcceptedFrame !== false
+    });
+    if (!stall.stalled) return null;
+
+    const cause = this._stallCause(ctx, stall);
+    if (stall.kind === 'waiting') {
+      return {
+        tone: 'warn',
+        headline: `Nothing recorded for ${stall.elapsedSec.toFixed(0)} s`,
+        detail: `${cause} Hold this bearing until a photograph is accepted — moving on now leaves a hole here that a second lap will not fill, because the same thing will happen at the same bearing.`,
+        arrow: 0, tilt: null, phase: this.phase, stall
+      };
+    }
+
+    // Where the operator has to return to. Signed against the direction of
+    // travel, which for this app is always counter-clockwise.
+    const sign = ctx.travelSinceKeyframeDeg < 0 ? +1 : -1;
+    const backDeg = Math.round(stall.returnDeg);
+    const target = Number.isFinite(ctx.heading)
+      ? ` — back to about ${bearingLabel(wrap360(ctx.heading + sign * stall.returnDeg))}`
+      : '';
+    return {
+      tone: 'fix',
+      headline: `Turn back ${backDeg}°${backDeg > 30 ? ' — coverage lost' : ''}`,
+      detail: `${stall.sweptDeg.toFixed(0)}° swept with no photograph accepted${stall.elapsedSec >= 1 ? ` over ${stall.elapsedSec.toFixed(0)} s` : ''}${target}. ${cause}${stall.uncoveredDeg > 0 ? ` ${stall.uncoveredDeg.toFixed(0)}° of the circle now has no image at all.` : ''}`,
+      arrow: sign * Math.max(1, backDeg), tilt: null, phase: this.phase, stall
+    };
+  }
+
+  /** Why the gates are refusing, in something an operator can act on outdoors. */
+  _stallCause(ctx, stall) {
+    if (ctx.glareFraction > 0.02) {
+      return 'The sun is in the frame, so the exposure has collapsed and the sky boundary cannot be traced. Shade the lens with your hand, put the sun behind a tree or the roofline, or come back when it is higher or lower.';
+    }
+    const byStatus = {
+      noSky: 'No sky is visible, so there is no boundary to measure.',
+      allSky: 'No obstruction is visible, so there is no boundary to measure.',
+      clippedTop: 'The obstruction runs off the top of the frame, so its height is unknown here.',
+      tooDark: 'It is too dark here for the sky boundary to be found.',
+      trackingLost: 'Visual tracking is lost, so azimuth cannot be advanced.',
+      parallax: 'The phone has moved sideways, not just turned.',
+      tooHigh: 'The camera is too close to straight up.'
+    };
+    if (byStatus[ctx.frameStatus]) return byStatus[ctx.frameStatus];
+    if (stall.reason === 'motion-too-fast') return 'Every frame here was turning too fast to record.';
+    if (stall.reason === 'segmentation-error' || stall.reason === 'no-synchronized-frame') {
+      return 'The camera is not delivering frames the segmenter can use.';
+    }
+    return 'The frame gates have refused every candidate along this arc.';
   }
 
   /** Frame-level problems that make the current view unusable. */

@@ -328,6 +328,13 @@ export class Survey {
     const runs = [];
     let start = -1;
     const bad = i => this.bins[i].status !== STATUS.VERIFIED;
+    // A normal first lap has zero verified bins by definition: verification
+    // requires observations from two passes. The circular run below has no
+    // good bin at which to close an all-bad run, so it used to return [] and
+    // falsely announce that every sector was verified. Preserve the full ring.
+    if (this.bins.every((_, i) => bad(i))) {
+      return [{ fromDeg: 0, toDeg: 0, widthDeg: 360 }];
+    }
     for (let i = 0; i < BIN_COUNT * 2; i++) {
       const idx = i % BIN_COUNT;
       if (bad(idx)) { if (start < 0) start = i; }
