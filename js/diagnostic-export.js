@@ -197,9 +197,9 @@ function framesCsv(frames) {
   return `${columns.join(',')}\r\n${rows.join('\r\n')}\r\n`;
 }
 
-function readme(photoCount, keyframeCount, missing) {
+function readme(photoCount, keyframeCount, missing, appVersion) {
   return [
-    'Horizon Scanner capture debug archive',
+    `Horizon Scanner capture debug archive${appVersion ? ` — app ${appVersion}` : ''}`,
     '',
     `Photos included: ${photoCount} of ${keyframeCount} keyframes.`,
     missing.length ? `Keyframes missing a stored photo: ${missing.join(', ')}.` : 'Every keyframe has a stored photo.',
@@ -234,7 +234,7 @@ function readme(photoCount, keyframeCount, missing) {
 
 /** Build the single-download source-photo + metadata + log archive. */
 export async function buildCaptureDebugZip({
-  siteName, sessionId, keyframes, photos, yawDatumDeg = 0,
+  siteName, sessionId, appVersion = null, keyframes, photos, yawDatumDeg = 0,
   azimuthOffsetDeg = 0, project, debugText, logText, snapshot,
   captureAudit = null, panoramaOptimization = null,
   scanCoverage = null, coverageImage = null
@@ -301,6 +301,9 @@ export async function buildCaptureDebugZip({
     format: 'horizon-capture-debug',
     version: 2,
     exportedAt: exportedAt.toISOString(),
+    // Which build produced this capture. Without it, a field failure cannot be
+    // tied to the code that caused it, which is how 2026-08-17 began.
+    appVersion: appVersion || null,
     sessionId: sessionId || null,
     site: project?.site || { name: siteName || '' },
     capture: project?.capture || null,
@@ -326,7 +329,7 @@ export async function buildCaptureDebugZip({
   };
 
   entries.unshift(
-    { name: 'README.txt', data: readme(includedPhotos, keyframes.length, missing), modifiedAt: exportedAt },
+    { name: 'README.txt', data: readme(includedPhotos, keyframes.length, missing, appVersion), modifiedAt: exportedAt },
     { name: 'metadata/session.json', data: json(session), modifiedAt: exportedAt },
     { name: 'metadata/keyframes.json', data: json(frames), modifiedAt: exportedAt },
     { name: 'metadata/keyframes.csv', data: framesCsv(frames), modifiedAt: exportedAt },

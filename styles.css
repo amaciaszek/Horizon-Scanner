@@ -417,3 +417,13 @@ details[open] > *:not(summary) { margin-top: 14px; }
           line-height: 1; padding: 2px 6px; border-radius: 6px; }
 .lm-del:hover, .lm-del:focus-visible { color: var(--coral); background: var(--panel-2); }
 .pano { cursor: crosshair; }
+
+/* Build identity. Small, quiet, and always present — the point is that the
+   question "is this iPad on the right version" is answered by looking. */
+.build {
+  margin-top: 2px;
+  font: 500 0.66rem/1 var(--mono);
+  letter-spacing: .04em;
+  color: var(--ink-2);
+  opacity: .75;
+}

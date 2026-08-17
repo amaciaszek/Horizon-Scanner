@@ -90,6 +90,7 @@ flowchart TD
 | `workers/vision.worker.js` | Coarse-to-fine normalized-correlation registration between sequential frames and loop closure. |
 | `js/survey.js` | Keyframes, projection into 720 bins, robust aggregation, weak sectors, loop correction, focal estimation, report and grade. |
 | `js/guide.js` | Capture state machine and human-readable instructions. |
+| `js/version.js` | Build identity, stamped into the header, log and archives. |
 | `js/coverage.js` | Per-bearing coverage confidence from every processed frame. |
 | `js/guidance.js` | The guidance dot: where to ask the operator to point next. |
 | `js/capture-policy.js` | Keyframe spacing and motion thresholds. |
@@ -724,6 +725,48 @@ The original source ZIP was not modified.
 - Fixed the all-unverified-ring weak-sector case so it cannot falsely report no
   work remaining.
 
+### 2026-08-17: a build that recorded nothing, and what now prevents it
+
+A field session produced no skyline overlay, no coverage, no guidance dot and no
+keyframes. The cause was one line: `js/main.js` called `exposureOf(...)` without
+importing it, so `processFrame` threw a ReferenceError on its very first
+statement, every frame, 1201 times. Everything downstream — segmentation,
+coverage, guidance, keyframe admission — sat behind that throw.
+
+Four things were wrong beyond the missing import, and each is now fixed:
+
+- **The failure was silent.** The error went to the log; the screen showed a
+  normal interface and 0%. Frame errors are now counted, and once the pipeline
+  has failed repeatedly having never processed a frame, the directive line says
+  so in as many words and tells the operator not to survey.
+- **The archive was gated on having keyframes.** The one button that would have
+  carried the logs, snapshot, audit and coverage map home was greyed out
+  precisely because the session had failed. It is never gated now; a failed
+  survey is worth more evidence than a good one, not less.
+- **Nothing could have caught it.** `node --check` parses a file and says
+  nothing about whether a name resolves, and no test touches `main.js`, which
+  needs a DOM, a camera and motion sensors to run one line.
+  `tests/module-references.test.mjs` now checks that every named import
+  resolves to a real export, and that every name used in call position is
+  declared, imported or a known global, across all 26 modules. It reproduces
+  the original bug as a fixture.
+- **The build on the device was unidentifiable.** See below.
+
+The remaining gap is honest and unclosed: no automated test executes
+`processFrame`. The reference checker catches unresolved names, which is the
+class of failure that occurred, but not a logic error inside the loop. A
+DOM-and-camera harness that runs the real capture loop is the next thing worth
+building.
+
+### Version stamping
+
+`js/version.js` holds `VERSION` and `BUILD_DATE`. **Bump `VERSION` with any
+change that goes to a device.** It appears under the title in the header, in the
+first line of the field log, in the debug snapshot, and in `session.json` and
+`README.txt` inside every archive — so "is the iPad running the right build" is
+answered by looking, and any capture can be tied back to the code that produced
+it.
+
 ### Coverage-guided scanning (the guidance dot)
 
 The scan is no longer an instruction to turn 360 degrees. A moving target is
@@ -994,6 +1037,8 @@ focused tests include:
   are excluded rather than averaged in, and thin evidence refuses;
 - `capture-stall.test.mjs`: coverage-loss detection, mode-specific overlap
   floors, glare attribution, and the pass-1 over-travel thresholds;
+- `module-references.test.mjs`: every import resolves and every call target
+  exists — the net under the 2026-08-17 failure;
 - `coverage-guidance.test.mjs`: what earns coverage and what does not, that
   coverage is never taken away, and above all that the dot does not advance
   when the phone turns through 360 degrees on worthless frames;

@@ -1,10 +1,11 @@
 'use strict';
 import * as L from './log.js';
+import { VERSION, BUILD_DATE, RELEASE_NOTE, versionLabel } from './version.js';
 import {
   clamp, wrap360, angDiff, screenQuat, quatFromEuler, quatRotate,
   cameraRay, vecToAzAlt, quatMul, yawQuat, DEG, RAD
 } from './math3d.js';
-import { CameraSource, WORK_W, WORK_H, LUMA_W, LUMA_H } from './camera.js';
+import { CameraSource, exposureOf, WORK_W, WORK_H, LUMA_W, LUMA_H } from './camera.js';
 import { OrientationSource } from './orientation.js';
 import { Survey, RULES, BIN_COUNT, BIN_STEP, STATUS } from './survey.js';
 import { ScanDirector, PHASE } from './guide.js';
@@ -84,6 +85,10 @@ const state = {
   guidanceTrail: [],
   lastGuidanceSampleAt: 0,
   lastGuidanceState: null,
+  /* A build that throws every frame must be visible on the glass, not only in
+   * a log nobody opens until they get home. */
+  frameErrors: 0,
+  lastFrameError: null,
   frameCount: 0,
   prevGyroYaw: null,
   trackingLost: false,
@@ -598,7 +603,23 @@ async function processFrame() {
 
     orientation.sampleDatum();
   } catch (err) {
-    log('error', 'Frame processing failed:', err);
+    /*
+     * A frame that throws is not a bad frame — it is a broken build.
+     *
+     * On 2026-08-17 a missing import made this throw on every single frame for
+     * an entire field session. It was logged 1201 times and the operator saw
+     * none of it: the picture had no skyline, the coverage sat at 0%, the
+     * guidance dot never appeared, and the honest conclusion available from the
+     * screen was "the new version is broken somehow". Twelve hundred silent
+     * errors is a worse outcome than one loud one, so the first few now go to
+     * the directive line where the operator is already looking, and the survey
+     * refuses to pretend it is running.
+     */
+    state.frameErrors++;
+    state.lastFrameError = String(err && err.message || err);
+    if (state.frameErrors <= 3 || state.frameErrors % 200 === 0) {
+      log('error', `Frame processing failed (${state.frameErrors} so far): ${state.lastFrameError}`, err);
+    }
   } finally {
     state.processing = false;
   }
@@ -1433,6 +1454,8 @@ function resetSurvey() {
   state.guidance = null;
   state.guidanceTrail = [];
   state.lastGuidanceState = null;
+  state.frameErrors = 0;
+  state.lastFrameError = null;
   state.obstructionProbe = {
     active: false, anchorYaw: null, startedAt: 0, frames: 0,
     lastCaptureAt: 0, parallax: false
@@ -1526,6 +1549,15 @@ function renderLive() {
     guidance: state.guidance
   };
   let d = director.directive(ctx);
+  // Nothing the director has to say matters if the pipeline is dead.
+  if (state.frameErrors > 5 && state.frameCount === 0) {
+    d = {
+      tone: 'fix',
+      headline: 'This build is broken — do not survey',
+      detail: `Frame processing has failed ${state.frameErrors} times and no frame has ever been processed. Nothing is being measured or recorded. Reload the page; if it persists, this version is faulty and needs reporting. Last error: ${state.lastFrameError}`,
+      arrow: null, tilt: null, phase: director.phase
+    };
+  }
   if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
     const flat = orientation.screenFlatnessDeg();
     const notDown = flat === null || flat > 15;
@@ -1739,7 +1771,24 @@ function updateReport() {
   $('exportHznBtn').disabled = !(complete && (gated || forced));
   $('exportHzn2Btn').disabled = !(survey.coverage().observedBins > 0);
   $('exportProjectBtn').disabled = survey.keyframes.length === 0 && survey.coverage().observedBins === 0;
-  $('exportCaptureZipBtn').disabled = survey.keyframes.length === 0;
+  /*
+   * The diagnostic archive is never gated on having keyframes.
+   *
+   * It used to require at least one, which is exactly backwards: on
+   * 2026-08-17 a build threw on every frame, so no keyframe was ever accepted,
+   * so the one button that would have carried the logs, the state snapshot, the
+   * capture audit and the coverage map home was greyed out — and the session
+   * that most needed diagnosing was the session that could export the least. A
+   * failed survey is worth more evidence than a good one, not less.
+   *
+   * With no photographs the archive still contains everything except photos,
+   * and it says so plainly in its own README rather than pretending.
+   */
+  const zipBtn = $('exportCaptureZipBtn');
+  zipBtn.disabled = false;
+  zipBtn.textContent = survey.keyframes.length
+    ? `Download source photos + debug ZIP (${survey.keyframes.length})`
+    : 'Download debug ZIP (no photos captured yet)';
   $('exportHint').textContent = !complete
     ? 'Some bins hold no altitude yet. Fill the gaps or finish the survey before writing a .hzn.'
     : gated ? 'The survey passes its acceptance rules. Safe to write.'
@@ -2574,7 +2623,6 @@ function downloadBlob(blob, filename) {
 
 async function exportCaptureDebugZip() {
   const btn = $('exportCaptureZipBtn');
-  const label = btn.textContent;
   btn.disabled = true;
   btn.textContent = 'Building ZIP...';
   try {
@@ -2586,6 +2634,7 @@ async function exportCaptureDebugZip() {
     const result = await buildCaptureDebugZip({
       siteName: $('siteName').value,
       sessionId: state.sessionId,
+      appVersion: `${VERSION} (${BUILD_DATE})`,
       keyframes: survey.keyframes,
       photos,
       yawDatumDeg: survey.yawDatum || 0,
@@ -2632,8 +2681,10 @@ async function exportCaptureDebugZip() {
   } catch (err) {
     log('error', 'Could not build capture debug ZIP:', err);
   } finally {
-    btn.textContent = label;
-    btn.disabled = survey.keyframes.length === 0;
+    // updateStats owns this button's label and enabled state; it re-runs on the
+    // next tick and will restore both, including the keyframe count.
+    btn.disabled = false;
+    updateStats();
   }
 }
 
@@ -2667,6 +2718,8 @@ async function shareDebugBundle() {
 function debugSnapshot() {
   return {
     generatedAt: new Date().toISOString(),
+    appVersion: VERSION,
+    appBuildDate: BUILD_DATE,
     phase: director.phase,
     sensorCalibrationStage: state.sensorCal.stage,
     orientation: orientation.health(),
@@ -3117,7 +3170,12 @@ if (!window.isSecureContext) {
 updateReport();
 refreshSessions();
 syncControls();
-log('info', 'Horizon Survey ready.', JSON.stringify({
+// On the glass, and first in the log. Whether the device is running the build
+// you think it is should be answerable by looking at it.
+$('buildLabel').textContent = versionLabel();
+$('buildLabel').title = RELEASE_NOTE;
+log('info', `Horizon Survey ${versionLabel()} ready.`, JSON.stringify({
+  version: VERSION, buildDate: BUILD_DATE,
   ua: navigator.userAgent, secure: window.isSecureContext,
   dpr: window.devicePixelRatio || 1, screen: `${screen.width}x${screen.height}`,
   workers: typeof Worker !== 'undefined', idb: 'indexedDB' in window
