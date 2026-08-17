@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["-m", "http.server", "8642"],
       "port": 8642
+    },
+    {
+      "name": "stitch-lab",
+      "runtimeExecutable": ".venv-stitch/Scripts/python.exe",
+      "runtimeArgs": ["-m", "http.server", "8644", "--directory", "lab"],
+      "port": 8644
     }
   ]
 }

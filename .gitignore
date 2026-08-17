@@ -1,0 +1,5 @@
+.venv-stitch/
+stitch-out/
+sweep/
+__pycache__/
+lab/

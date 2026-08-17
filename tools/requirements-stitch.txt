@@ -1,2 +1,4 @@
+# Verified working on Python 3.14.6, Windows, 2026-08-17.
+# Nothing else is needed; both wheels install without a compiler.
 numpy>=2.0,<3
-opencv-contrib-python-headless>=4.10,<6
+opencv-contrib-python-headless>=5.0,<6

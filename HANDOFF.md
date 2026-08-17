@@ -91,6 +91,7 @@ flowchart TD
 | `js/survey.js` | Keyframes, projection into 720 bins, robust aggregation, weak sectors, loop correction, focal estimation, report and grade. |
 | `js/guide.js` | Capture state machine and human-readable instructions. |
 | `js/version.js` | Build identity, stamped into the header, log and archives. |
+| `tools/stitch_lab.py` | Offline reference stitcher. See tools/README-stitch-lab.md. |
 | `js/coverage.js` | Per-bearing coverage confidence from every processed frame. |
 | `js/guidance.js` | The guidance dot: where to ask the operator to point next. |
 | `js/capture-policy.js` | Keyframe spacing and motion thresholds. |
@@ -724,6 +725,45 @@ The original source ZIP was not modified.
 - Made pass 2 a real dense verification lap before targeted cleanup.
 - Fixed the all-unverified-ring weak-sector case so it cannot falsely report no
   work remaining.
+
+### Offline stitching: tools/stitch_lab.py
+
+A separate handoff lives at **`tools/README-stitch-lab.md`** and is the document
+to read before touching stitching. Summary only, here.
+
+The 91-frame capture of 2026-08-17 21:23 stitches accurately offline. Measured
+on that capture, the same renderer fed solved rotations rather than raw sensor
+poses moves the median pairwise residual from 1.046 to 0.103 degrees, the worst
+from 68.3 to 0.96, and the overlap disagreement from 51.8 to 34.0 out of 255.
+The house goes from doubled windows and smeared clapboard to sharp.
+
+What produced that, in order of how much it mattered:
+
+- **SIFT.** 159,719 features, median 1,872 per frame, against the browser's 220.
+  This is the largest single lever and the one open portability question.
+- **Rotation-only model.** Three angles per frame plus one shared focal, solved
+  by Gauss-Newton on a 274x274 dense system. Not a per-pair homography, whose
+  eight parameters absorb parallax and drift into a plausible-looking lie.
+- **Gravity held, azimuth freed.** Tilt prior a hundred times the yaw prior.
+  Frames moved a median 2.2 degrees from the sensors, almost all of it yaw.
+- **Prune then re-solve.** Dropping matches beyond 0.8 degrees after convergence
+  and solving again took the worst residual from 65.8 degrees to under one.
+- **Feathered blending** instead of the browser's nearest-axis hard cuts.
+
+The measured focal scale was 0.9916, so the stated lens was right to within 1%
+on this device and lens calibration is not the current problem.
+
+What remains is parallax, not misalignment: overlap disagreement sits at 97 out
+of 255 at p95 with geometric residual already at a tenth of a degree. The house
+is twelve metres away, the optical centre moves a few centimetres as the
+operator pivots, and no rotation can put both views of a roofline in the same
+place. Blending averages them into a roofline in neither. The plan is exposure
+compensation, then seam cutting, then multiband blending — described in full in
+the stitching handoff.
+
+The governing constraint on that work: **nothing in the Python reference that
+could not be reimplemented in JavaScript.** Python is the laboratory, not the
+product.
 
 ### The tilt runaway, and why it wrecked the panorama (v0.9.2)
 

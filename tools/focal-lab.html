@@ -80,11 +80,16 @@ try {
     yawCorrection: r.orientation.stitchYawCorrectionDeg,
     elevation: r.pointing.centerAltitudeDeg,
     roll: r.pointing.rollDeg,
-    // The saved contour belongs to the capture-time raster and cannot be
-    // rotated into another one-value-per-column curve, so offline runs use the
-    // whole frame. Clear sky has no corners, which does most of that work.
-    boundary: null,
-    height: TH
+    // The saved contour belongs to the capture-time raster, and where a frame
+    // was rolled it cannot be re-expressed exactly as one value per column in
+    // this one. Offline runs used to pass null and rely on clear sky having no
+    // corners. That was measuring something the app never does — at capture time
+    // the boundary is always present — and the approximation costs less than the
+    // difference it was hiding: on the reference capture, supplying it moves the
+    // solved residual from 0.1969 to 0.1882 degrees and removes 876 matches that
+    // were sitting on cloud.
+    boundary: r.analysis?.boundary || null,
+    height: 288
   }));
 
   const t0 = performance.now();
@@ -93,11 +98,15 @@ try {
     yieldFn: () => new Promise(r => setTimeout(r, 0))
   });
   const d = res.diagnostics;
+  window.__diag = d;                 // for poking at from a console or a driver
   say(`\nran in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
 
   say(`\nROTATION REFINEMENT  applied=${d.applied}  (${d.reason})`);
   say(`  ${d.verifiedPairs} verified pairs, ${d.solverMatchCount} solver matches`);
-  say(`  residual ${d.rmsDeg?.toFixed(4)}° RMS`);
+  say(`  residual ${d.rmsDeg?.toFixed(4)}° RMS`
+    + (d.pruneApplied
+      ? `  (first pass ${d.firstPassRmsDeg?.toFixed(4)}°, then ${d.prunedDropped} matches pruned and re-solved)`
+      : `  (prune not applied; ${d.prunedDropped} would have gone)`));
   say(`  moved: max ${d.maxMovedDeg?.toFixed(3)}°, of which tilt ${d.maxTiltMovedDeg?.toFixed(3)}°`);
 
   const f = d.focalCheck;
