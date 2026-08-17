@@ -55,6 +55,10 @@ const keyframes = [0, 1].map(index => ({
     }
   },
   quat: [1, 0, 0, 0],
+  // A post-capture lens measurement moved the panorama render but must not
+  // touch the capture record.
+  bundleFocalScale: index === 0 ? 1.0655 : 1.0655,
+  exposure: { luma: 118.4 + index, saturatedFraction: index === 0 ? 0.0 : 0.031 },
   screenAngle: 0,
   yawRaw: index * 15,
   yawFused: index * 15.25,
@@ -92,6 +96,24 @@ const result = await buildCaptureDebugZip({
     counts: { accepted: 2, 'motion-too-fast': 3 },
     events: [{ reason: 'motion-too-fast', accepted: false, headingDeg: 41 }]
   },
+  scanCoverage: {
+    binSizeDeg: 2, binCount: 180, coveredBins: 171, fraction: 0.95,
+    complete: false, remainingDeg: 18, coverageThreshold: 0.75,
+    tuning: { binSizeDeg: 2, coverageThreshold: 0.75, minObservations: 5 },
+    guidance: { state: 'waiting', bearingDeg: 212.5, targetBearingDeg: 212.5, waitingSec: 6.4,
+      tuning: { leadDeg: 7, hysteresisDeg: 12 } },
+    gaps: [{ fromDeg: 204, toDeg: 222, widthDeg: 18, centreDeg: 213 }],
+    bearings: [
+      { bearingDeg: 1, score: 0.98, creditedFrames: 31, sweptFrames: 33, covered: true },
+      { bearingDeg: 213, score: 0.11, creditedFrames: 1, sweptFrames: 26, covered: false }
+    ],
+    trail: [
+      { performanceMs: 41200, headingDeg: 210.4, dotBearingDeg: 212.5, state: 'waiting',
+        coveredFraction: 0.95, frameQuality: 0.02, credited: false, frameStatus: 'noSky',
+        yawRateDegPerSec: 8.1, elevationDeg: 3.2, rollDeg: 1.1, glareFraction: 0.07 }
+    ]
+  },
+  coverageImage: new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: 'image/png' }),
   panoramaOptimization: { applied: true, verifiedPairs: 1, rmsDeg: 0.2 },
   debugText: 'DEBUG DATA',
   logText: 'FIELD LOG'
@@ -121,6 +143,25 @@ check('surrounding raw motion samples survive', frames[0].gyroscope.motionWindow
   && frames[0].gyroscope.motionWindow[0].offsetFromFrameMs === -0.5);
 check('capture timing stays attached to its photo', frames[0].captureTiming.videoFrame.mediaTimeSec === 8.2
   && frames[0].captureTiming.processingLatencyMs === 42);
+// The archive has to be able to say which optics the panorama was drawn with,
+// without ever rewriting which optics the photograph was taken through.
+check('capture-time intrinsics are untouched by the render correction',
+  frames[0].camera.tanHalfHorizontal === 0.5 && frames[0].camera.tanHalfVertical === 0.375
+  && frames[0].camera.focalPx === 384);
+check('render intrinsics are exported separately and labelled',
+  frames[0].renderCamera
+  && frames[0].renderCamera.appliedFocalScale === 1.0655
+  && Math.abs(frames[0].renderCamera.tanHalfHorizontal - 0.5 * 1.0655) < 1e-9
+  && Math.abs(frames[0].renderCamera.tanHalfVertical - 0.375 * 1.0655) < 1e-9
+  && /panorama render only/.test(frames[0].renderCamera.appliesTo));
+check('the render correction keeps pixels square',
+  Math.abs(frames[0].renderCamera.tanHalfHorizontal / frames[0].renderCamera.tanHalfVertical
+    - frames[0].camera.tanHalfHorizontal / frames[0].camera.tanHalfVertical) < 1e-12);
+check('per-photo exposure is exported for the frame it was measured on',
+  frames[0].analysis.exposure.saturatedFraction === 0
+  && frames[1].analysis.exposure.saturatedFraction === 0.031
+  && frames[1].analysis.exposure.meanLuma === 119.4);
+
 check('exact cover crop and exposure settings stay attached',
   frames[0].captureTiming.coverFit.visibleRectScreenAligned.y === 555
   && frames[0].captureTiming.track.exposureTime === 0.01);
@@ -129,11 +170,41 @@ check('skyline columns include projected angles', frames[0].analysis.skylineSamp
   && Number.isFinite(frames[0].analysis.skylineSamples[0].azimuthDeg)
   && Number.isFinite(frames[0].analysis.skylineSamples[0].altitudeDeg));
 const audit = JSON.parse(new TextDecoder().decode(parsed.files.get('metadata/capture-audit.json')));
+// Coverage-guided scanning has to be diagnosable from the archive alone: if the
+// dot sat somewhere for twenty seconds, the reason has to be in here.
+const scanCoverage = JSON.parse(new TextDecoder().decode(parsed.files.get('metadata/scan-coverage.json')));
+check('the coverage map is in the archive', scanCoverage.binCount === 180 && scanCoverage.coveredBins === 171);
+check('the tuning that produced it travels with it',
+  scanCoverage.tuning.coverageThreshold === 0.75 && scanCoverage.guidance.tuning.leadDeg === 7);
+check('per-bearing evidence separates credited frames from swept-past ones',
+  scanCoverage.bearings[1].creditedFrames === 1 && scanCoverage.bearings[1].sweptFrames === 26,
+  'the distinction that says "you passed here and got nothing"');
+check('where the dot was, and why it was not moving',
+  scanCoverage.guidance.state === 'waiting'
+  && scanCoverage.guidance.bearingDeg === 212.5
+  && scanCoverage.trail[0].frameQuality === 0.02
+  && scanCoverage.trail[0].frameStatus === 'noSky');
+check('the rendered coverage picture is included',
+  parsed.files.has('coverage-map.png') && parsed.files.get('coverage-map.png').length === 4);
+const sessionJson = JSON.parse(new TextDecoder().decode(parsed.files.get('metadata/session.json')));
+check('the session summary points at it',
+  sessionJson.scanCoverage.coveredBins === 171
+  && sessionJson.scanCoverage.guidanceState === 'waiting');
+const readmeText = new TextDecoder().decode(parsed.files.get('README.txt'));
+check('the README explains how to read it',
+  readmeText.includes('scan-coverage.json') && readmeText.includes('coverage-map.png')
+  && readmeText.includes('frameQuality'));
+
 check('capture rejection reasons survive', audit.counts['motion-too-fast'] === 3
   && audit.events[0].headingDeg === 41);
 const optimisation = JSON.parse(new TextDecoder().decode(parsed.files.get('metadata/panorama-optimization.json')));
 check('visual optimisation residual survives', optimisation.applied && optimisation.rmsDeg === 0.2);
 const manifest = JSON.parse(new TextDecoder().decode(parsed.files.get('metadata/stitch-manifest.json')));
+check('the stitch manifest carries both lenses',
+  manifest.images[0].tanHalfHorizontal === 0.5
+  && Math.abs(manifest.images[0].renderTanHalfHorizontal - 0.5 * 1.0655) < 1e-9
+  && manifest.images[0].appliedFocalScale === 1.0655
+  && /never rewritten/.test(manifest.intrinsicsPolicy));
 check('stitch manifest ties image, pose, intrinsics, and crop together',
   manifest.images[0].path === 'photos/keyframe-0000.jpg'
   && manifest.images[0].placedQuaternion.length === 4

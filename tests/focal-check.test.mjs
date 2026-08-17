@@ -15,9 +15,16 @@
  * the scenery slid vertically over how far the camera tilted IS the focal
  * length. Run over the real capture's own photographs at 220 features per
  * frame, every combination of thresholds tried put the vertical field of view
- * between 48.1 and 48.8 degrees against an offline reference of 48.2, with
- * correlations from 0.994 to 0.998. At 160 features the same code wandered
- * between 49.6 and 50.8, which is why the density is pinned upstream.
+ * between 49.3 and 50.4 degrees, with correlations from 0.994 to 0.998. At 160
+ * features the same code wandered between 50.6 and 52.5, which is why the
+ * density is pinned upstream in panorama-optimize.js.
+ *
+ * The synthetic fixture below uses 48.26 degrees as its ground truth, which is
+ * the figure the offline analysis reported for the real capture. That is a
+ * coincidence of history and not a target: the fixture only has to prove the
+ * estimator returns whatever lens the virtual camera was actually given. The
+ * real capture's own answer is the 49.3-50.4 above, higher than 48.26 because
+ * the offline fit carried the on-axis bias that `residualAt` exists to avoid.
  */
 import { extractFeatures } from '../js/bundle.js';
 import { crossLapFocalCheck } from '../js/focal-check.js';
@@ -38,7 +45,7 @@ const rng = s => () => {
 
 const OBJECTS = (() => {
   const r = rng(20260816);
-  return Array.from({ length: 1600 }, () => ({
+  return Array.from({ length: 700 }, () => ({
     az: (r() * 2 - 1) * Math.PI,
     alt: (r() - 0.5) * 1.4,
     s: 0.004 + r() * 0.016,
@@ -59,7 +66,7 @@ function worldTexture(d) {
   return Math.max(8, Math.min(247, v));
 }
 
-const TW = 200, TH = 267;                       // portrait, like the corrected frames
+const TW = 160, TH = 213;                       // portrait, like the corrected frames
 const TRUE_TAN_V = Math.tan(48.26 / 2 * DEG);   // the lens the camera really has
 const TRUE_TAN_H = TRUE_TAN_V * (TW / TH);
 const STATED_SCALE = 1 / 1.0655;                // the pinned known-device entry
@@ -116,14 +123,39 @@ function buildSurvey({ count = 16, stepDeg = 22, lap2Offset = 7, statedScale = 1
   return { keyframes, sources };
 }
 
+/*
+ * Rendering is by far the expensive part of this fixture, and almost every
+ * scenario below photographs the SAME world from the SAME poses — what varies is
+ * only what the keyframes claim about the lens, the pass number or the recorded
+ * elevation. Rendering once and re-labelling the metadata took this file from
+ * 111 seconds to a few, which matters because a suite nobody will sit through
+ * is a suite that stops being run.
+ */
+const BASE = buildSurvey({ statedScale: 1 });
+const BASE_FEATURES = new Map();
+const featuresOf = (target = 220) => {
+  if (!BASE_FEATURES.has(target)) {
+    BASE_FEATURES.set(target, BASE.sources.map((s, i) =>
+      extractFeatures(s, BASE.keyframes[i], { target })));
+  }
+  return BASE_FEATURES.get(target);
+};
+/** The shared capture, re-labelled. `edit` may change any keyframe field. */
+const survey = (edit = k => k) => ({
+  keyframes: BASE.keyframes.map((k, i) => edit({ ...k }, i)),
+  sources: BASE.sources
+});
+const statedAt = scale => (k => ({
+  ...k, tanHalfH: TRUE_TAN_H * scale, tanHalfV: TRUE_TAN_V * scale
+}));
+
 const featuresFor = (sources, keyframes, target = 220) =>
   sources.map((s, i) => extractFeatures(s, keyframes[i], { target }));
 
 console.log('=== A pinned lens that is 6% wrong is measured back out ===');
 {
-  const { keyframes, sources } = buildSurvey({ statedScale: STATED_SCALE });
-  const features = featuresFor(sources, keyframes);
-  const r = crossLapFocalCheck({ keyframes, features });
+  const { keyframes } = survey(statedAt(STATED_SCALE));
+  const r = crossLapFocalCheck({ keyframes, features: featuresOf() });
   console.log(`   ${r.pairCount} repeat-view pairs, correlation ${r.correlation?.toFixed(4)}`);
   for (const row of r.pairs.slice(0, 4)) {
     console.log(`     ${row.from}->${row.to}  dElev ${row.elevationChangeDeg.toFixed(2)}°  ` +
@@ -140,19 +172,18 @@ console.log('=== A pinned lens that is 6% wrong is measured back out ===');
 
 console.log('\n=== A correct lens is not disturbed ===');
 {
-  const { keyframes, sources } = buildSurvey({ statedScale: 1 });
-  const r = crossLapFocalCheck({ keyframes, features: featuresFor(sources, keyframes) });
+  const { keyframes } = survey(statedAt(1));
+  const r = crossLapFocalCheck({ keyframes, features: featuresOf() });
   console.log(`   ${r.pairCount} pairs, fitted ${r.fittedVfovDeg?.toFixed(2)}°`);
   check('stays within 2% of unity', Math.abs(r.scale - 1) < 0.02, `${r.scale.toFixed(4)}`);
 }
 
 console.log('\n=== Without a second lap there is nothing to measure ===');
 {
-  const { keyframes, sources } = buildSurvey({ statedScale: STATED_SCALE });
+  const { keyframes } = survey(statedAt(STATED_SCALE));
   const single = keyframes.filter(k => k.pass === 1);
-  const singleSources = sources.slice(0, single.length);
   const r = crossLapFocalCheck({
-    keyframes: single, features: featuresFor(singleSources, single)
+    keyframes: single, features: featuresOf().slice(0, single.length)
   });
   check('refuses rather than guessing', r.measured === false, r.reason);
   check('leaves the lens exactly alone', r.scale === 1, `${r.scale}`);
@@ -174,20 +205,80 @@ console.log('\n=== Two physical laps both labelled pass 1 are still found ===');
   // The capture this was written for labelled every frame pass 1, because loop
   // closure never matched and the survey never advanced. Pass number alone
   // would have found nothing; the time separation is what saves it.
-  const { keyframes, sources } = buildSurvey({ statedScale: STATED_SCALE });
-  const mislabelled = keyframes.map(k => ({ ...k, pass: 1 }));
-  const r = crossLapFocalCheck({
-    keyframes: mislabelled, features: featuresFor(sources, mislabelled)
-  });
+  const { keyframes: mislabelled } = survey(k => ({ ...statedAt(STATED_SCALE)(k), pass: 1 }));
+  const r = crossLapFocalCheck({ keyframes: mislabelled, features: featuresOf() });
   check('finds the repeat views anyway', r.pairCount >= 5, `${r.pairCount} pairs`);
   check('and still measures the lens', r.measured === true, r.reason);
 }
 
+console.log('\n=== Every pair is accounted for in the evidence ===');
+{
+  const { keyframes } = survey(statedAt(STATED_SCALE));
+  const r = crossLapFocalCheck({ keyframes, features: featuresOf() });
+  check('each kept pair says whether it was used in the fit',
+    r.pairs.length > 0 && r.pairs.every(p => typeof p.used === 'boolean'));
+  check('each kept pair carries its own evidence',
+    r.pairs.every(p => Number.isFinite(p.elevationChangeDeg)
+      && Number.isFinite(p.medianShiftV) && Number.isFinite(p.horizontalShiftSpread)
+      && Number.isFinite(p.matchCount)));
+  check('rejected pairs are listed with a reason',
+    Array.isArray(r.rejectedPairs) && r.rejectedPairs.every(p => typeof p.reason === 'string'));
+  check('the per-pair lens estimates are reported',
+    Array.isArray(r.perPairScales) && r.perPairScales.length === r.pairCount,
+    `${r.perPairScales.length} scales`);
+  check('an uncertainty is reported alongside the answer',
+    Number.isFinite(r.fittedVfovUncertaintyDeg),
+    `±${r.fittedVfovUncertaintyDeg?.toFixed(2)}°`);
+  console.log(`   ${r.fittedVfovDeg.toFixed(2)}° ± ${r.fittedVfovUncertaintyDeg.toFixed(2)}°, pairs agree to ${r.scaleAgreementMad.toFixed(4)}`);
+}
+
+console.log('\n=== Pairs that disagree about the lens are not averaged in ===');
+{
+  // A pair whose scenery moved for reasons other than the camera turning —
+  // parallax on a near roofline is the case that matters — implies a different
+  // focal length from the rest. The consensus band must exclude it rather than
+  // splitting the difference, because splitting the difference produces a
+  // confident number that is wrong by however much the outlier pulled.
+  const features = featuresOf();
+  const { keyframes } = survey(statedAt(STATED_SCALE));
+  const clean = crossLapFocalCheck({ keyframes, features });
+
+  // Corrupt one frame's recorded elevation. Its pair now implies a lens that
+  // disagrees with every other pair, which is the signature being tested.
+  const { keyframes: poisoned } = survey((k, i) => i === 16
+    ? { ...statedAt(STATED_SCALE)(k), elevation: k.elevation + 5 }
+    : statedAt(STATED_SCALE)(k));
+  const dirty = crossLapFocalCheck({ keyframes: poisoned, features });
+  console.log(`   clean ${clean.fittedVfovDeg.toFixed(2)}°, with one bad pair ${dirty.fittedVfovDeg.toFixed(2)}°`);
+  check('the outlier is identified rather than absorbed',
+    dirty.rejectedPairs.some(p => p.reason === 'disagrees-with-other-pairs')
+    || dirty.pairs.some(p => p.used === false),
+    `${dirty.rejectedPairs.length} rejected`);
+  check('the answer barely moves',
+    Math.abs(dirty.fittedVfovDeg - clean.fittedVfovDeg) < 0.6,
+    `${Math.abs(dirty.fittedVfovDeg - clean.fittedVfovDeg).toFixed(3)}° shift`);
+}
+
+console.log('\n=== Wholesale disagreement refuses to change the geometry ===');
+{
+  // If the pairs cannot agree at all, there is no lens to report. This is the
+  // guard against a survey shot so close to a building that parallax, not
+  // optics, is what the estimator is looking at.
+  const { keyframes: scrambled } = survey((k, i) => i >= 16
+    ? { ...statedAt(STATED_SCALE)(k), elevation: k.elevation + ((i * 7919) % 13) - 6 }
+    : statedAt(STATED_SCALE)(k));
+  const r = crossLapFocalCheck({ keyframes: scrambled, features: featuresOf() });
+  console.log(`   pairs agree to ${r.scaleAgreementMad?.toFixed(4)}, reason: ${r.reason}`);
+  check('it refuses when the pairs do not concur',
+    r.measured === false, r.reason);
+  check('and leaves the lens exactly alone', r.scale === 1, `${r.scale}`);
+}
+
 console.log('\n=== Feature density is a real dependency, not a preference ===');
 {
-  const { keyframes, sources } = buildSurvey({ statedScale: STATED_SCALE });
-  const thin = crossLapFocalCheck({ keyframes, features: featuresFor(sources, keyframes, 60) });
-  const dense = crossLapFocalCheck({ keyframes, features: featuresFor(sources, keyframes, 220) });
+  const { keyframes } = survey(statedAt(STATED_SCALE));
+  const thin = crossLapFocalCheck({ keyframes, features: featuresOf(60) });
+  const dense = crossLapFocalCheck({ keyframes, features: featuresOf(220) });
   console.log(`   60 features: ${thin.pairCount} pairs, ${thin.fittedVfovDeg?.toFixed(2) ?? 'n/a'}°`);
   console.log(`   220 features: ${dense.pairCount} pairs, ${dense.fittedVfovDeg?.toFixed(2)}°`);
   check('a dense set yields more usable repeat views',

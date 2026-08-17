@@ -1,5 +1,6 @@
 'use strict';
-import { clamp, wrap360, angDiff } from './math3d.js';
+import { clamp, wrap360, angDiff, quatConj } from './math3d.js';
+import { azAltToVec, worldToImage } from './panorama.js';
 import { BIN_COUNT, BIN_STEP, STATUS } from './survey.js';
 
 const COLOR = {
@@ -259,7 +260,124 @@ export function drawProfile(canvas, survey, view) {
 
 /* ------------------------------------------------------- live camera overlay */
 
-export function drawOverlay(canvas, frame, directive) {
+/**
+ * The guidance dot and the coverage strip.
+ *
+ * `guide` is the object `ScanGuidance.update()` returned, plus the pose and
+ * intrinsics needed to place a world bearing on the screen. The dot is drawn
+ * where the camera would actually see that bearing — through the same
+ * projection the panorama uses, roll and all — so following it means physically
+ * turning to put it in the middle of the picture, which is the entire
+ * interaction. When the bearing is off-frame the dot becomes an arrow pinned to
+ * the edge it lies beyond, because a target you cannot find is not guidance.
+ */
+function drawGuidance(ctx, W, H, guide) {
+  if (!guide) return;
+  const { bearingDeg, state, summary, quat, tanHalfH, tanHalfV, altitudeDeg = 0 } = guide;
+
+  // --- the 360-degree coverage strip -------------------------------------
+  // Fixed mapping, north at the left, so a section that has been finished stays
+  // put on screen instead of sliding about as the operator turns. Thin, low
+  // contrast, bottom of frame: it answers "how much is left" at a glance and is
+  // not asking to be studied.
+  // Array-LIKE, not Array: the coverage map hands over its Float32Array
+  // directly to avoid copying 180 floats every frame, and `Array.isArray` says
+  // no to that. Getting this wrong meant the strip silently never drew.
+  const scores = guide.scores;
+  if (summary && scores && scores.length > 0) {
+    const barH = 4;
+    const y = H - 26;
+    const n = scores.length;
+    ctx.fillStyle = 'rgba(8,16,20,0.55)';
+    ctx.fillRect(0, y - 2, W, barH + 4);
+    for (let i = 0; i < n; i++) {
+      const x0 = i / n * W, x1 = (i + 1) / n * W;
+      const score = scores[i];
+      const done = guide.covered && guide.covered[i];
+      ctx.fillStyle = done ? 'rgba(46,199,230,0.95)'
+        : score > 0.25 ? `rgba(46,199,230,${0.18 + score * 0.4})`
+          : 'rgba(232,244,248,0.10)';
+      ctx.fillRect(x0, y, Math.max(1, x1 - x0 + 0.5), barH);
+    }
+    // Where the camera is now, and where the dot is asking for.
+    if (Number.isFinite(guide.headingDeg)) {
+      const x = wrap360(guide.headingDeg) / 360 * W;
+      ctx.fillStyle = 'rgba(232,244,248,0.9)';
+      ctx.fillRect(x - 1, y - 3, 2, barH + 6);
+    }
+    if (Number.isFinite(bearingDeg) && state !== 'complete') {
+      const x = wrap360(bearingDeg) / 360 * W;
+      ctx.fillStyle = COLOR.target;
+      ctx.beginPath();
+      ctx.arc(x, y + barH / 2, 3, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  if (state === 'complete' || !Number.isFinite(bearingDeg) || !quat) return;
+
+  // --- the dot itself -----------------------------------------------------
+  const uv = worldToImage(azAltToVec(bearingDeg, altitudeDeg), quatConj(quat), tanHalfH, tanHalfV);
+  const waiting = state === 'waiting' || state === 'behind';
+  const ink = waiting ? COLOR.weak : COLOR.target;
+
+  if (uv) {
+    const x = (uv[0] + 1) / 2 * W;
+    const y = (1 - uv[1]) / 2 * H;
+    const pulse = waiting ? 0.5 + 0.5 * Math.sin(Date.now() / 260) : 1;
+
+    // A ring rather than a blob: the operator has to be able to see the horizon
+    // through it, since lining the two up is the task.
+    ctx.beginPath();
+    ctx.arc(x, y, 26, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(255,255,255,${0.20 + 0.25 * pulse})`;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(x, y, 13, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,0.92)';
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(x, y, 13, 0, Math.PI * 2);
+    ctx.strokeStyle = ink;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // While it is waiting, say so in the only place the operator is looking.
+    if (waiting) {
+      ctx.beginPath();
+      ctx.arc(x, y, 26 + 8 * (1 - pulse), 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(224,163,60,${0.5 * pulse})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
+    return;
+  }
+
+  // --- off-frame: an arrow at the edge, pointing the way round ------------
+  const delta = angDiff(bearingDeg, guide.headingDeg);
+  const left = delta < 0;
+  const x = left ? 30 : W - 30;
+  const y = H / 2;
+  const dir = left ? -1 : 1;
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = ink;
+  ctx.beginPath();
+  ctx.moveTo(dir * 17, 0);
+  ctx.lineTo(dir * -8, -15);
+  ctx.lineTo(dir * -8, 15);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+  ctx.fillStyle = 'rgba(232,244,248,0.85)';
+  ctx.font = '600 12px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  ctx.fillText(`${Math.abs(delta).toFixed(0)}°`, x, y + 22);
+}
+
+export function drawOverlay(canvas, frame, directive, guide = null) {
   // When the director has declared the frame unusable, draw nothing. A traced
   // line on screen reads as a measurement whatever the confidence chip says.
   if (directive && (directive.headline === 'Too dark to survey' || directive.headline === 'Tracking lost — stop turning')) {
@@ -302,6 +420,8 @@ export function drawOverlay(canvas, frame, directive) {
   ctx.beginPath(); ctx.moveTo(W * 0.12, H / 2); ctx.lineTo(W * 0.88, H / 2); ctx.stroke();
   ctx.beginPath(); ctx.moveTo(W / 2, H * 0.12); ctx.lineTo(W / 2, H * 0.88); ctx.stroke();
 
+  drawGuidance(ctx, W, H, guide);
+
   // Tilt arrows when the director asks for one
   if (directive && directive.tilt) {
     const up = directive.tilt > 0;
@@ -317,3 +437,114 @@ export function drawOverlay(canvas, frame, directive) {
 }
 
 export { COLOR };
+
+/* ------------------------------------------------- coverage map, for export */
+
+/**
+ * Draw the finished coverage map as a standalone picture for the debug archive.
+ *
+ * The JSON beside it has every number, but a ring you can look at answers the
+ * question people actually ask — "where was the dot and why would it not move"
+ * — in about a second. Covered sectors read solid, partly-covered ones fade
+ * with their confidence, and anything the camera swept through without
+ * capturing is marked distinctly from ground never visited at all, because
+ * those two look identical on a plain progress meter and mean opposite things.
+ *
+ * Returns a PNG Blob, or null where the platform has no canvas.
+ */
+export function renderCoverageCard(coverage, guidance = null, { size = 520 } = {}) {
+  if (typeof document === 'undefined') return null;
+  const canvas = document.createElement('canvas');
+  canvas.width = size; canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return null;
+
+  const cx = size / 2, cy = size / 2 + 8;
+  const R = size * 0.40;
+  const inner = R - size * 0.085;
+  const toAngle = az => (az - 90) * Math.PI / 180;
+  const summary = coverage.completeness();
+
+  ctx.fillStyle = '#0a1418';
+  ctx.fillRect(0, 0, size, size);
+
+  for (let i = 0; i < coverage.binCount; i++) {
+    const covered = coverage.isCovered(i);
+    const score = coverage.score[i];
+    const visited = coverage.visited(i);
+    let fill;
+    if (covered) fill = COLOR.verified;
+    else if (score > 0.05) fill = `rgba(46,199,230,${0.15 + score * 0.5})`;
+    // Swept through and not captured is the interesting failure, and it is a
+    // different fact from never having been pointed at. Amber, not blank.
+    else if (visited) fill = 'rgba(224,163,60,0.55)';
+    else fill = '#16262d';
+    const a0 = toAngle(i * coverage.binSizeDeg);
+    const a1 = toAngle((i + 1.03) * coverage.binSizeDeg);
+    ctx.beginPath();
+    ctx.arc(cx, cy, R, a0, a1);
+    ctx.arc(cx, cy, inner, a1, a0, true);
+    ctx.closePath();
+    ctx.fillStyle = fill;
+    ctx.fill();
+  }
+
+  ctx.strokeStyle = COLOR.gridStrong;
+  ctx.lineWidth = 1;
+  for (const r of [R, inner]) { ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke(); }
+
+  ctx.font = '600 13px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  for (const [az, label] of [[0, 'N'], [90, 'E'], [180, 'S'], [270, 'W']]) {
+    const a = toAngle(az);
+    ctx.fillStyle = COLOR.text;
+    ctx.fillText(label, cx + Math.cos(a) * (R + 16), cy + Math.sin(a) * (R + 16));
+  }
+
+  // Where the dot finished, and where the camera was pointing.
+  const mark = (deg, colour, label) => {
+    if (!Number.isFinite(deg)) return;
+    const a = toAngle(deg);
+    ctx.beginPath();
+    ctx.moveTo(cx + Math.cos(a) * (inner - 10), cy + Math.sin(a) * (inner - 10));
+    ctx.lineTo(cx + Math.cos(a) * (R + 4), cy + Math.sin(a) * (R + 4));
+    ctx.strokeStyle = colour; ctx.lineWidth = 2.5; ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cx + Math.cos(a) * (inner - 16), cy + Math.sin(a) * (inner - 16), 5, 0, Math.PI * 2);
+    ctx.fillStyle = colour; ctx.fill();
+    ctx.fillStyle = colour;
+    ctx.font = '600 11px ui-monospace, SFMono-Regular, Menlo, monospace';
+    ctx.fillText(label, cx + Math.cos(a) * (inner - 34), cy + Math.sin(a) * (inner - 34));
+  };
+  if (guidance) {
+    mark(guidance.headingDeg, COLOR.ink, 'cam');
+    if (guidance.state !== 'complete') mark(guidance.bearingDeg, COLOR.target, 'dot');
+  }
+
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillStyle = COLOR.ink;
+  ctx.font = '600 15px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.fillText(`${Math.round(summary.fraction * 100)}% of the horizon covered`, 16, 14);
+  ctx.fillStyle = COLOR.text;
+  ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+  ctx.fillText(`${summary.coveredBins}/${summary.binCount} bins · ${summary.remainingDeg}° remaining` +
+    `${guidance ? ` · target ${guidance.state}` : ''}`, 16, 34);
+
+  ctx.textAlign = 'center';
+  const legend = [['covered', COLOR.verified], ['partial', 'rgba(46,199,230,0.45)'],
+    ['swept, not captured', 'rgba(224,163,60,0.55)'], ['never pointed at', '#16262d']];
+  let x = 18;
+  for (const [label, colour] of legend) {
+    ctx.fillStyle = colour;
+    ctx.fillRect(x, size - 22, 10, 10);
+    ctx.fillStyle = COLOR.text;
+    ctx.textAlign = 'left';
+    ctx.fillText(label, x + 14, size - 21);
+    x += 16 + ctx.measureText(label).width + 12;
+  }
+
+  return new Promise(resolve => {
+    if (typeof canvas.toBlob !== 'function') { resolve(null); return; }
+    canvas.toBlob(blob => resolve(blob), 'image/png');
+  });
+}

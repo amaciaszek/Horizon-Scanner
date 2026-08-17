@@ -193,27 +193,6 @@ export function rayOf(kf, u, v, q, scale = 1) {
   return quatRotate(q, cameraRay(u, v, kf.tanHalfH * scale, kf.tanHalfV * scale));
 }
 
-/**
- * d(world ray)/d(log scale), for the focal-length unknown.
- *
- * Written out rather than differenced numerically because the whole point of
- * the sub-pixel matching upstream is that residuals here are a hundredth of a
- * degree, and a finite difference at that size is mostly rounding.
- */
-function rayFocalDerivative(kf, u, v, q, scale) {
-  const a = u * kf.tanHalfH, b = v * kf.tanHalfV;
-  const x = a * scale, y = b * scale;
-  const L = Math.hypot(x, y, 1);
-  const dot = (a * x + b * y) / (L * L * L);      // p . dp/ds  over |p|^3
-  // d(p/|p|)/ds, then chain through ds/d(lambda) = s.
-  const d = [
-    scale * (a / L - x * dot),
-    scale * (b / L - y * dot),
-    scale * (0 / L + 1 * dot)                      // p_z = -1, so -p_z*dot = +dot
-  ];
-  return quatRotate(q, d);
-}
-
 /** Project a world direction into a keyframe. Returns [u, v] or null. */
 function project(world, qc, tanH, tanV) {
   const c = quatRotate(qc, world);
@@ -386,22 +365,15 @@ function expQuat(w) {
  * such anchor and is exactly what needs freeing.
  */
 export function refineRotations(frames, pairs, {
-  iterations = 30, tiltStiffness = 50, yawStiffness = 0.5, huber = 0.01,
-  solveFocal = false, focalStiffness = 40
+  iterations = 30, tiltStiffness = 50, yawStiffness = 0.5, huber = 0.01
 } = {}) {
   const n = frames.length;
   const q = frames.map(f => f.q.slice());
   let lastCost = Infinity, matchCount = 0;
-  // One focal unknown for the whole survey, held as log scale so the step is
-  // symmetric in "6% wider" and "6% narrower". Per-frame focal was considered
-  // and rejected: the lens does not change during a lap, and n free focal
-  // lengths would let the solver absorb genuine misalignment into fake zoom.
-  let lambda = 0;
 
   for (let iter = 0; iter < iterations; iter++) {
-    const scale = Math.exp(lambda);
-    const fi = 3 * n;                       // index of the focal unknown
-    const N = 3 * n + (solveFocal ? 1 : 0);
+    // Normal equations for the 3n rotation-correction unknowns.
+    const N = 3 * n;
     const H = new Float64Array(N * N);
     const g = new Float64Array(N);
     let cost = 0; matchCount = 0;
@@ -409,8 +381,8 @@ export function refineRotations(frames, pairs, {
     for (const pr of pairs) {
       const { i, j } = pr;
       for (const m of pr.matches) {
-        const da = rayOf(frames[i].kf, m.ua, m.va, q[i], scale);
-        const db = rayOf(frames[j].kf, m.ub, m.vb, q[j], scale);
+        const da = rayOf(frames[i].kf, m.ua, m.va, q[i]);
+        const db = rayOf(frames[j].kf, m.ub, m.vb, q[j]);
         const r = [da[0] - db[0], da[1] - db[1], da[2] - db[2]];
         const rn = Math.hypot(...r);
         // Huber: a handful of wrong matches always survive the ratio test, and
@@ -441,26 +413,6 @@ export function refineRotations(frames, pairs, {
           g[bj + a] -= wgt * gb;
         }
 
-        if (!solveFocal) continue;
-        // Both frames share the one focal length, so the two derivatives
-        // subtract. A pair whose matches all sit at the same image radius
-        // contributes almost nothing here, which is correct: such a pair
-        // genuinely cannot tell you the focal length.
-        const fa = rayFocalDerivative(frames[i].kf, m.ua, m.va, q[i], scale);
-        const fb = rayFocalDerivative(frames[j].kf, m.ub, m.vb, q[j], scale);
-        const Jf = [fa[0] - fb[0], fa[1] - fb[1], fa[2] - fb[2]];
-        let ff = 0, gf = 0;
-        for (let k = 0; k < 3; k++) { ff += Jf[k] * Jf[k]; gf += Jf[k] * r[k]; }
-        H[fi * N + fi] += wgt * ff;
-        g[fi] -= wgt * gf;
-        for (let a = 0; a < 3; a++) {
-          let cia = 0, cja = 0;
-          for (let k = 0; k < 3; k++) { cia += Ja[k][a] * Jf[k]; cja += Jb[k][a] * Jf[k]; }
-          H[(bi + a) * N + fi] += wgt * cia;
-          H[fi * N + bi + a] += wgt * cia;
-          H[(bj + a) * N + fi] += wgt * cja;
-          H[fi * N + bj + a] += wgt * cja;
-        }
       }
     }
 
@@ -474,19 +426,6 @@ export function refineRotations(frames, pairs, {
       H[(b + 2) * N + b + 2] += yawStiffness;
     }
 
-    // The focal prior is a real prior, not the step damping used above: it
-    // carries a gradient that pulls the accumulated scale back toward the
-    // measured lens. The rotations are each anchored by their own sensor
-    // attitude, but the focal length is one unknown shared by every frame with
-    // nothing else holding it, and an unanchored global scale on a nearly
-    // planar match set will wander. Also: this keeps H positive definite when
-    // the matches happen to be uninformative about focal length, so a
-    // degenerate capture returns "no change" instead of failing the solve.
-    if (solveFocal) {
-      H[fi * N + fi] += focalStiffness;
-      g[fi] -= focalStiffness * lambda;
-    }
-
     const delta = solveSPD(H, g, N);
     if (!delta) break;
 
@@ -497,13 +436,6 @@ export function refineRotations(frames, pairs, {
       q[i] = quatMul(expQuat(w), q[i]);        // correction is in the WORLD frame
       const nq = Math.hypot(...q[i]);
       for (let k = 0; k < 4; k++) q[i][k] /= nq;
-    }
-    if (solveFocal && Number.isFinite(delta[fi])) {
-      // Clamp the per-iteration focal step. Gauss-Newton on a scale parameter
-      // can overshoot hard on the first iteration, and a wild scale poisons the
-      // rotation Jacobians for every iteration after it.
-      lambda += Math.max(-0.05, Math.min(0.05, delta[fi]));
-      maxStep = Math.max(maxStep, Math.abs(delta[fi]));
     }
     lastCost = cost;
     if (maxStep < 1e-6) break;
@@ -520,8 +452,7 @@ export function refineRotations(frames, pairs, {
     cost: lastCost,
     rmsDeg: matchCount ? Math.sqrt(lastCost / matchCount) / DEG : null,
     movedDeg: moved,
-    maxMovedDeg: moved.length ? Math.max(...moved) : 0,
-    focalScale: Math.exp(lambda)
+    maxMovedDeg: moved.length ? Math.max(...moved) : 0
   };
 }
 

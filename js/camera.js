@@ -4,6 +4,40 @@ import { clamp, RAD, DEG } from './math3d.js';
 export const WORK_W = 384, WORK_H = 288;   // segmentation working frame
 export const LUMA_W = 160, LUMA_H = 120;   // registration base frame
 
+/** Luminance at or above which a pixel counts as a blown highlight in every
+ *  channel. Bright overcast sits around 200-230 and must not trip it. */
+const SATURATED = 250;
+
+/**
+ * Mean luminance and blown-highlight fraction of one already-captured frame.
+ *
+ * Takes ImageData rather than reading the camera, and that is the whole point.
+ * An earlier version redrew whatever the live video happened to be showing at
+ * the moment it was called, which is a LATER frame than the one segmentation
+ * rejected — and near a low sun, where auto-exposure is hunting hardest and the
+ * device is usually moving, "a later frame" can be a completely different
+ * exposure of a completely different bearing. The capture audit would then
+ * blame glare that was measured somewhere else, which is worse than not
+ * measuring it: it is a plausible wrong answer in the permanent record.
+ *
+ * The dark end was always checked; the bright end never was, and the bright end
+ * is what actually cost a survey. Panning into a low sun collapses the
+ * exposure, floods the frame with flare, and the segmenter — looking for a
+ * contrast boundary — finds nothing it trusts. Every frame is then refused,
+ * silently, for as long as the sun is in view.
+ */
+export function exposureOf(imageData) {
+  const d = imageData?.data;
+  if (!d || !d.length) return null;
+  let sum = 0, hot = 0, n = 0;
+  for (let i = 0; i < d.length; i += 64) {
+    sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    if (d[i] >= SATURATED && d[i + 1] >= SATURATED && d[i + 2] >= SATURATED) hot++;
+    n++;
+  }
+  return n ? { luma: sum / n, saturatedFraction: hot / n } : null;
+}
+
 /**
  * Camera wrapper.
  *
@@ -321,35 +355,9 @@ export class CameraSource {
   /** Mean luminance of the working frame, 0-255. Used to refuse to segment a
    *  scene too dark for a sky boundary to exist in the imagery at all. */
   meanLuma() {
-    return this.exposureStats()?.luma ?? null;
-  }
-
-  /**
-   * Mean luminance and blown-highlight fraction of the working frame, from one
-   * pass over the same sampled pixels.
-   *
-   * The dark end was always checked; the bright end never was, and the bright
-   * end is what actually cost a survey. Panning into a low sun collapses the
-   * auto-exposure, floods the frame with flare, and the segmenter — which is
-   * looking for a contrast boundary — finds nothing it trusts. Every frame is
-   * then refused, silently, for as long as the sun is in view. Measuring the
-   * saturated fraction costs nothing here and is the difference between the app
-   * saying "no sky visible" and the app saying "the sun is in the frame".
-   */
-  exposureStats() {
     if (!this.ready) return null;
     this._drawRotated(this.workCtx, WORK_W, WORK_H);
-    const d = this.workCtx.getImageData(0, 0, WORK_W, WORK_H).data;
-    let sum = 0, hot = 0, n = 0;
-    for (let i = 0; i < d.length; i += 64) {
-      const y = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-      sum += y;
-      // Near-clipped in every channel: a true highlight, not merely a bright
-      // patch of sky. Bright overcast sits around 200-230 and must not trip it.
-      if (d[i] >= 250 && d[i + 1] >= 250 && d[i + 2] >= 250) hot++;
-      n++;
-    }
-    return n ? { luma: sum / n, saturatedFraction: hot / n } : null;
+    return exposureOf(this.workCtx.getImageData(0, 0, WORK_W, WORK_H))?.luma ?? null;
   }
 
   get ready() {

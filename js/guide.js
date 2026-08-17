@@ -2,7 +2,7 @@
 import { wrap360, angDiff, clamp } from './math3d.js';
 import { BIN_STEP, BIN_COUNT, STATUS } from './survey.js';
 import { captureGapReport, bearingLabel } from './capture-gaps.js';
-import { captureStall } from './capture-policy.js';
+import { captureStall, overlapFloor, pass1OverTravel, PASS1_REFUSE_DEG } from './capture-policy.js';
 
 export const PHASE = {
   IDLE: 'idle',
@@ -137,7 +137,8 @@ export class ScanDirector {
 
   refreshTargets() {
     const weak = this.survey.weakSectors(1.0).map(target => ({ ...target, kind: 'weak-skyline' }));
-    const report = captureGapReport(this.survey.keyframes, this.survey.yawDatum || 0);
+    const report = captureGapReport(this.survey.keyframes, this.survey.yawDatum || 0,
+      { minOverlap: overlapFloor(this.mode) });
     // Cleanup concerns the lap just completed. A gap in pass 1 that was filled
     // during pass 2 no longer needs another visit; a gap repeated in pass 2 is
     // exactly where an offline stitcher will be unable to connect the photos.
@@ -229,9 +230,10 @@ export class ScanDirector {
       // instruction to turn forever. One field capture ran to 714 degrees on
       // it, which put both physical laps inside pass 1 and left the survey with
       // no independent verification at all.
-      if (Math.abs(this.pass1Travel) > 400) {
+      const over = pass1OverTravel(this.pass1Travel);
+      if (over.prompt) {
         return say('fix', 'Stop — the lap is done',
-          `${Math.abs(this.pass1Travel).toFixed(0)}° covered, which is more than a full circle. The starting view never matched visually, so the app cannot close the loop for you. Tap the button below to close the lap and start the verification lap — turning further only adds photographs to a pass that is already complete.`,
+          `${over.travelledDeg.toFixed(0)}° covered, which is more than a full circle. The starting view never matched visually, so the app cannot close the loop for you. Tap the button below to close the lap and start the verification lap — turning further only adds photographs to a pass that is already complete.${over.refuseNewSweeps ? ` Past ${PASS1_REFUSE_DEG}° no further pass-1 photographs are being recorded, because every bearing already has one.` : ''}`,
           0);
       }
       if (this.pass1Travel > 12) {
@@ -253,6 +255,9 @@ export class ScanDirector {
       if (ctx.visualQuality != null && ctx.visualQuality < 0.25 && ctx.stillness > 0.7) {
         return say('warn', 'Not enough texture here', 'Tilt down slightly to include more of the skyline edge, or pause while more frames are collected.');
       }
+      const guided = this._followTheDot(ctx, say);
+      if (guided) return guided;
+
       const progress = clamp(Math.abs(this.pass1Travel) / 360, 0, 1);
       if (Math.abs(this.pass1Travel) >= 358) {
         return say('good', 'Loop nearly closed', 'Keep turning counter-clockwise until the view matches where you started.', -1, progress);
@@ -283,6 +288,8 @@ export class ScanDirector {
         if (ctx.rotationRate > M.maxRate) {
           return say('fix', 'Slow down', `${ctx.rotationRate.toFixed(0)} degrees/s will start to blur verification frames.`, +1);
         }
+        const guided = this._followTheDot(ctx, say);
+        if (guided) return guided;
         const progress = clamp(Math.abs(this.pass2Travel) / 360, 0, 1);
         const verified = this.survey.coverage().verifiedBins;
         if (Math.abs(this.pass2Travel) >= 358) {
@@ -338,7 +345,11 @@ export class ScanDirector {
       travelDeg: ctx.travelSinceKeyframeDeg,
       hfovDeg: ctx.hfovDeg,
       reason: ctx.lastRejectReason,
-      hasAcceptedFrame: ctx.hasAcceptedFrame !== false
+      hasAcceptedFrame: ctx.hasAcceptedFrame !== false,
+      // The active mode's floor, so a tripod survey — which needs more overlap
+      // than a handheld one — is warned at its own limit rather than at the
+      // looser default.
+      minOverlap: overlapFloor(this.mode)
     });
     if (!stall.stalled) return null;
 
@@ -387,6 +398,59 @@ export class ScanDirector {
       return 'The camera is not delivering frames the segmenter can use.';
     }
     return 'The frame gates have refused every candidate along this arc.';
+  }
+
+  /**
+   * Follow the dot.
+   *
+   * Everything the operator is told here comes from the coverage map, and none
+   * of it from how far the phone has turned. Four states, and each one has
+   * exactly one thing for them to do:
+   *
+   *   complete   — stop; the horizon is covered.
+   *   waiting    — the dot is not moving, so give this sector more.
+   *   behind     — the dot is back the way you came; go and get it.
+   *   advancing  — follow it.
+   *
+   * The individual reasons a sector scored badly — too fast, too rolled, a
+   * skyline the segmenter could not find, a sun in the lens — are deliberately
+   * not surfaced. The operator does not need eight diagnostics; they need to
+   * see that the target has not moved on yet. Genuine faults that make the
+   * whole frame unusable are still reported, by `_frameProblem`, before this.
+   */
+  _followTheDot(ctx, say) {
+    const g = ctx.guidance;
+    if (!g || !g.summary) return null;
+    const pct = Math.round(g.summary.fraction * 100);
+
+    if (g.state === 'complete') {
+      return say('good', 'Horizon covered',
+        'Every part of the skyline has enough good data. Tap the button below to continue.',
+        0, 1);
+    }
+    if (!Number.isFinite(g.offsetDeg)) return null;
+
+    const away = Math.abs(g.offsetDeg);
+    const arrow = g.offsetDeg > 0 ? +Math.max(1, Math.round(away)) : -Math.max(1, Math.round(away));
+
+    if (g.state === 'waiting' && away < 25) {
+      return say('work', 'Hold here — filling this section',
+        `This part of the horizon still needs more. Keep the camera on the target and move slowly; it will move on by itself. ${pct}% of the horizon done.`,
+        0, g.summary.fraction);
+    }
+    if (g.state === 'behind' || away > 35) {
+      return say('fix', `Target is ${away.toFixed(0)}° ${g.offsetDeg > 0 ? 'right' : 'left'}`,
+        `That section did not get enough usable data. Sweep back onto the target and cover it again. ${pct}% of the horizon done.`,
+        arrow, g.summary.fraction);
+    }
+    if (away > 12) {
+      return say('work', `Follow the target — ${g.offsetDeg > 0 ? 'right' : 'left'}`,
+        `${pct}% of the horizon covered. Keep the target near the middle of the picture.`,
+        arrow, g.summary.fraction);
+    }
+    return say('good', 'Following the target',
+      `${pct}% of the horizon covered. Keep sweeping smoothly; the target moves on as each section fills in.`,
+      arrow, g.summary.fraction);
   }
 
   /** Frame-level problems that make the current view unusable. */

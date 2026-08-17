@@ -90,6 +90,8 @@ flowchart TD
 | `workers/vision.worker.js` | Coarse-to-fine normalized-correlation registration between sequential frames and loop closure. |
 | `js/survey.js` | Keyframes, projection into 720 bins, robust aggregation, weak sectors, loop correction, focal estimation, report and grade. |
 | `js/guide.js` | Capture state machine and human-readable instructions. |
+| `js/coverage.js` | Per-bearing coverage confidence from every processed frame. |
+| `js/guidance.js` | The guidance dot: where to ask the operator to point next. |
 | `js/capture-policy.js` | Keyframe spacing and motion thresholds. |
 | `js/capture-gaps.js` | Photo-to-photo overlap measurement and exact recapture bearings. |
 | `js/bundle.js` | Below-skyline features, matching, pair verification, and gravity-constrained rotation-only bundle adjustment. |
@@ -510,6 +512,14 @@ The existing Python proof script predates this manifest and still reads
 `keyframes.json`; the manifest is deliberately redundant for backward
 compatibility.
 
+`tanHalfHorizontal`/`tanHalfVertical` are the optics each photograph was taken
+through and are never rewritten. When a post-capture lens measurement changed the
+browser render, `renderTanHalfHorizontal`, `renderTanHalfVertical` and
+`appliedFocalScale` appear alongside them, and `intrinsicsPolicy` in the same
+file states which to use for which purpose. A consumer that reads only the
+capture-time pair still reconstructs something sane; one that reads the render
+pair reproduces what the app drew.
+
 #### `metadata/capture-gaps.json`
 
 Machine-readable overlap/gap measurements and recommended recapture bearings.
@@ -610,12 +620,85 @@ Reference input: `home-back-yard-capture-debug-2026-08-15-23-10-55.zip`.
 | Minimum inliers | 113 | No weak cross-lap pair under the analysis threshold. |
 | Median reprojection error | 0.53 px | Matches were geometrically precise. |
 | Elevation/vertical-shift correlation | 0.996 | Saved elevation is highly valuable and should be retained as a strong prior. |
-| Experimental vertical FOV | 48.26 degrees | Slightly different from the saved 45.6-degree value. |
+| Experimental vertical FOV | 48.26 degrees | Superseded — see section 13a. |
 
 Correcting the quarter-turn immediately produced a recognizable absolute-
 azimuth pose panorama. Changing vertical FOV from 45.6 to 48.26 degrees improved
 the model slightly but did not remove house ghosts. The remaining displacement
 was mainly yaw inconsistency and local parallax.
+
+## 13a. The field-of-view figure, and why it moved three times
+
+The 48.26 degrees above does not survive scrutiny. Three methods were applied to
+the same 61 photographs and the first two were confidently wrong; the history is
+recorded because each failure is a trap the next capture could fall into.
+
+**Method 1 — regression of vertical feature shift against saved elevation.**
+This is what produced 48.26, and it reproduces exactly (48.18) when repeated
+independently. It carries a systematic bias: it models the shift as
+`-tan(dElevation) / tanHalfV`, which is the correct expression evaluated at the
+optical axis only. Real matches spread across the frame, the tangent is convex,
+so the mean shift exceeds the on-axis prediction and the fitted tangent comes out
+too small. On a synthetic camera genuinely built at 48.26 degrees, this method
+reports 47.2. The bias is roughly 2% and no quantity of data removes it.
+
+**Method 2 — the exact projection, ungated.** Fitting
+`tan(theta - dElevation) / tanHalfV` against every match removes that bias and
+gives 49.3 to 50.4 degrees across every threshold combination, with correlations
+of 0.994 to 0.998. This looked conclusive and was reported as such. It is also
+wrong, because it silently assumed the two laps were shot from the same place.
+
+**Method 3 — the exact projection, gated on parallax.** Within a repeat-view
+pair, the spread of horizontal feature shift is a viewpoint proxy: a rotation
+carries the whole frame together, a change of position moves near features
+further than far ones. A clean synthetic rotation measures 0.03 to 0.055 in
+normalised image units. This capture's repeat views have a median of 0.208 and a
+maximum of 0.356 — the operator moved between laps, around a close building, and
+most pairs carry it. Admitting them all gives 50.1 degrees with the pairs
+disagreeing among themselves by 0.09. Admitting only pairs under 0.12 gives
+46.14 degrees ± 0.66 from five pairs, three of which agree to 0.016.
+
+So the parallax was worth three to four degrees of apparent field of view, and
+methods 1 and 2 were both measuring the house rather than the lens.
+
+**The current position: the pinned 45.6 degrees may have been close to right.**
+The best-gated estimate is 46.1 ± 0.7, a correction of about 1.3%, resting on
+three pairs. That is below the evidence threshold the app requires, so
+`crossLapFocalCheck` declines to move the geometry on this capture and records
+`too-few-low-parallax-repeat-views`. Nothing about the lens should be considered
+settled until a tripod capture, or one further from a building, supplies repeat
+views that are actually rotations.
+
+Do not promote any of these figures to a pinned device default.
+
+## 13b. Fused yaw drifted about ten degrees per lap
+
+Found while investigating why cross-lap matching failed under the placed pose.
+`yawBaseCorrectionDeg` — the fused-yaw correction applied on top of the sensor
+attitude — grows from 0.02 degrees at the first keyframe to 15.8 at the last.
+Between two frames of the same bearing one lap apart it is about 10 degrees.
+
+Applying it destroys the matching it should enable. Pairs that yield 17, 14 and
+26 verified matches from the raw sensor attitudes yield 0, 1 and 2 from the
+placed poses:
+
+| Pair | yawBase difference | matches, raw attitude | matches, placed pose |
+|---|---:|---:|---:|
+| 9 -> 40 | 10.98 deg | 17 | 0 |
+| 10 -> 41 | 10.41 deg | 14 | 1 |
+| 11 -> 42 | 10.45 deg | 26 | 2 |
+| 2 -> 31 | 9.36 deg | 23 | 9 |
+
+The raw attitudes agree between laps and the fused yaw does not, which says the
+gyro-led fusion accumulated real drift over 125 seconds while the device's own
+orientation stream stayed repeatable. Which of the two should be trusted for
+placement is unresolved and matters for absolute azimuth; it should be settled
+with landmark bearings on the next capture rather than argued from this one.
+
+`crossLapFocalCheck` sidesteps it rather than assuming: it tries the placed pose,
+falls back to the raw attitude when that finds too few matches, and records which
+it used per pair. The measurement rests on vertical shift against
+gravity-derived elevation, so a wrong yaw costs matches, not degrees.
 
 The local analysis package is outside this repository and must be preserved if
 another developer needs to reproduce the conclusions:
@@ -640,6 +723,127 @@ The original source ZIP was not modified.
 - Made pass 2 a real dense verification lap before targeted cleanup.
 - Fixed the all-unverified-ring weak-sector case so it cannot falsely report no
   work remaining.
+
+### Coverage-guided scanning (the guidance dot)
+
+The scan is no longer an instruction to turn 360 degrees. A moving target is
+drawn in the live picture; the operator follows it, and it advances only as the
+horizon behind it accumulates enough good observation. Race through a sector and
+the dot is simply left behind, because nothing there got captured.
+
+Two modules, deliberately separate, and the separation is load-bearing:
+
+- `js/coverage.js` — the physical record. 180 bins of 2 degrees, each holding a
+  confidence rather than a visited flag. Every processed frame is offered to it,
+  including the ones the keyframe gates refuse, and credit is spread across the
+  usable field of view with a raised-cosine falloff rather than being dropped on
+  the centre azimuth. Confidence approaches 1 asymptotically, so repeated good
+  looks help with diminishing returns; poor frames contribute little and
+  disqualified ones nothing. Coverage is never removed — wobble, reversal,
+  overshoot and revisiting are all normal operator behaviour and none of them
+  may undo work.
+- `js/guidance.js` — an opinion derived from that record, and nothing else. It
+  picks a bearing, smooths it, and reports one of `advancing`, `waiting`,
+  `behind` or `complete`.
+
+Why they are apart: the scoring will be tuned against real captures for some
+time, and none of that should require touching how the dot behaves. Every knob
+in both files lives in one exported object (`COVERAGE_TUNING`,
+`GUIDANCE_TUNING`) — bin size, coverage threshold, minimum observations, rate
+and pitch and roll tolerances, gain, smoothing, lead, hysteresis, completion
+tolerance.
+
+Three findings from building it, each of which looked correct and was not:
+
+1. **The dot followed the phone.** With a "re-pick when a better candidate
+   appears" rule, a map where everything has been swept but nothing captured
+   produces a frontier that sits a fixed distance behind the operator — so it
+   slides along with them, around the whole circle. Fixed by making the target
+   hold position until its ground is actually covered, and by permitting a
+   re-pick only when `CoverageMap.generation` changes, which happens solely when
+   a bin crosses into covered. Turning the phone now cannot move the dot; only
+   covering the horizon can.
+2. **Every scan opened by pointing backwards.** The field of view marks bins as
+   visited immediately, so the frontier walk found the trailing half of the very
+   first frame and sent the operator back over ground they were looking at. The
+   walk now starts beyond the trailing edge of the current field.
+3. **"Visited" and "observed" are different facts.** Bins were only counted as
+   visited when a frame earned credit, which meant a sector raced through at
+   90 degrees per second — earning nothing — looked identical to a sector never
+   reached. The map now tracks `visits` separately from `observations`, and that
+   distinction is the whole basis for telling "you missed this" from "you have
+   not got here yet".
+
+Completion is coverage, not rotation: `updatePrimary` closes pass 1 when the map
+says the horizon is covered, with the old travel and bin-count tests kept only
+as a fallback so a session with no usable coverage data is never trapped. The
+map is reset at the start of each lap, so a verification pass is guided on its
+own merits. `scanCoverage` and the guidance state are written into the debug
+archive.
+
+The dot is drawn by `drawGuidance` in `js/render.js`, projected through the same
+pose and intrinsics the panorama uses, so following it means physically turning
+to centre it. Off-frame it becomes an edge arrow with a distance. A thin
+fixed-mapping coverage strip sits at the bottom of the stage — finished sections
+stay put on screen rather than sliding as the operator turns.
+
+Diagnosable from the archive alone, which matters because the first question
+anyone asks of a guidance dot is "why is it there":
+
+- `metadata/scan-coverage.json` — the map, the tuning that produced it, and a
+  per-bearing table separating frames that earned credit from frames that merely
+  swept past. It also carries `trail`: a sampled record of where the dot was,
+  with the frame quality, frame status, turn rate, elevation, roll and glare at
+  that moment. Sampled on every state change and otherwise four times a second,
+  capped at 4000 entries.
+- `coverage-map.png` — the same thing as a picture. Covered sectors solid,
+  partial ones fading with confidence, AMBER for horizon swept through without
+  capturing, dark for horizon never pointed at, and two markers for the camera
+  and the dot. The amber/dark distinction is the one a plain progress meter
+  cannot show and the one that explains a stalled target.
+
+### Live coverage loss, glare, and runaway passes
+
+- Added `captureStall()`: the app now says out loud when it has swept past the
+  point where the next photograph could overlap the last, gives the bearing to
+  return to (the edge of recoverable overlap, not the middle of the hole), and
+  names the cause. The 2026-08-15 capture lost 68.9 degrees over 14.2 seconds in
+  silence; every input needed to catch that already existed.
+- Added blown-highlight measurement per exposure, computed from the synchronized
+  frame's own pixels rather than a later redraw of the live camera, and carried
+  into the audit event and the per-photo export. The repeated missing sector was
+  the setting sun, not merely a sideways segmenter.
+- Unified the overlap policy: `overlapFloor(mode)` now feeds the live warning,
+  the recapture bearings and the end-of-pass gap report, so a tripod survey is
+  warned at its own 45% floor rather than the looser default.
+- Pass 1 prompts to stop past 400 degrees and refuses further sweep keyframes
+  past 500, recording `pass1-over-travel`. The gap between the two thresholds is
+  deliberate: the quantity being tested is integrated gyro yaw, and a scale error
+  must not truncate a legitimate lap.
+
+### Measuring the lens from the survey
+
+- Added `js/focal-check.js`, which measures focal length from repeat views of the
+  same bearing on different laps, gated on parallax and on whether the pairs
+  agree with each other. See sections 13a and 13b for what it found and for the
+  two methods it replaced.
+- Removed the focal-length unknown from the rotation bundle adjustment. It was
+  implemented, tested, and measured against the real capture, where the cost
+  surface it must descend is flattened by parallax; it returned 0.99 where other
+  evidence said 1.07. `rayOf` and `verifyPair` keep their scale parameter because
+  the lens check needs them.
+- Features touching a blown highlight are excluded from matching. Flare ghosts
+  are viewpoint-fixed, so matching on them tells the solver the world rotated
+  when it did not.
+- Raised the optimiser's feature target to 220. Below about 200 the lens check's
+  answer is determined by its thresholds rather than by the photographs.
+- The panorama's render intrinsics are exported separately from the capture-time
+  intrinsics, in both `keyframes.json` (`renderCamera`) and
+  `stitch-manifest.json` (`renderTanHalf*`, `appliedFocalScale`). The capture
+  record is never rewritten by a diagnostic.
+- Added `tools/focal-lab.html`, which runs the browser's own optimiser and lens
+  check against an extracted capture-debug ZIP. Both findings above came out of
+  it and neither was visible in synthetic tests.
 
 ### Evidence and recovery guidance
 
@@ -685,8 +889,12 @@ creation, and `tests/capture-audit-flow.test.mjs` now protects that boundary.
 
 ## 15. Current known limitations and risks
 
-1. **House parallax remains the central image problem.** More global homography
-   tuning will not solve it. Use a fixed optical center and build a local warp.
+1. **House parallax remains the central image problem**, and it is now measured
+   rather than inferred: within repeat views of the same bearing, the horizontal
+   spread of feature shift has a median of 0.208 against 0.03-0.055 for a pure
+   rotation. It corrupted two successive attempts to measure the lens before
+   being gated out. More global homography tuning will not solve it; use a fixed
+   optical centre and build a local warp.
 2. **Browser mosaic compositing is diagnostic.** It chooses one nearest-axis
    source and does not blend or optimize seams locally.
 3. **Browser visual refinement does not update the controller profile.** This is
@@ -702,8 +910,17 @@ creation, and `tests/capture-audit-flow.test.mjs` now protects that boundary.
 9. **The offline OpenCV result loses absolute azimuth and may fail on a
    disconnected capture graph.**
 10. **No live iPad end-to-end capture has yet validated all latest changes
-    together.** Synthetic and module tests pass, but the next field ZIP is the
-    decisive validation artifact.
+    together.** Synthetic and module tests pass and the panorama path has been
+    replayed against the 61-frame archive, but the capture-loop changes — stall
+    warnings, glare attribution, over-travel refusal — have not run against real
+    sensors. The next field ZIP is the decisive validation artifact.
+11. **The field of view is unresolved.** See section 13a. The best parallax-gated
+    estimate is 46.1 +/- 0.7 degrees from three agreeing pairs, which is below
+    the threshold the app requires to act, so it currently declines to change
+    anything. Do not pin any figure as a device default.
+12. **Placed pose and raw sensor attitude disagree by about ten degrees per lap.**
+    See section 13b. This is unresolved and bears directly on absolute azimuth.
+    Settle it with landmark bearings on the next capture.
 
 ## 16. Recommended next engineering sequence
 
@@ -759,7 +976,8 @@ foreach ($test in $tests) {
 if ($failed.Count) { throw "FAILED: $($failed -join ', ')" }
 ```
 
-At handoff, all 19 `*.test.mjs` files pass. Important focused tests include:
+At handoff, all 22 `*.test.mjs` files pass in about 24 seconds. Important
+focused tests include:
 
 - `camera-sync.test.mjs`: one-draw synchronization, iPad rotation, crop/exposure
   metadata and measured-lens persistence;
@@ -770,6 +988,15 @@ At handoff, all 19 `*.test.mjs` files pass. Important focused tests include:
 - `capture-debug-zip.test.mjs`: archive layout and metadata survival;
 - `bundle.test.mjs`: subpixel visual alignment, cloud exclusion, gravity prior
   and tilted-band behavior;
+- `bundle-scale-glare.test.mjs`: focal scaling keeps pixels square, and blown
+  highlights yield no features;
+- `focal-check.test.mjs`: the lens is recovered from repeat views, outlying pairs
+  are excluded rather than averaged in, and thin evidence refuses;
+- `capture-stall.test.mjs`: coverage-loss detection, mode-specific overlap
+  floors, glare attribution, and the pass-1 over-travel thresholds;
+- `coverage-guidance.test.mjs`: what earns coverage and what does not, that
+  coverage is never taken away, and above all that the dot does not advance
+  when the phone turns through 360 degrees on worthless frames;
 - `panorama.test.mjs`: projection and mosaic geometry;
 - `verification-pass.test.mjs` and `weak-sectors.test.mjs`: two-lap flow and
   circular weak-sector behavior.
@@ -824,16 +1051,25 @@ and new files. No commit or pull request was created as part of this work.
 The principal changed/new files are:
 
 ```text
+js/bundle.js
 js/camera.js
+js/coverage.js
+js/guidance.js
 js/capture-policy.js
+js/focal-check.js
 js/diagnostic-export.js
 js/guide.js
 js/main.js
 js/survey.js
 js/capture-gaps.js
 js/panorama-optimize.js
+tools/focal-lab.html
+tests/bundle-scale-glare.test.mjs
+tests/coverage-guidance.test.mjs
 tests/camera-sync.test.mjs
 tests/capture-audit-flow.test.mjs
+tests/capture-stall.test.mjs
+tests/focal-check.test.mjs
 tests/capture-debug-zip.test.mjs
 tests/capture-gaps.test.mjs
 tests/capture-policy.test.mjs

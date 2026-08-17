@@ -53,6 +53,30 @@ function projectedSkyline(kf, yawDatumDeg, azimuthOffsetDeg) {
   return samples;
 }
 
+/**
+ * Intrinsics as used for the browser panorama, when a post-capture measurement
+ * moved them.
+ *
+ * `bundleFocalScale` is written onto the keyframe by the panorama build when
+ * the cross-lap lens check produced a trusted number. Without this block the
+ * archive states one field of view and the rendered panorama used another, and
+ * an offline stitcher reading the photos plus per-photo metadata would rebuild
+ * with the uncorrected optics while believing it had reproduced the app.
+ */
+function renderCameraOf(kf) {
+  const scale = Number(kf.bundleFocalScale);
+  if (!Number.isFinite(scale) || scale === 1) return null;
+  return {
+    source: 'cross-lap-elevation-regression',
+    appliedFocalScale: round(scale, 6),
+    tanHalfHorizontal: round(kf.tanHalfH * scale, 9),
+    tanHalfVertical: round(kf.tanHalfV * scale, 9),
+    focalPx: Number.isFinite(kf.focalPx) ? round(kf.focalPx / scale) : null,
+    appliesTo: 'browser panorama render only; the 720-bin profile used the capture-time camera block',
+    note: 'Post-capture diagnostic correction measured from repeat views of the same bearing on different laps. See metadata/panorama-optimization.json for the pairs and residuals.'
+  };
+}
+
 function serialiseFrame(kf, photo, photoName, yawDatumDeg, azimuthOffsetDeg) {
   const captureHeading = Number.isFinite(kf.yawFused)
     ? kf.yawFused + yawDatumDeg
@@ -100,6 +124,9 @@ function serialiseFrame(kf, photo, photoName, yawDatumDeg, azimuthOffsetDeg) {
       sample: kf.orientationSample || null
     },
     gyroscope: kf.gyro || null,
+    // The lens the photograph was actually taken through. Never rewritten by a
+    // later diagnostic: a capture record that quietly changes when someone
+    // presses "build panorama" is not a capture record.
     camera: {
       tanHalfHorizontal: round(kf.tanHalfH, 9),
       tanHalfVertical: round(kf.tanHalfV, 9),
@@ -107,9 +134,18 @@ function serialiseFrame(kf, photo, photoName, yawDatumDeg, azimuthOffsetDeg) {
       analysisWidth: kf.boundary?.length || null,
       analysisHeight: finite(kf.height)
     },
+    // The lens the browser panorama was RENDERED with, when a post-capture
+    // measurement changed it. Present only when it differs, and explicitly
+    // labelled, so an offline stitcher reading this file reconstructs what the
+    // app drew rather than silently falling back to the uncorrected optics.
+    renderCamera: renderCameraOf(kf),
     analysis: {
       visualQuality: round(kf.visualQuality),
       skyFraction: round(kf.skyFraction),
+      exposure: kf.exposure ? {
+        meanLuma: round(kf.exposure.luma, 2),
+        saturatedFraction: round(kf.exposure.saturatedFraction, 5)
+      } : null,
       boundary: Array.from(kf.boundary || [], v => round(v, 3)),
       confidence: Array.from(kf.confidence || [], v => round(v, 5)),
       flags: Array.from(kf.flags || []),
@@ -176,6 +212,8 @@ function readme(photoCount, keyframeCount, missing) {
     'metadata/capture-gaps.json measures photo-to-photo overlap and gives the bearings that should be revisited.',
     'metadata/capture-audit.json counts and samples accepted and rejected capture candidates, including why a photo was not taken.',
     'metadata/panorama-optimization.json records visual matches, residuals, and any gravity-constrained rotation refinements applied in the browser.',
+    'metadata/scan-coverage.json is the coverage-guided scanning record: per-bearing confidence, how many frames were credited, how many merely swept past, the tuning in force, and a sampled trail of where the guidance dot was and what the frame quality was at the time.',
+    'coverage-map.png draws the same thing. Covered sectors are solid, partial ones fade with confidence, amber marks horizon the camera swept through without capturing, and dark marks horizon it never pointed at. The two markers are the camera and the guidance dot at export time.',
     'metadata/project.horizon-project is the normal recomputable project archive without duplicate embedded images.',
     'logs/field-log.txt is the complete in-app field log at export time.',
     'logs/debug-bundle.txt combines the final state snapshot, lens inventory, acceptance report, and field log.',
@@ -188,6 +226,7 @@ function readme(photoCount, keyframeCount, missing) {
     'Each photo, analysis frame and sensor snapshot now come from one synchronized capture record. Browser/video timing fields are included when the platform exposes them.',
     'captureTiming.coverFit is the exact rotation, scale, retained source rectangle, and output size used to make that saved photo. captureTiming.track contains the live exposure/focus settings the browser exposed.',
     'Gyroscope data includes the exposure snapshot plus a short surrounding sample window; it is not a continuous full-session raw stream.',
+    'If the guidance dot appeared stuck, read metadata/scan-coverage.json: the trail entries carry frameQuality, frameStatus, yawRateDegPerSec, elevationDeg, rollDeg and glareFraction for that moment, which between them say why a sector earned nothing. The coverage map is reset at the start of each lap, so it describes the lap in progress at export time and not the whole session.',
     'Older saved sessions may show null for fields that were not recorded by their app version.',
     ''
   ].join('\n');
@@ -197,7 +236,8 @@ function readme(photoCount, keyframeCount, missing) {
 export async function buildCaptureDebugZip({
   siteName, sessionId, keyframes, photos, yawDatumDeg = 0,
   azimuthOffsetDeg = 0, project, debugText, logText, snapshot,
-  captureAudit = null, panoramaOptimization = null
+  captureAudit = null, panoramaOptimization = null,
+  scanCoverage = null, coverageImage = null
 }) {
   const exportedAt = new Date();
   const photoMap = photos instanceof Map ? photos : new Map();
@@ -228,6 +268,7 @@ export async function buildCaptureDebugZip({
     coordinateSystem: 'right-handed ENU world; camera rays use u right, v up, forward -Z',
     imageGeometry: 'Photos are already screen-aligned. captureTiming.coverFit records the exact decoded-video rotation/crop/scale used to create each saved image.',
     posePolicy: 'placedQuaternion is the sensor pose with yaw datum and loop correction applied. rawQuaternion is the exposure sensor pose before those azimuth corrections. visuallyRefinedQuaternion, when present, is a gravity-constrained rotation-only visual refinement.',
+    intrinsicsPolicy: 'tanHalfHorizontal/tanHalfVertical are the optics the photograph was taken through and are never rewritten. renderTanHalf* and appliedFocalScale are present only when a post-capture cross-lap lens measurement changed the panorama render; both tangents scale together so pixels stay square. Use the render values to reproduce the browser panorama, the capture values to reproduce the 720-bin profile.',
     yawDatumDeg: Number(yawDatumDeg) || 0,
     outputAzimuthOffsetDeg: Number(azimuthOffsetDeg) || 0,
     captureGaps: gaps,
@@ -241,8 +282,14 @@ export async function buildCaptureDebugZip({
       rawQuaternion: frame.orientation.quaternion,
       placedQuaternion: frame.orientation.placedQuaternion,
       visuallyRefinedQuaternion: frame.orientation.visuallyRefinedQuaternion,
+      // Capture-time optics, then the correction if one was measured. A
+      // consumer that understands only the first pair still reconstructs
+      // something sane; one that reads the second reproduces what the app drew.
       tanHalfHorizontal: frame.camera.tanHalfHorizontal,
       tanHalfVertical: frame.camera.tanHalfVertical,
+      renderTanHalfHorizontal: frame.renderCamera?.tanHalfHorizontal ?? null,
+      renderTanHalfVertical: frame.renderCamera?.tanHalfVertical ?? null,
+      appliedFocalScale: frame.renderCamera?.appliedFocalScale ?? null,
       centerAzimuthDeg: frame.pointing.stitchedAzimuthDeg,
       centerAltitudeDeg: frame.pointing.centerAltitudeDeg,
       rollDeg: frame.pointing.rollDeg,
@@ -262,6 +309,14 @@ export async function buildCaptureDebugZip({
     keyframeCount: keyframes.length,
     missingPhotoIndexes: missing,
     captureGapCount: gaps.gapCount,
+    scanCoverage: scanCoverage ? {
+      coveredFraction: scanCoverage.fraction ?? null,
+      coveredBins: scanCoverage.coveredBins ?? null,
+      binCount: scanCoverage.binCount ?? null,
+      complete: scanCoverage.complete ?? null,
+      remainingDeg: scanCoverage.remainingDeg ?? null,
+      guidanceState: scanCoverage.guidance?.state ?? null
+    } : null,
     captureAudit: {
       counts: audit.counts || {},
       eventCount: Array.isArray(audit.events) ? audit.events.length : 0
@@ -279,10 +334,15 @@ export async function buildCaptureDebugZip({
     { name: 'metadata/capture-gaps.json', data: json(gaps), modifiedAt: exportedAt },
     { name: 'metadata/capture-audit.json', data: json(audit), modifiedAt: exportedAt },
     { name: 'metadata/panorama-optimization.json', data: json(optimization), modifiedAt: exportedAt },
+    { name: 'metadata/scan-coverage.json', data: json(scanCoverage), modifiedAt: exportedAt },
     { name: 'metadata/project.horizon-project', data: json(project), modifiedAt: exportedAt },
     { name: 'logs/field-log.txt', data: `${logText || '(empty)'}\n`, modifiedAt: exportedAt },
     { name: 'logs/debug-bundle.txt', data: `${debugText || '(empty)'}\n`, modifiedAt: exportedAt }
   );
+
+  if (coverageImage) {
+    entries.push({ name: 'coverage-map.png', data: coverageImage, modifiedAt: exportedAt });
+  }
 
   const blob = await buildZip(entries);
   const stamp = exportedAt.toISOString().slice(0, 19).replace(/[T:]/g, '-');

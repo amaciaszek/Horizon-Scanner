@@ -1,0 +1,135 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Horizon Scanner — lens and rotation lab</title>
+<!--
+  Runs the browser's own panorama optimiser and lens check against a real
+  capture-debug ZIP, outside the app, so a field capture can be re-analysed
+  without a device and without reimplementing the geometry in another language.
+
+  This exists because the numbers it produces changed the design twice. It
+  showed that solving focal length inside the bundle adjustment descends a cost
+  surface flattened by parallax, and it showed that the cross-lap lens
+  measurement is contaminated by that same parallax unless the pairs are gated
+  on lateral spread. Both were invisible in synthetic tests and obvious here.
+
+  USAGE
+    1. Extract a capture-debug ZIP so that photos/ and metadata/ sit in one
+       directory, and copy this file plus the app's js/ directory beside them:
+
+         lab/
+           focal-lab.html
+           js/            <- copy of the repository's js/ directory
+           photos/
+           metadata/
+
+    2. Serve that directory and open this file. A plain static server is enough:
+
+         py -m http.server 8644 --directory lab
+
+    3. Open http://localhost:8644/focal-lab.html
+
+  It reads metadata/keyframes.json. An orientation-corrected bundle works too,
+  since the fields are the same.
+-->
+<body style="font:13px ui-monospace,monospace;padding:1rem;white-space:pre-wrap" id="out">running…</body>
+<script type="module">
+import { optimisePanoramaRotations } from './js/panorama-optimize.js';
+import { crossLapFocalCheck } from './js/focal-check.js';
+import { extractFeatures } from './js/bundle.js';
+
+const out = document.getElementById('out');
+const lines = [];
+const say = s => { lines.push(s); out.textContent = lines.join('\n'); };
+
+// Thumbnail size the optimiser works at. Keep the saved photo's aspect ratio.
+const LONG = 427;
+
+async function loadThumb(path, w, h) {
+  const img = new Image();
+  img.src = path;
+  await img.decode();
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const cx = c.getContext('2d', { willReadFrequently: true });
+  cx.drawImage(img, 0, 0, w, h);
+  return { w, h, data: cx.getImageData(0, 0, w, h).data };
+}
+
+try {
+  const records = await (await fetch('./metadata/keyframes.json')).json();
+  const first = records.find(r => r.photo);
+  if (!first) throw new Error('no photos referenced by metadata/keyframes.json');
+  const aspect = (first.photo.width || 480) / (first.photo.height || 640);
+  const TH = LONG, TW = Math.round(LONG * aspect);
+  say(`${records.length} keyframes; decoding photos at ${TW}x${TH}`);
+
+  const sources = [];
+  for (const r of records) sources.push(r.photo ? await loadThumb(r.photo.path, TW, TH) : null);
+
+  const keyframes = records.map(r => ({
+    index: r.index,
+    t: r.timestampMs,
+    pass: r.pass,
+    captureKind: r.captureKind,
+    tanHalfH: r.camera.tanHalfHorizontal,
+    tanHalfV: r.camera.tanHalfVertical,
+    quat: r.orientation.quaternion,
+    yawRaw: r.orientation.yawRawDeg,
+    yawFused: r.pointing.captureAzimuthDeg,
+    yawBase: r.orientation.yawBaseCorrectionDeg,
+    yawCorrection: r.orientation.stitchYawCorrectionDeg,
+    elevation: r.pointing.centerAltitudeDeg,
+    roll: r.pointing.rollDeg,
+    // The saved contour belongs to the capture-time raster and cannot be
+    // rotated into another one-value-per-column curve, so offline runs use the
+    // whole frame. Clear sky has no corners, which does most of that work.
+    boundary: null,
+    height: TH
+  }));
+
+  const t0 = performance.now();
+  const res = await optimisePanoramaRotations({
+    keyframes, sources, yawDatum: 0,
+    yieldFn: () => new Promise(r => setTimeout(r, 0))
+  });
+  const d = res.diagnostics;
+  say(`\nran in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+
+  say(`\nROTATION REFINEMENT  applied=${d.applied}  (${d.reason})`);
+  say(`  ${d.verifiedPairs} verified pairs, ${d.solverMatchCount} solver matches`);
+  say(`  residual ${d.rmsDeg?.toFixed(4)}° RMS`);
+  say(`  moved: max ${d.maxMovedDeg?.toFixed(3)}°, of which tilt ${d.maxTiltMovedDeg?.toFixed(3)}°`);
+
+  const f = d.focalCheck;
+  say(`\nLENS CHECK  measured=${f.measured}  (${f.reason})`);
+  say(`  collected ${f.pairCount} repeat-view pairs from ${f.candidateCount} frames`);
+  say(`  of which ${f.usedPairCount} agreed with each other`);
+  say(`  rejected: ${JSON.stringify(f.rejected)}`);
+  say(`  stated ${f.statedVfovDeg?.toFixed(2)}° vertical -> fitted ${f.fittedVfovDeg?.toFixed(2)}° ± ${f.fittedVfovUncertaintyDeg?.toFixed(2)}°`);
+  say(`  per-pair lens estimates: ${JSON.stringify(f.perPairScales)}`);
+  say(`  pairs agree to ${f.scaleAgreementMad?.toFixed(4)}; raw scale ${f.rawScale?.toFixed(4)}`);
+  say(`  SCALE APPLIED TO THE RENDER: ${d.focalScaleApplied}`);
+
+  if (f.pairs?.length) {
+    say('\n  pair      dElev      lateral spread   matches   used');
+    for (const p of f.pairs) {
+      say(`  ${String(p.from).padStart(3)}->${String(p.to).padEnd(4)} ` +
+        `${p.elevationChangeDeg.toFixed(2).padStart(7)}°   ` +
+        `${p.horizontalShiftSpread.toFixed(4).padStart(8)}       ` +
+        `${String(p.matchCount).padStart(4)}    ${p.used ? 'yes' : 'no'}`);
+    }
+  }
+  // Lateral spread is the parallax proxy: a rotation carries the whole frame
+  // together, a change of viewpoint moves near things further than far ones.
+  const all = f.pairs?.map(p => p.horizontalShiftSpread).sort((a, b) => a - b) || [];
+  if (all.length) {
+    say(`\n  lateral spread over kept pairs: min ${all[0].toFixed(3)}, ` +
+      `median ${all[all.length >> 1].toFixed(3)}, max ${all[all.length - 1].toFixed(3)}`);
+    say('  (a clean synthetic rotation measures 0.03 to 0.055)');
+  }
+  say('\nDONE');
+} catch (err) {
+  say(`\nFAILED: ${err && err.message || err}`);
+  say('Check that metadata/keyframes.json, photos/ and js/ are all beside this file.');
+}
+</script>

@@ -2,15 +2,17 @@
 import * as L from './log.js';
 import {
   clamp, wrap360, angDiff, screenQuat, quatFromEuler, quatRotate,
-  cameraRay, vecToAzAlt, DEG, RAD
+  cameraRay, vecToAzAlt, quatMul, yawQuat, DEG, RAD
 } from './math3d.js';
 import { CameraSource, WORK_W, WORK_H, LUMA_W, LUMA_H } from './camera.js';
 import { OrientationSource } from './orientation.js';
 import { Survey, RULES, BIN_COUNT, BIN_STEP, STATUS } from './survey.js';
 import { ScanDirector, PHASE } from './guide.js';
+import { CoverageMap } from './coverage.js';
+import { ScanGuidance } from './guidance.js';
 import { Pipeline } from './pipeline.js';
 import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
-import { drawRing, drawProfile, drawOverlay } from './render.js';
+import { drawRing, drawProfile, drawOverlay, renderCoverageCard } from './render.js';
 import { calibrationFigure } from './calfigures.js';
 import { LensCalibrator } from './lenscal.js';
 import * as store from './storage.js';
@@ -18,7 +20,7 @@ import * as out from './exporters.js';
 import { buildCaptureDebugZip } from './diagnostic-export.js';
 import { captureGapReport } from './capture-gaps.js';
 import { optimisePanoramaRotations } from './panorama-optimize.js';
-import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted } from './capture-policy.js';
+import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted, overlapFloor, pass1OverTravel } from './capture-policy.js';
 import {
   buildMosaic, skylineTracks, drawPanorama, disagreementByBin,
   pixelToAzAlt, landmarkResiduals
@@ -57,6 +59,10 @@ function syncFovReadout() {
 
 const survey = new Survey();
 const director = new ScanDirector(survey);
+/* The physical record of what the camera has observed, and the target dot
+ * derived from it. Two objects on purpose — see js/coverage.js. */
+const coverage = new CoverageMap();
+const guidance = new ScanGuidance();
 const orientation = new OrientationSource(log);
 const camera = new CameraSource($('video'), log);
 const pipeline = new Pipeline(log);
@@ -66,6 +72,18 @@ const preflight = new PreflightSweep();
 const state = {
   sceneLuma: null,
   glareFraction: null,
+  /* Coverage-guided scanning. `coverage` is the physical record of what the
+   * camera has actually observed well; `guidance` is only an opinion about
+   * where to put the target dot, derived from it. Keeping the two apart is what
+   * lets the scoring be retuned without redesigning the interaction. */
+  lastCoverageAt: null,
+  guidance: null,
+  /* Where the dot was, and why. Sampled rather than continuous — see
+   * recordGuidanceSample. This is the only way to answer "the target sat there
+   * for twenty seconds and I could not see why" after the fact. */
+  guidanceTrail: [],
+  lastGuidanceSampleAt: 0,
+  lastGuidanceState: null,
   frameCount: 0,
   prevGyroYaw: null,
   trackingLost: false,
@@ -115,7 +133,66 @@ const ELEVATION_HARD_LIMIT_DEG = 78;
 const fmt = (v, d = 1, suffix = '°') => Number.isFinite(v) ? `${v.toFixed(d)}${suffix}` : '—';
 
 /** Keep both aggregate rejection counts and a rate-limited event trail. */
-function recordCaptureDecision(reason, { pose = null, t = null, accepted = false, detail = null } = {}) {
+/** Mean confidence along a segmenter's traced skyline, ignoring flagged
+ *  columns — those are where the boundary ran off the top of the frame and
+ *  carry a confidence that does not describe a measured horizon. */
+function meanConfidence(seg) {
+  if (!seg || !seg.confidence || !seg.confidence.length) return null;
+  let sum = 0, n = 0;
+  for (let i = 0; i < seg.confidence.length; i++) {
+    if (seg.flags && seg.flags[i] !== 0) continue;
+    sum += seg.confidence[i]; n++;
+  }
+  return n ? sum / n : 0;
+}
+
+/**
+ * Sample the guidance state into the trail.
+ *
+ * Sampled on state change, and otherwise four times a second. A full 10 Hz log
+ * of a three-minute scan would be two thousand entries of mostly nothing; what
+ * matters is every transition — the moment the dot stopped advancing, and the
+ * frame quality at that moment — plus enough of the quiet stretches to see the
+ * shape of the scan. The quality figure is the single number the coverage map
+ * assigned to that frame, which is the direct answer to "why is it not moving".
+ */
+function recordGuidanceSample(t, pose, att, quality) {
+  const g = state.guidance;
+  if (!g) return;
+  const changed = g.state !== state.lastGuidanceState;
+  if (!changed && t - state.lastGuidanceSampleAt < 250) return;
+  state.lastGuidanceSampleAt = t;
+  state.lastGuidanceState = g.state;
+  state.guidanceTrail.push({
+    performanceMs: Math.round(t),
+    wallClockMs: Date.now(),
+    phase: director.phase,
+    headingDeg: Number(currentHeading().toFixed(2)),
+    dotBearingDeg: Number.isFinite(g.bearingDeg) ? Number(g.bearingDeg.toFixed(2)) : null,
+    targetBearingDeg: Number.isFinite(g.rawBearingDeg) ? Number(g.rawBearingDeg.toFixed(2)) : null,
+    offsetDeg: Number.isFinite(g.offsetDeg) ? Number(g.offsetDeg.toFixed(2)) : null,
+    state: g.state,
+    coveredFraction: Number(g.summary.fraction.toFixed(4)),
+    scoreHere: Number.isFinite(g.hereScore) ? Number(g.hereScore.toFixed(3)) : null,
+    // Why this frame counted for what it did.
+    frameQuality: quality && Number.isFinite(quality.quality) ? Number(quality.quality.toFixed(3)) : 0,
+    credited: !!(quality && quality.credited),
+    elevationDeg: Number(att.elevation.toFixed(2)),
+    rollDeg: Number(att.roll.toFixed(2)),
+    yawRateDegPerSec: Number.isFinite(pose.gyro.yawRateDegPerSec)
+      ? Number(pose.gyro.yawRateDegPerSec.toFixed(2)) : null,
+    frameStatus: state.frameStatus,
+    glareFraction: Number.isFinite(state.glareFraction)
+      ? Number(state.glareFraction.toFixed(4)) : null
+  });
+  if (state.guidanceTrail.length > 4000) {
+    state.guidanceTrail.splice(0, state.guidanceTrail.length - 4000);
+  }
+}
+
+function recordCaptureDecision(reason, {
+  pose = null, t = null, accepted = false, detail = null, exposure = null
+} = {}) {
   if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
   const audit = state.captureAudit;
   audit.counts[reason] = (audit.counts[reason] || 0) + 1;
@@ -137,6 +214,15 @@ function recordCaptureDecision(reason, { pose = null, t = null, accepted = false
       stillness: pose?.gyro?.stillness ?? null,
       frameStatus: state.frameStatus,
       overlap: state.overlap,
+      // From the frame this decision was made about, not from a later redraw.
+      sceneLuma: exposure ? Number(exposure.luma.toFixed(2)) : null,
+      saturatedFraction: exposure ? Number(exposure.saturatedFraction.toFixed(5)) : null,
+      // How much has been swept and how long it has been since anything was
+      // accepted, so a rejection streak is legible in the export without
+      // having to reconstruct it from timestamps.
+      sinceKeyframeMs: state.lastKeyframeAt ? Math.round(now - state.lastKeyframeAt) : null,
+      travelSinceKeyframeDeg: state.fusedYawAtKeyframe === null
+        ? null : Number(angDiff(state.fusedYaw, state.fusedYawAtKeyframe).toFixed(3)),
       detail
     });
     if (audit.events.length > 2500) audit.events.splice(0, audit.events.length - 2500);
@@ -189,6 +275,11 @@ async function processFrame() {
     const capturedFrame = camera.grabSynchronizedFrame();
     if (!capturedFrame) return;
     const { workFrame, luma } = capturedFrame;
+    // Exposure is measured from THIS frame's pixels, frozen alongside the pose
+    // and the skyline, so whatever the audit later says about glare describes
+    // the image that was actually judged.
+    const exposure = exposureOf(workFrame);
+    capturedFrame.exposure = exposure;
 
     const att = orientation.attitude();
     const rawYaw = orientation.rawYaw();
@@ -430,10 +521,12 @@ async function processFrame() {
       // the ground carries the bright lights — so every cue the segmenter uses
       // points the wrong way, and what it draws is a trace of sensor noise in
       // black pixels. Refuse rather than produce a confident-looking wrong line.
-      if (state.frameCount % 15 === 0) {
-        const exposure = camera.exposureStats();
-        state.sceneLuma = exposure ? exposure.luma : null;
-        state.glareFraction = exposure ? exposure.saturatedFraction : null;
+      // Every frame, not every fifteenth: it is free now that it rides on the
+      // pixels already in hand, and a sampled-every-15th glare reading would
+      // reintroduce exactly the mismatch this was changed to remove.
+      if (exposure) {
+        state.sceneLuma = exposure.luma;
+        state.glareFraction = exposure.saturatedFraction;
       }
       state.frameStatus = Math.abs(att.elevation) > ELEVATION_HARD_LIMIT_DEG ? 'tooHigh'
       : state.obstructionProbe.parallax ? 'parallax'
@@ -442,6 +535,41 @@ async function processFrame() {
         : seg.noSky ? 'noSky'
         : seg.allSky ? 'allSky'
           : (clippedTop / seg.flags.length > 0.22) ? 'clippedTop' : 'ok';
+    }
+
+    // ---- coverage-guided scanning ---------------------------------------
+    // Every processed frame is offered to the coverage map, including the ones
+    // the keyframe gates will refuse. That is the point of having a separate
+    // map: the survey's bins record measured skyline where a keyframe was
+    // admitted, and this records where the camera has genuinely dwelt with
+    // usable data. A sector the segmenter rejected forty times running scores
+    // nothing here, which is exactly what the operator needs to be told.
+    if (director.phase === PHASE.PASS1 || director.phase === PHASE.PASS2) {
+      const dtSec = state.lastCoverageAt === null ? null : (t - state.lastCoverageAt) / 1000;
+      state.lastCoverageAt = t;
+      const quality = coverage.observe({
+        headingDeg: currentHeading(),
+        elevationDeg: att.elevation,
+        rollDeg: att.roll,
+        yawRateDegPerSec: pose.gyro.yawRateDegPerSec,
+        jitterDeg: pose.jitterDeg,
+        skylineConfidence: seg && !seg.error ? meanConfidence(seg) : null,
+        visualQuality: state.visualQuality,
+        glareFraction: state.glareFraction,
+        frameStatus: state.frameStatus,
+        trackingLost: state.trackingLost,
+        hfovDeg: camera.hfovDeg,
+        dtSec,
+        atMs: t
+      });
+      state.guidance = guidance.update({
+        coverage,
+        headingDeg: currentHeading(),
+        dtSec: dtSec ?? 0.1,
+        nowMs: t,
+        hfovDeg: camera.hfovDeg
+      });
+      recordGuidanceSample(t, pose, att, quality);
     }
 
     // ---- overlap with the last accepted keyframe -------------------------
@@ -477,17 +605,20 @@ async function processFrame() {
 }
 
 function maybeKeyframe({ seg, pose, capturedFrame, t }) {
+  // Whatever the audit records about this decision must describe the frame
+  // the decision was made about.
+  const exposure = capturedFrame?.exposure || null;
   if (!seg || seg.error) {
-    recordCaptureDecision('segmentation-error', { pose, t, detail: seg?.error || null });
+    recordCaptureDecision('segmentation-error', { pose, t, exposure, detail: seg?.error || null });
     return;
   }
   if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
   if (!capturedFrame) {
-    recordCaptureDecision('no-synchronized-frame', { pose, t });
+    recordCaptureDecision('no-synchronized-frame', { pose, t, exposure });
     return;
   }
   if (state.frameStatus !== 'ok') {
-    recordCaptureDecision(`frame-${state.frameStatus}`, { pose, t });
+    recordCaptureDecision(`frame-${state.frameStatus}`, { pose, t, exposure });
     return;
   }
   const probe = state.obstructionProbe;
@@ -501,7 +632,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   if (!keyframeMotionAccepted(instantRate, {
     probe: probe.active, mode: director.mode.id
   })) {
-    recordCaptureDecision('motion-too-fast', { pose, t, detail: { instantRate } });
+    recordCaptureDecision('motion-too-fast', { pose, t, exposure, detail: { instantRate } });
     return;
   }
 
@@ -519,6 +650,16 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
       (t - probe.lastCaptureAt) > 500;
   } else if (!last) accept = true;
   else if (director.phase === PHASE.PASS1) {
+    // Far enough past a full circle that no plausible gyro scale error explains
+    // it, and every further sweep frame lands on a bearing that already has one.
+    // Refusing is recorded, never silent: the operator sees the keyframe count
+    // stop and the guide is already telling them to close the lap.
+    if (pass1OverTravel(director.pass1Travel).refuseNewSweeps) {
+      recordCaptureDecision('pass1-over-travel', {
+        pose, t, exposure, detail: { pass1TravelDeg: director.pass1Travel }
+      });
+      return;
+    }
     accept = Math.abs(angDiff(state.fusedYaw, state.fusedYawAtKeyframe)) >= stepDeg;
   } else {
     // A normal pass 2 is a dense second lap. Targeted holds are reserved for
@@ -540,7 +681,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
       : (director.phase === PHASE.PASS2 && !director.verificationSweep
           ? 'off-target-or-not-still'
           : 'spacing-not-reached');
-    recordCaptureDecision(reason, { pose, t, detail: { stepDeg } });
+    recordCaptureDecision(reason, { pose, t, exposure, detail: { stepDeg } });
     return;
   }
 
@@ -581,6 +722,11 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     gyro: { ...pose.gyro, motionWindow },
     visualQuality: state.visualQuality,
     skyFraction: seg.skyFraction,
+    // Measured on this exposure's own pixels. A photograph that was taken into
+    // the sun looks perfectly reasonable on its own; what marks it is the
+    // blown fraction, and without it recorded the next offline analysis has to
+    // re-derive it from the JPEGs and hope it matches what the app decided.
+    exposure,
     height: WORK_H,
     boundary: Float32Array.from(seg.boundary),
     confidence: Float32Array.from(seg.confidence),
@@ -589,6 +735,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   recordCaptureDecision('accepted', {
     pose,
     t,
+    exposure,
     accepted: true,
     detail: { keyframeIndex: kf.index, captureKind: kf.captureKind }
   });
@@ -829,6 +976,12 @@ function finishCalibration() {
     pipeline.anchor(luma, LUMA_W, LUMA_H);
   }
   pipeline.resetRegistration();
+  // A fresh lap is guided from a clean map. Coverage is per-lap evidence that
+  // the operator painted the horizon this time round, not a lifetime tally.
+  coverage.reset();
+  guidance.reset();
+  state.lastCoverageAt = null;
+  state.guidance = null;
   director.beginPass1(currentHeading());
   setTimeout(() => {
     if (!orientation.gyroAvailable) {
@@ -1107,7 +1260,7 @@ function skipSensorTest() {
 /* -------------------------------------------------------------- transitions */
 
 function logCaptureGaps(label) {
-  const report = captureGapReport(survey.keyframes, survey.yawDatum || 0);
+  const report = captureGapReport(survey.keyframes, survey.yawDatum || 0, { minOverlap: overlapFloor(director.mode) });
   const latest = report.passes[report.passes.length - 1];
   if (!latest?.gaps.length) {
     log('info', `${label}: no photo-overlap gaps detected; median step ${latest?.medianStepDeg ?? '—'}°.`);
@@ -1198,6 +1351,10 @@ async function finishPass1() {
 
   survey.reproject(camera.intrinsics());
   logCaptureGaps('First lap');
+  coverage.reset();
+  guidance.reset();
+  state.lastCoverageAt = null;
+  state.guidance = null;
   director.beginPass2();
   log('info', `Verification pass planned: ${director.targets.length} sector(s) need more evidence.`);
   updateReport();
@@ -1270,6 +1427,12 @@ function resetSurvey() {
   state.signSamples = [];
   state.sensorCal = { stage: 'idle', startedAt: 0 };
   state.captureAudit = { counts: {}, events: [], lastReason: null, lastAt: 0 };
+  coverage.reset();
+  guidance.reset();
+  state.lastCoverageAt = null;
+  state.guidance = null;
+  state.guidanceTrail = [];
+  state.lastGuidanceState = null;
   state.obstructionProbe = {
     active: false, anchorYaw: null, startedAt: 0, frames: 0,
     lastCaptureAt: 0, parallax: false
@@ -1288,6 +1451,47 @@ function resetSurvey() {
   updateReport();
   syncControls();
   log('info', 'Survey reset.');
+}
+
+/**
+ * Everything the overlay needs to place the guidance dot in the live picture.
+ *
+ * The dot is a world bearing, so it has to be projected through the same pose
+ * the survey places keyframes with — the sensor attitude carried into the fused
+ * azimuth frame — or it would sit at the raw compass bearing and drift away
+ * from the coverage map it came from.
+ *
+ * Its altitude is simply wherever the camera is already looking. The dot asks
+ * for a turn, not a tilt: elevation is governed by the frame gates and their
+ * own arrows, and a target that also demanded a specific pitch would be two
+ * instructions at once for no gain.
+ */
+function guidanceView() {
+  if (!state.guidance || !state.running) return null;
+  const att = orientation.attitude();
+  const intr = camera.intrinsics();
+  const placed = quatMul(
+    yawQuat(angDiff(state.fusedYaw, orientation.rawYaw()) + (survey.yawDatum || 0)),
+    screenQuat(orientation.quat, orientation.screenAngle)
+  );
+  return {
+    ...state.guidance,
+    headingDeg: currentHeading(),
+    altitudeDeg: att.elevation,
+    quat: placed,
+    tanHalfH: intr.tanHalfH,
+    tanHalfV: intr.tanHalfV,
+    scores: coverage.score,
+    covered: coverageCoveredFlags()
+  };
+}
+
+/** Per-bin covered/not for the strip. Recomputed per frame; 180 bins is
+ *  nothing, and caching it would mean another thing to invalidate. */
+function coverageCoveredFlags() {
+  const flags = new Uint8Array(coverage.binCount);
+  for (let i = 0; i < coverage.binCount; i++) flags[i] = coverage.isCovered(i) ? 1 : 0;
+  return flags;
 }
 
 /* ------------------------------------------------------------------ render */
@@ -1318,7 +1522,8 @@ function renderLive() {
       ? 0
       : angDiff(state.fusedYaw, state.fusedYawAtKeyframe),
     lastRejectReason: state.captureAudit.lastReason,
-    glareFraction: state.glareFraction
+    glareFraction: state.glareFraction,
+    guidance: state.guidance
   };
   let d = director.directive(ctx);
   if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
@@ -1474,7 +1679,7 @@ function renderLive() {
   $('tKf').textContent = String(survey.keyframes.length);
   $('tMatch').textContent = state.visualQuality == null ? '—' : `${Math.round(state.visualQuality * 100)}%`;
 
-  drawOverlay($('overlay'), state.frame, d);
+  drawOverlay($('overlay'), state.frame, d, guidanceView());
   const view = { heading: state.running ? heading : NaN, hfovDeg: camera.hfovDeg, target: director.target, maxAlt: state.maxAlt };
   drawRing($('ring'), survey, view);
   drawRing($('miniRing'), survey, view);
@@ -1662,10 +1867,19 @@ function syncControls() {
   }
   if (p === PHASE.CALIBRATING) { btn.textContent = 'Calibrating…'; btn.disabled = true; return; }
   if (p === PHASE.PASS1) {
-    const enough = Math.abs(director.pass1Travel) >= 300 || survey.coverage().observedBins >= 700;
-    btn.textContent = enough
-      ? 'Close the loop and plan verification'
-      : `Keep turning — ${Math.abs(director.pass1Travel).toFixed(0)}° of 360° (${survey.coverage().observedBins} of 720 bins seen)`;
+    // Coverage is the primary signal now: the lap is done when the horizon has
+    // been observed well enough, not when the phone has been turned far enough.
+    // The travel and bin-count tests stay as a fallback so a session running
+    // without usable coverage data — no camera, an unfed map — is never trapped.
+    const done = coverage.completeness();
+    const enough = done.complete
+      || Math.abs(director.pass1Travel) >= 300
+      || survey.coverage().observedBins >= 700;
+    btn.textContent = done.complete
+      ? 'Horizon covered — plan verification'
+      : enough
+        ? 'Close the loop and plan verification'
+        : `Keep going — ${Math.round(done.fraction * 100)}% of the horizon covered`;
     // Never trap the operator behind a counter. If the ring shows the circle is
     // covered, the lap happened, whatever the accumulator says.
     btn.disabled = false;
@@ -1675,11 +1889,11 @@ function syncControls() {
   if (p === PHASE.ANALYSING) { btn.textContent = 'Analysing…'; btn.disabled = true; return; }
   if (p === PHASE.PASS2) {
     if (director.verificationSweep) {
-      const coverage = survey.coverage();
-      const enough = Math.abs(director.pass2Travel) >= 300 || coverage.verifiedBins >= 700;
+      const binCoverage = survey.coverage();
+      const enough = Math.abs(director.pass2Travel) >= 300 || binCoverage.verifiedBins >= 700;
       btn.textContent = enough
         ? 'Finish verification lap'
-        : `Keep turning - ${Math.abs(director.pass2Travel).toFixed(0)} degrees of 360 degrees (${coverage.verifiedBins} bins verified)`;
+        : `Keep turning - ${Math.abs(director.pass2Travel).toFixed(0)} degrees of 360 degrees (${binCoverage.verifiedBins} bins verified)`;
       btn.disabled = !enough;
     } else {
       btn.textContent = 'Finish survey';
@@ -2042,6 +2256,7 @@ async function buildPanorama() {
   for (const kf of kfs) {
     delete kf.bundleQuaternion;
     delete kf.bundleMovedDeg;
+    delete kf.bundleFocalScale;
   }
   const label = btn.textContent;
   btn.disabled = true; btn.textContent = 'Building…';
@@ -2082,6 +2297,18 @@ async function buildPanorama() {
           kfs[i].bundleQuaternion = renderKeyframes[i].bundleQuaternion;
           kfs[i].bundleMovedDeg = renderKeyframes[i].bundleMovedDeg;
         }
+      }
+      // The measured lens is recorded separately from the rotation refinement
+      // because it survives independently: a rotation solve can fail its sanity
+      // gate while the lens measurement stands, and the export has to be able
+      // to say which optics the panorama above was actually drawn with. Note
+      // this only ANNOTATES the keyframes — tanHalfH/tanHalfV on the survey
+      // keyframes stay at their capture-time values, so the 720-bin profile is
+      // untouched and the archive's camera block remains a capture record.
+      for (let i = 0; i < kfs.length; i++) {
+        const scale = renderKeyframes[i]?.bundleFocalScale;
+        if (Number.isFinite(scale) && scale !== 1) kfs[i].bundleFocalScale = scale;
+        else delete kfs[i].bundleFocalScale;
       }
     }
 
@@ -2126,13 +2353,13 @@ async function buildPanorama() {
     panoBuilt = true;
     $('panoSaveBtn').disabled = false;
 
-    const coverage = mosaic.painted / (mosaic.width * mosaic.height) * 100;
+    const paintedPct = mosaic.painted / (mosaic.width * mosaic.height) * 100;
     status.textContent = found
-      ? `${kfs.length} keyframes, ${found} with imagery, ${coverage.toFixed(0)}% of the sky panel painted, ${ms.toFixed(0)} ms.${optimization.applied ? ` Vision refined ${optimization.verifiedPairs} photo pairs while limiting tilt correction to ${optimization.maxTiltMovedDeg.toFixed(2)}°.` : ''}`
+      ? `${kfs.length} keyframes, ${found} with imagery, ${paintedPct.toFixed(0)}% of the sky panel painted, ${ms.toFixed(0)} ms.${optimization.applied ? ` Vision refined ${optimization.verifiedPairs} photo pairs while limiting tilt correction to ${optimization.maxTiltMovedDeg.toFixed(2)}°.` : ''}`
       : `${kfs.length} keyframes, geometry only — no photos were captured this session. Images are collected automatically during a survey; if this says zero, the camera was not delivering frames when the keyframes were taken. ("Embed keyframe images in archive", under Advanced, is a different thing — it only controls what goes into an exported archive.)`;
 
     $('panoFindings').textContent = panoramaFindings(dis, mosaic, found, renderKeyframes, optimization);
-    log('info', `Diagnostic panorama built: ${kfs.length} keyframes, imagery for ${found}, ${coverage.toFixed(1)}% painted, ${ms.toFixed(0)} ms.`, optimization);
+    log('info', `Diagnostic panorama built: ${kfs.length} keyframes, imagery for ${found}, ${paintedPct.toFixed(1)}% painted, ${ms.toFixed(0)} ms.`, optimization);
     const fc = optimization?.focalCheck;
     if (fc?.measured && Math.abs(fc.scale - 1) > 0.03) {
       log('warn', `The lens is ${((fc.scale - 1) * 100).toFixed(1)}% wider than recorded: ${fc.statedVfovDeg.toFixed(2)}° vertical was stated, ${fc.fittedVfovDeg.toFixed(2)}° measured from ${fc.pairCount} same-bearing pairs on different laps (r=${fc.correlation.toFixed(3)}). The panorama uses the measured value; the 720-bin profile still uses the stated one. Re-measure the lens under Advanced before the next survey.`, {
@@ -2232,7 +2459,7 @@ function panoramaFindings(dis, mosaic, found, kfs, optimization = null) {
   const single = dis.filter(d => d.n === 1).length;
   if (single) lines.push(`bins seen by one frame only     ${single}  (no cross-check possible)`);
 
-  const photoGaps = captureGapReport(survey.keyframes, survey.yawDatum || 0);
+  const photoGaps = captureGapReport(survey.keyframes, survey.yawDatum || 0, { minOverlap: overlapFloor(director.mode) });
   if (photoGaps.gapCount) {
     lines.push('');
     lines.push(`source-photo overlap gaps        ${photoGaps.gapCount}`);
@@ -2370,6 +2597,32 @@ async function exportCaptureDebugZip() {
         events: state.captureAudit.events.slice()
       },
       panoramaOptimization: state.pano?.optimization || null,
+      // Coverage-guided scanning: the map, the tuning that produced it, and a
+      // sampled trail of where the dot was with the frame quality at the time.
+      // The picture is the same data, for when the question is "why did the
+      // target sit there" and nobody wants to read an array of 180 floats.
+      scanCoverage: {
+        ...coverage.snapshot(),
+        tuning: { ...coverage.tuning },
+        guidance: state.guidance ? {
+          state: state.guidance.state,
+          bearingDeg: state.guidance.bearingDeg,
+          targetBearingDeg: state.guidance.rawBearingDeg,
+          offsetDeg: state.guidance.offsetDeg,
+          waitingSec: Number((state.guidance.waitingSec || 0).toFixed(2)),
+          tuning: { ...guidance.tuning }
+        } : { state: 'not-started', tuning: { ...guidance.tuning } },
+        bearings: Array.from({ length: coverage.binCount }, (_, i) => ({
+          bearingDeg: Number(coverage.bearingOf(i).toFixed(2)),
+          score: Number(coverage.score[i].toFixed(4)),
+          creditedFrames: coverage.observations[i],
+          sweptFrames: coverage.visits[i],
+          covered: coverage.isCovered(i)
+        })),
+        trail: state.guidanceTrail.slice()
+      },
+      coverageImage: await renderCoverageCard(coverage, state.guidance
+        ? { ...state.guidance, headingDeg: currentHeading() } : null),
       debugText: buildDebugBundle(),
       logText: L.dump()
     });
@@ -2446,7 +2699,15 @@ function debugSnapshot() {
       pass1Travel: director.pass1Travel,
       pass2Travel: director.pass2Travel,
       keyframes: survey.keyframes.length,
-      captureGaps: captureGapReport(survey.keyframes, survey.yawDatum || 0),
+      captureGaps: captureGapReport(survey.keyframes, survey.yawDatum || 0, { minOverlap: overlapFloor(director.mode) }),
+      // What the camera actually painted, and where the guidance dot was left.
+      // The map is per-lap, so this describes the lap in progress.
+      scanCoverage: coverage.snapshot(),
+      guidance: state.guidance ? {
+        bearingDeg: state.guidance.bearingDeg,
+        state: state.guidance.state,
+        waitingSec: Number(state.guidance.waitingSec?.toFixed(2)) || 0
+      } : null,
       captureAudit: {
         counts: { ...state.captureAudit.counts },
         eventCount: state.captureAudit.events.length,

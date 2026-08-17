@@ -13,13 +13,15 @@
  * the ground. Flare ghosts move with the camera rather than with the scene, so
  * matching on them tells the solver the world rotated when it did not.
  *
- * The focal-length UNKNOWN inside the bundle adjustment is deliberately not
- * exercised for accuracy here. It exists, it is off, and js/focal-check.js
- * records why: measured against the real capture the cost surface it would have
- * to descend is flat, because parallax from a nearby house dominates it. What
- * is checked is that the option stays off and stays harmless.
+ * The scale parameter is all that survives of an attempt to solve focal length
+ * inside the bundle adjustment itself. That was built, measured against the
+ * real capture, found to be descending a cost surface made flat by parallax
+ * from a nearby house, and removed. js/focal-check.js carries the numbers and
+ * measures the lens somewhere the parallax cancels instead. `rayOf` and
+ * `verifyPair` still take a scale, because the focal check has to ask what the
+ * world looks like through a different lens — which is what is pinned here.
  */
-import { extractFeatures, matchPair, refineRotations, overlappingPairs, rayOf, verifyPair } from '../js/bundle.js';
+import { extractFeatures, matchPair, rayOf, verifyPair } from '../js/bundle.js';
 import { quatMul, quatRotate, quatFromAxisAngle, cameraRay, DEG, RAD } from '../js/math3d.js';
 
 let failures = 0;
@@ -126,35 +128,6 @@ console.log('\n=== Blown highlights yield no features ===');
   check('a bright but unclipped scene is unaffected',
     Math.abs(bright.feats.length - clean.feats.length) <= 2,
     `${bright.feats.length} vs ${clean.feats.length}`);
-}
-
-console.log('\n=== The focal unknown is off, and harmless when switched on ===');
-{
-  const kf = makeKf();
-  const truth = Array.from({ length: 12 }, (_, i) => quatMul(
-    quatFromAxisAngle(0, 0, 1, i * 18 * DEG), quatFromAxisAngle(1, 0, 0, 90 * DEG)));
-  const rnd = rng(5);
-  const noisy = truth.map((q, i) => quatMul(quatMul(
-    quatFromAxisAngle(0, 0, 1, 0.5 * i * DEG),
-    quatFromAxisAngle(1, 0, 0, (rnd() - 0.5) * 0.4 * DEG)), q));
-  const srcs = truth.map(q => render(q));
-  const frames = noisy.map(q => ({ kf, q }));
-  const feats = srcs.map(s => extractFeatures(s, kf, { target: 150 }));
-  const pairs = overlappingPairs(frames).map(p => ({
-    ...p,
-    matches: verifyPair(matchPair(feats[p.i], feats[p.j], kf, kf, frames[p.i].q, frames[p.j].q),
-      kf, kf, frames[p.i].q, frames[p.j].q)
-  })).filter(p => p.matches.length >= 6);
-
-  const off = refineRotations(frames, pairs, { iterations: 24 });
-  check('reports scale exactly 1 when not solving focal', off.focalScale === 1, `${off.focalScale}`);
-
-  const on = refineRotations(frames, pairs, { iterations: 24, solveFocal: true });
-  check('stays inside its clamp when solving focal',
-    Math.abs(on.focalScale - 1) < 0.2, `${on.focalScale.toFixed(4)}`);
-  check('does not wreck the rotation solution',
-    Number.isFinite(on.rmsDeg) && on.rmsDeg < off.rmsDeg * 1.5,
-    `rms ${on.rmsDeg.toFixed(4)}° vs ${off.rmsDeg.toFixed(4)}°`);
 }
 
 console.log('\n=== verifyPair honours the scale it is verifying at ===');

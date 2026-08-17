@@ -11,8 +11,9 @@
  * reason for the most recent rejection. Nothing new had to be measured. It only
  * had to be checked, and said.
  */
-import { captureStall, maxUsableStepDeg, MIN_PHOTO_OVERLAP } from '../js/capture-policy.js';
-import { ScanDirector, PHASE } from '../js/guide.js';
+import { captureStall, maxUsableStepDeg, overlapFloor, MIN_PHOTO_OVERLAP,
+  pass1OverTravel, PASS1_PROMPT_DEG, PASS1_REFUSE_DEG } from '../js/capture-policy.js';
+import { ScanDirector, PHASE, MODES } from '../js/guide.js';
 import { Survey } from '../js/survey.js';
 
 let failures = 0;
@@ -21,16 +22,32 @@ const check = (name, ok, detail) => {
   if (!ok) failures++;
 };
 
-console.log('=== The threshold matches the gap report exactly ===');
+console.log('=== One overlap policy, parameterised by mode ===');
 {
-  // If these two disagreed, the live warning and the end-of-pass gap list would
-  // describe different worlds, and the operator would be sent back for photos
-  // the report did not want — or worse, not sent back for ones it did.
+  // If the live warning, the recovery bearings and the end-of-pass gap list used
+  // different overlap floors, the operator would be sent back for photos the
+  // report did not want — or worse, not sent back for ones it did. On a tripod,
+  // which needs MORE overlap than handheld, the loose default would have stayed
+  // quiet until well past the mode's own limit.
   const fov = 45.6;
-  check('desired maximum step mirrors captureGapReport',
-    Math.abs(maxUsableStepDeg(fov) - fov * (1 - MIN_PHOTO_OVERLAP)) < 1e-9,
-    `${maxUsableStepDeg(fov).toFixed(2)}°`);
-  check('minimum overlap is the 35% the gap report requires', MIN_PHOTO_OVERLAP === 0.35);
+  check('the default is the 35% captureGapReport has always used',
+    MIN_PHOTO_OVERLAP === 0.35 && overlapFloor(null) === 0.35);
+  check('handheld uses its own looser floor', overlapFloor(MODES.handheld) === 0.30);
+  check('tripod uses its own stricter floor', overlapFloor(MODES.tripod) === 0.45);
+  check('a tripod is warned sooner than a handheld',
+    maxUsableStepDeg(fov, overlapFloor(MODES.tripod))
+      < maxUsableStepDeg(fov, overlapFloor(MODES.handheld)),
+    `${maxUsableStepDeg(fov, 0.45).toFixed(1)}° vs ${maxUsableStepDeg(fov, 0.30).toFixed(1)}°`);
+  check('the step is exactly fov x (1 - overlap)',
+    Math.abs(maxUsableStepDeg(fov, 0.45) - fov * 0.55) < 1e-9);
+
+  // Same sweep, two modes: the tripod must ask for more of it back.
+  const args = { sinceMs: 9000, travelDeg: -40, hfovDeg: fov, reason: 'frame-noSky' };
+  const hand = captureStall({ ...args, minOverlap: overlapFloor(MODES.handheld) });
+  const tripod = captureStall({ ...args, minOverlap: overlapFloor(MODES.tripod) });
+  check('a 40° sweep is a stall on a tripod', tripod.stalled === true);
+  check('and the tripod is asked back further', tripod.returnDeg > hand.returnDeg,
+    `${tripod.returnDeg.toFixed(1)}° vs ${hand.returnDeg.toFixed(1)}°`);
 }
 
 console.log('\n=== Normal dense capture never trips it ===');
@@ -47,7 +64,10 @@ console.log('\n=== Normal dense capture never trips it ===');
 
 console.log('\n=== The 2026-08-15 gap is caught ===');
 {
-  const s = captureStall({ sinceMs: 14232, travelDeg: -68.94, hfovDeg: 45.6, reason: 'frame-noSky' });
+  const s = captureStall({
+    sinceMs: 14232, travelDeg: -68.94, hfovDeg: 45.6, reason: 'frame-noSky',
+    minOverlap: overlapFloor(MODES.handheld)
+  });
   check('it fires', s.stalled === true, s.kind);
   check('it is classified as lost coverage', s.kind === 'coverage-lost');
   check('it reports the uncovered arc', Math.abs(s.uncoveredDeg - 23.34) < 0.1,
@@ -56,7 +76,7 @@ console.log('\n=== The 2026-08-15 gap is caught ===');
   // middle of the hole. Turning back to the midpoint leaves the far side just
   // as unmatched as it was.
   check('it asks for a return to the edge of recoverable overlap',
-    Math.abs(s.returnDeg - (68.94 - 45.6 * 0.65)) < 0.01, `${s.returnDeg.toFixed(2)}°`);
+    Math.abs(s.returnDeg - (68.94 - 45.6 * 0.70)) < 0.01, `${s.returnDeg.toFixed(2)}°`);
   check('it carries the reason through', s.reason === 'frame-noSky');
 }
 
@@ -94,12 +114,12 @@ console.log('\n=== The director says it in words, with a bearing ===');
   });
   console.log(`   "${d.headline}" — ${d.detail}`);
   check('it is a corrective instruction, not a status line', d.tone === 'fix');
-  check('the headline says how far to turn back', /Turn back 39/.test(d.headline), d.headline);
+  check('the headline says how far to turn back', /Turn back 37/.test(d.headline), d.headline);
   check('the detail states how far was swept for nothing',
     /69° swept with no photograph accepted/.test(d.detail), d.detail);
   check('the detail states how much of the circle has no image',
     /23° of the circle now has no image/.test(d.detail));
-  check('the detail names a bearing to return to', /back to about 335\.7° NNW/.test(d.detail));
+  check('the detail names a bearing to return to', /back to about 333\.4° NNW/.test(d.detail), d.detail);
   check('the arrow points clockwise, back the way they came', d.arrow > 0, `${d.arrow}`);
   check('it outranks the plain frame complaint', !/No sky visible/.test(d.headline));
 }
@@ -154,6 +174,38 @@ console.log('\n=== A lap that will not close is stopped anyway ===');
     lastRejectReason: 'spacing-not-reached', glareFraction: 0
   });
   check('a normal lap in progress is left alone', !/Stop/.test(ok.headline), ok.headline);
+}
+
+console.log('\n=== The over-travel prompt has teeth, but not too early ===');
+{
+  // A prompt at 400 and a refusal at 500, and the gap between them is the point.
+  // The number being tested is integrated gyro yaw; its scale is measured but
+  // not infallible, and a gyro over-reporting by 15% would reach "400" at a real
+  // 348. Refusing there would trade an old failure mode for a new one.
+  check('a normal lap is untouched', !pass1OverTravel(-352).prompt);
+  check('one full circle plus a little is untouched', !pass1OverTravel(-380).prompt);
+  check('the prompt fires past 400', pass1OverTravel(-410).prompt === true);
+  check('but photographs are still accepted there',
+    pass1OverTravel(-410).refuseNewSweeps === false);
+  check('refusal only past 500', pass1OverTravel(-505).refuseNewSweeps === true);
+  check('the 2026-08-15 run would have been stopped',
+    pass1OverTravel(-714.4).refuseNewSweeps === true);
+  check('direction does not matter', pass1OverTravel(714.4).refuseNewSweeps === true);
+  check('the two thresholds leave room for a scale error',
+    PASS1_REFUSE_DEG - PASS1_PROMPT_DEG >= 100,
+    `${PASS1_PROMPT_DEG}° then ${PASS1_REFUSE_DEG}°`);
+
+  const director = new ScanDirector(new Survey());
+  director.beginPass1(0);
+  director.pass1Travel = -714.4;
+  const d = director.directive({
+    heading: 7, elevation: 0, roll: 0, rotationRate: 9, stillness: 0.6, overlap: 0.8,
+    frameStatus: 'ok', visualQuality: 0.5, jitterDeg: 0.2, hfovDeg: 45.6,
+    hasAcceptedFrame: true, sinceKeyframeMs: 800, travelSinceKeyframeDeg: -8,
+    lastRejectReason: 'spacing-not-reached', glareFraction: 0
+  });
+  check('and the operator is told capture has stopped',
+    /no further pass-1 photographs are being recorded/.test(d.detail), d.detail);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall passed');
