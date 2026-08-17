@@ -360,6 +360,85 @@ console.log('\n=== A sliver at a seam does not hold the survey hostage ===');
     `${map.completeness().remainingDeg}° remaining`);
 }
 
+console.log('\n=== A sector taller than the frame is not finished ===');
+{
+  /* The 2026-08-17 capture reported 99% covered and still had a hole above the
+   * house: 84 frames were refused for clipping and the guidance never once
+   * asked for a tilt. Horizontal coverage was never the whole question. */
+  const map = new CoverageMap();
+  const guide = new ScanGuidance();
+  const tall = 120;
+  let h = 0;
+  for (let i = 0; i < 400; i++) {
+    const clipped = Math.abs(angDiff(h, tall)) < 10 ? 0.4 : 0;
+    map.observe(goodFrame(h, { dtSec: 0.1, vfovDeg: 35, clippedFraction: clipped }));
+    h = wrap360(h - 0.9);
+  }
+  const done = map.completeness();
+  console.log(`   ${done.coveredBins}/${done.binCount} complete, ${done.binsNeedingLift} awaiting a taller look, highest request ${done.highestRequestedElevationDeg}°`);
+  check('the tall sector is recorded as needing a lift',
+    done.binsNeedingLift > 0, `${done.binsNeedingLift} bins`);
+  check('and the scan is therefore not complete', done.complete === false);
+  check('a required elevation was worked out', map.requiredElevationAt(tall) > 5,
+    `${map.requiredElevationAt(tall).toFixed(1)}°`);
+  check('the flat sectors are unaffected', map.completeAt(tall + 90) === true);
+
+  const g = guide.update({
+    coverage: map, headingDeg: tall, elevationDeg: 2, dtSec: 0.1, hfovDeg: 45.6
+  });
+  console.log(`   dot at ${g.bearingDeg?.toFixed(0)}° bearing, ${g.elevationDeg?.toFixed(1)}° elevation, wantsLift=${g.wantsLift}`);
+  check('the dot asks for a tilt', g.wantsLift === true);
+  check('and sits above the camera', g.elevationDeg > 2, `${g.elevationDeg?.toFixed(1)}°`);
+  check('by a stated amount', g.liftDeg > 1, `${g.liftDeg}°`);
+
+  // The remedy is a raised SWEEP, not a raised stare: a clipped frame cannot
+  // say which bearing inside it was the tall one, so the requirement is
+  // recorded across the field and has to be answered across the field too.
+  const lifted = map.requiredElevationAt(tall);
+  for (let sweepAt = tall - 34; sweepAt <= tall + 34; sweepAt += 1) {
+    for (let i = 0; i < 4; i++) {
+      map.observe(goodFrame(wrap360(sweepAt), {
+        dtSec: 0.1, vfovDeg: 35, clippedFraction: 0, elevationDeg: lifted
+      }));
+    }
+  }
+  check('a high, unclipped look satisfies the sector', map.needsLiftAt(tall) === false);
+  check('sweeping it at that elevation clears the whole run',
+    map.completeness().binsNeedingLift === 0,
+    `${map.completeness().binsNeedingLift} left`);
+  check('and the scan can then complete', map.completeness().complete === true);
+}
+
+console.log('\n=== The dot only asks for a tilt where one is needed ===');
+{
+  const map = new CoverageMap();
+  const guide = new ScanGuidance();
+  let h = 0;
+  for (let i = 0; i < 120; i++) {
+    map.observe(goodFrame(h, { dtSec: 0.1, vfovDeg: 35, clippedFraction: 0 }));
+    guide.update({ coverage: map, headingDeg: h, elevationDeg: 4, dtSec: 0.1, hfovDeg: 45.6 });
+    h = wrap360(h - 1);
+  }
+  const g = guide.update({ coverage: map, headingDeg: h, elevationDeg: 4, dtSec: 0.1, hfovDeg: 45.6 });
+  check('no lift is requested on ordinary horizon', g.wantsLift === false);
+  check('and the dot rides at the camera elevation',
+    Math.abs(g.elevationDeg - 4) < 1.5, `${g.elevationDeg?.toFixed(2)}° vs 4°`);
+}
+
+console.log('\n=== An unreachable top does not trap the operator ===');
+{
+  // Something enormous and very close. The request is capped, so raising the
+  // camera as far as the app allows settles it rather than looping forever.
+  const map = new CoverageMap();
+  for (let i = 0; i < 40; i++) {
+    map.observe(goodFrame(200, { dtSec: 0.1, vfovDeg: 35, clippedFraction: 0.9, elevationDeg: 40 }));
+  }
+  const required = map.requiredElevationAt(200);
+  check('the request is capped at the tunable ceiling',
+    required <= COVERAGE_TUNING.maxRequestedElevationDeg + 1e-6,
+    `${required.toFixed(1)}° vs cap ${COVERAGE_TUNING.maxRequestedElevationDeg}°`);
+}
+
 console.log('\n=== Everything is tunable from one object ===');
 {
   const coarse = new CoverageMap({ binSizeDeg: 5, coverageThreshold: 0.5, minObservations: 2 });

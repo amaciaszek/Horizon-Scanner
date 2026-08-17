@@ -433,6 +433,21 @@ export class ScanDirector {
     const away = Math.abs(g.offsetDeg);
     const arrow = g.offsetDeg > 0 ? +Math.max(1, Math.round(away)) : -Math.max(1, Math.round(away));
 
+    /*
+     * Tilt outranks turn, but only once the operator is roughly on the bearing.
+     * Something stands here whose top has never been inside a frame, and no
+     * amount of turning will fix that — which is exactly what the 2026-08-17
+     * capture did for eighty-four frames while the dot sat on the horizon.
+     */
+    if (g.wantsLift && away < 25) {
+      return {
+        tone: 'work',
+        headline: `Tilt up ${Math.max(1, Math.round(g.liftDeg))}° — this is taller than the frame`,
+        detail: `The top of what stands here has never been inside a picture, so its height is unmeasured. Raise the camera until the target sits on it, keeping the same spot on the ground. ${pct}% of the horizon done.`,
+        arrow: 0, tilt: +1, phase: this.phase, progress: g.summary.fraction
+      };
+    }
+
     if (g.state === 'waiting' && away < 25) {
       return say('work', 'Hold here — filling this section',
         `This part of the horizon still needs more. Keep the camera on the target and move slowly; it will move on by itself. ${pct}% of the horizon done.`,
@@ -448,6 +463,11 @@ export class ScanDirector {
         `${pct}% of the horizon covered. Keep the target near the middle of the picture.`,
         arrow, g.summary.fraction);
     }
+    if (g.wantsLift) {
+      return say('work', `Follow the target — ${g.offsetDeg > 0 ? 'right' : 'left'} and up`,
+        `${pct}% covered. The next section is taller than the frame, so the target sits above the horizon; raise the camera to meet it.`,
+        arrow, g.summary.fraction);
+    }
     return say('good', 'Following the target',
       `${pct}% of the horizon covered. Keep sweeping smoothly; the target moves on as each section fills in.`,
       arrow, g.summary.fraction);
@@ -456,7 +476,18 @@ export class ScanDirector {
   /** Frame-level problems that make the current view unusable. */
   _frameProblem(ctx) {
     if (ctx.frameStatus === 'tooHigh') {
-      return { tone: 'fix', headline: 'Tilt down — too close to straight up', detail: 'Measurements above 78° elevation are rejected because yaw becomes unstable near the zenith. Tilt down below 70°, then use the high-obstruction probe while keeping the phone in the same place.', arrow: null, tilt: -1, phase: this.phase };
+      /*
+       * The gate is on the MAGNITUDE of elevation, so it catches the camera
+       * pointing at the ground just as readily as at the zenith — and on the
+       * 2026-08-17 capture that is overwhelmingly what it caught: 290 frames,
+       * median elevation -81 degrees, which is a phone held flat while the
+       * operator reads the screen. Telling that person to tilt down is the
+       * exact opposite of the remedy, so the two cases now say different things.
+       */
+      const pointingDown = Number.isFinite(ctx.elevation) && ctx.elevation < 0;
+      return pointingDown
+        ? { tone: 'fix', headline: 'Raise the camera to the horizon', detail: 'The camera is pointing at the ground, so there is no skyline in the picture to measure. Bring it up until the horizon sits across the middle of the frame.', arrow: null, tilt: +1, phase: this.phase }
+        : { tone: 'fix', headline: 'Tilt down — too close to straight up', detail: 'Measurements above 78° elevation are rejected because yaw becomes unstable near the zenith. Tilt down below 70°, then use the high-obstruction probe while keeping the phone in the same place.', arrow: null, tilt: -1, phase: this.phase };
     }
     if (ctx.frameStatus === 'parallax') {
       return { tone: 'fix', headline: 'Phone position moved', detail: 'Return the phone to the same spot and hold it still. Moving sideways while viewing a nearby roof changes its apparent direction and cannot be corrected as rotation.', arrow: null, tilt: null, phase: this.phase };

@@ -517,10 +517,12 @@ async function processFrame() {
     }
 
     // ---- frame quality gates --------------------------------------------
+    let clippedFraction = 0;
     if (seg && !seg.error) {
       state.frame = seg;
       let clippedTop = 0;
       for (let i = 0; i < seg.flags.length; i++) if (seg.flags[i] === 1) clippedTop++;
+      clippedFraction = seg.flags.length ? clippedTop / seg.flags.length : 0;
       // A sky boundary can only be measured if there is light to measure it
       // by. At night the whole premise inverts — the sky is the dark region and
       // the ground carries the bright lights — so every cue the segmenter uses
@@ -564,12 +566,18 @@ async function processFrame() {
         frameStatus: state.frameStatus,
         trackingLost: state.trackingLost,
         hfovDeg: camera.hfovDeg,
+        // Elevation inputs: how tall the frame is, and how much of the skyline
+        // ran off its top edge. Together these are what let the map know a
+        // sector has a top nobody has measured.
+        vfovDeg: camera.intrinsics().vfovDeg,
+        clippedFraction,
         dtSec,
         atMs: t
       });
       state.guidance = guidance.update({
         coverage,
         headingDeg: currentHeading(),
+        elevationDeg: att.elevation,
         dtSec: dtSec ?? 0.1,
         nowMs: t,
         hfovDeg: camera.hfovDeg
@@ -1484,10 +1492,10 @@ function resetSurvey() {
  * azimuth frame — or it would sit at the raw compass bearing and drift away
  * from the coverage map it came from.
  *
- * Its altitude is simply wherever the camera is already looking. The dot asks
- * for a turn, not a tilt: elevation is governed by the frame gates and their
- * own arrows, and a target that also demanded a specific pitch would be two
- * instructions at once for no gain.
+ * Its altitude comes from the guidance layer. Normally that is wherever the
+ * camera already looks, so the dot asks for a turn and nothing else. Where the
+ * coverage map has recorded an obstruction whose top has never been inside a
+ * frame, the dot climbs instead, and following it is the instruction to tilt up.
  */
 function guidanceView() {
   if (!state.guidance || !state.running) return null;
@@ -1500,7 +1508,9 @@ function guidanceView() {
   return {
     ...state.guidance,
     headingDeg: currentHeading(),
-    altitudeDeg: att.elevation,
+    altitudeDeg: Number.isFinite(state.guidance.elevationDeg)
+      ? state.guidance.elevationDeg : att.elevation,
+    cameraElevationDeg: att.elevation,
     quat: placed,
     tanHalfH: intr.tanHalfH,
     tanHalfV: intr.tanHalfV,

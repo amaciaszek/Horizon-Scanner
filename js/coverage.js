@@ -108,7 +108,33 @@ export const COVERAGE_TUNING = {
 
   /** Fraction of the circle allowed to remain uncovered at completion. 0.015 is
    *  about five degrees, roughly two bins. */
-  completionTolerance: 0.015
+  completionTolerance: 0.015,
+
+  /* ---- elevation ---------------------------------------------------------
+   * A sector is not surveyed just because the camera looked at its horizon. If
+   * the obstruction runs off the top of the frame, the thing being measured —
+   * how high it stands — is precisely what was not seen. The 2026-08-17 capture
+   * refused 84 frames for exactly that and the guidance never once asked the
+   * operator to tilt up, which is why the finished panorama has a hole above
+   * the house.
+   */
+
+  /** Fraction of skyline columns running off the top edge before the sector is
+   *  treated as needing a higher look. Deliberately far below the 0.22 that
+   *  makes the whole frame unusable: a sector can be credited as covered while
+   *  a tenth of the obstruction is still above the frame, and that tenth is the
+   *  part the survey exists to measure. */
+  clippedFractionForLift: 0.02,
+
+  /** How much of the vertical field to gain per request, as a fraction. Asking
+   *  for the full half-field would overshoot and lose the horizon out of the
+   *  bottom; this converges in two or three looks. */
+  liftFraction: 0.4,
+
+  /** Never ask for more than this. Beyond it yaw becomes unreliable and the
+   *  high-obstruction probe is the right tool, so a sector that still clips
+   *  here is marked satisfied rather than left as an impossible errand. */
+  maxRequestedElevationDeg: 55
 };
 
 /** Frame states that mean the camera did not usefully observe anything. */
@@ -156,6 +182,12 @@ export class CoverageMap {
     // nothing" apart from "not reached yet" and those are different facts.
     this.visits = new Uint16Array(this.binCount);
     this.bestQuality = new Float32Array(this.binCount);
+    /* How high the camera must look here to see the top of what stands here,
+     * and the highest unclipped look actually achieved. When the second falls
+     * short of the first, the sector has a top nobody has measured. */
+    this.requiredElevation = new Float32Array(this.binCount);
+    this.satisfiedElevation = new Float32Array(this.binCount);
+    this.satisfiedElevation.fill(-Infinity);
     this.lastYawRate = null;
     this.lastObservedAt = null;
     this.totalObservations = 0;
@@ -237,6 +269,9 @@ export class CoverageMap {
     const t = this.tuning;
     const heading = Number(sample.headingDeg);
     if (!Number.isFinite(heading)) return { credited: false, reason: 'no-heading', quality: 0 };
+    const elevationDeg = Number(sample.elevationDeg);
+    const vfovDeg = Number(sample.vfovDeg);
+    const clippedFraction = Number(sample.clippedFraction) || 0;
 
     const dtSec = Number.isFinite(sample.dtSec)
       ? clamp(sample.dtSec, 0, t.maxFrameGapSec)
@@ -261,6 +296,24 @@ export class CoverageMap {
       // "swept through and got nothing" is precisely the state the guidance dot
       // has to recognise in order to wait for the operator.
       if (this.visits[index] < 65535) this.visits[index]++;
+
+      /*
+       * Elevation bookkeeping, done for EVERY frame including the rejected
+       * ones. A frame refused for clipping is the single most informative
+       * frame about this sector: it is the app saying "there is more above
+       * here than I can see". Skipping it because its quality was zero is how
+       * the information got thrown away.
+       */
+      if (Number.isFinite(elevationDeg) && Number.isFinite(vfovDeg) && vfovDeg > 1) {
+        if (clippedFraction > t.clippedFractionForLift) {
+          const wanted = Math.min(t.maxRequestedElevationDeg, elevationDeg + vfovDeg * t.liftFraction);
+          if (wanted > this.requiredElevation[index]) this.requiredElevation[index] = wanted;
+        } else if (quality > 0 && elevationDeg > this.satisfiedElevation[index]) {
+          // An unclipped look here reached this high and saw the top.
+          this.satisfiedElevation[index] = elevationDeg;
+        }
+      }
+
       if (quality <= 0) continue;
 
       // Raised cosine from 1 at the axis to `edgeWeight` at the usable edge.
@@ -312,6 +365,43 @@ export class CoverageMap {
   }
 
   /**
+   * How high the camera should look here, or 0 where the horizon is enough.
+   * This is what the guidance dot rides on vertically.
+   */
+  requiredElevationAt(headingDeg) {
+    return this.requiredElevation[this.indexOf(headingDeg)];
+  }
+
+  /**
+   * Has anything been seen standing above this sector that nobody has measured
+   * the top of?
+   *
+   * A sector can be fully "covered" in the horizontal sense and still fail
+   * this: the camera looked, the skyline was traced, and the top of the
+   * obstruction was above the frame the whole time. That is the state that put
+   * a black hole above the house in the 2026-08-17 panorama.
+   */
+  needsLift(index) {
+    const i = ((index % this.binCount) + this.binCount) % this.binCount;
+    const required = this.requiredElevation[i];
+    if (!(required > 0)) return false;
+    return this.satisfiedElevation[i] < required - 1;
+  }
+
+  needsLiftAt(headingDeg) {
+    return this.needsLift(this.indexOf(headingDeg));
+  }
+
+  /** Covered horizontally AND nothing left unmeasured above it. */
+  isComplete(index) {
+    return this.isCovered(index) && !this.needsLift(index);
+  }
+
+  completeAt(headingDeg) {
+    return this.isComplete(this.indexOf(headingDeg));
+  }
+
+  /**
    * Has the camera ever looked here at all, however badly?
    *
    * The distinction between "visited but not covered" and "never visited"
@@ -332,9 +422,14 @@ export class CoverageMap {
   /** Overall state of the scan. */
   completeness() {
     let covered = 0, sum = 0, weakest = 0, weakestIndex = 0;
+    let lifts = 0, highestRequest = 0;
     let lowest = Infinity;
     for (let i = 0; i < this.binCount; i++) {
-      if (this.isCovered(i)) covered++;
+      if (this.needsLift(i)) {
+        lifts++;
+        if (this.requiredElevation[i] > highestRequest) highestRequest = this.requiredElevation[i];
+      }
+      if (this.isComplete(i)) covered++;
       sum += this.score[i];
       if (this.score[i] < lowest) { lowest = this.score[i]; weakestIndex = i; }
     }
@@ -343,6 +438,11 @@ export class CoverageMap {
     return {
       binCount: this.binCount,
       coveredBins: covered,
+      /* Sectors whose horizon is covered but whose top is still above every
+       * frame taken there. Reported separately because the operator's remedy is
+       * different: tilt up, do not turn. */
+      binsNeedingLift: lifts,
+      highestRequestedElevationDeg: Number(highestRequest.toFixed(1)),
       fraction,
       meanScore: sum / this.binCount,
       weakestScore: weakest,

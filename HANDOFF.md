@@ -725,6 +725,50 @@ The original source ZIP was not modified.
 - Fixed the all-unverified-ring weak-sector case so it cannot falsely report no
   work remaining.
 
+### Elevation-aware guidance (v0.9.1)
+
+The 2026-08-17 evening capture worked: 56 photos, coverage reported 99%,
+guidance reached `complete`, the rotation refinement applied with 96 verified
+pairs at 0.307 degrees RMS, and the panorama genuinely stitched. It also had a
+hole above the house, and the archive said exactly why — 84 frames refused for
+`clippedTop` while the guidance dot sat on the horizon and never once asked for
+a tilt.
+
+Coverage now has a vertical dimension, though only a one-dimensional one:
+
+- `CoverageMap` records `requiredElevation` per bearing, raised whenever a frame
+  there ran off the top edge by more than `clippedFractionForLift` (2%, far
+  below the 22% that makes a frame unusable — a sector can be credited as
+  covered while a tenth of the obstruction is still above the frame, and that
+  tenth is what the survey exists to measure). The bookkeeping runs for EVERY
+  frame including refused ones, because a frame rejected for clipping is the
+  most informative frame about that sector.
+- `satisfiedElevation` records the highest unclipped look actually achieved.
+  When it falls short, `needsLift` is true and `isComplete` is false, so the
+  scan will not finish.
+- Requests are capped at `maxRequestedElevationDeg` (55) so a genuinely
+  unreachable top settles rather than becoming an impossible errand; the
+  high-obstruction probe is the tool beyond that.
+- `ScanGuidance` returns `elevationDeg` for the dot. Normally it rides at
+  whatever elevation the camera holds, asking for a turn and nothing else. Where
+  a top is unmeasured it climbs, and following the dot becomes the instruction
+  to tilt up. Verified on canvas: camera at 2 degrees, dot at 16, drawn at y=42
+  of 411 — which is where a 14-degree lift lands through a 29-degree field.
+
+Also fixed: `frame-tooHigh` gates on the MAGNITUDE of elevation, so it catches
+the camera pointing at the ground as readily as at the zenith. On this capture
+it fired 290 times at a median elevation of -81 degrees — a phone held flat
+while the operator reads the screen — and told them to tilt DOWN. The two cases
+now say different things.
+
+STILL OPEN, and the likely cause of the remaining dark band under the house:
+coverage is one-dimensional. With a 29.4-degree vertical field, a camera raised
+to 25 degrees to clear a roof spans roughly 10 to 40 degrees and sees nothing
+below that, and nothing in the model notices. Bearings 140-254 in this capture
+were all shot between 16 and 27.5 degrees of elevation. Covering 0 to 45 degrees
+needs either two elevation bands or the obstruction probe, and the coverage map
+would have to become a grid of azimuth by elevation to guide it.
+
 ### 2026-08-17: a build that recorded nothing, and what now prevents it
 
 A field session produced no skyline overlay, no coverage, no guidance dot and no

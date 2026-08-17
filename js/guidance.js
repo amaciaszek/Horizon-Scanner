@@ -65,6 +65,15 @@ export const GUIDANCE_TUNING = {
    *  advance. */
   stalledAfterSec: 2.0,
 
+  /** How far above the camera's current aim the dot may be asked to sit before
+   *  the interface starts saying "tilt up" in words as well as in position. */
+  liftPromptDeg: 8,
+
+  /** Smoothing for the dot's vertical travel, in seconds. Slower than the
+   *  horizontal: a target that bobs vertically while the operator is trying to
+   *  frame a roofline is worse than one that arrives a moment late. */
+  elevationSmoothingSec: 0.35,
+
   /** A stretch of swept-but-uncovered ground has to be at least this wide
    *  before the dot will turn the operator around for it. Every sweep leaves a
    *  thin under-exposed sliver at the trailing edge of wherever it began, and
@@ -99,6 +108,10 @@ export class ScanGuidance {
     this.lastGeneration = -1;
     this.waitingSec = 0;
     this.complete = false;
+    /** Where the dot sits vertically, smoothed. */
+    this.elevationDeg = null;
+    this.wantsLift = false;
+    this.liftDeg = 0;
   }
 
   /**
@@ -147,7 +160,7 @@ export class ScanGuidance {
     const maxLookBack = skip + Math.round(t.maxLeadDeg / step);
     for (let k = skip; k <= maxLookBack; k++) {
       const bearing = wrap360(headingDeg - dir * k * step);
-      if (coverage.coveredAt(bearing) || !coverage.visitedAt(bearing)) break;
+      if (coverage.completeAt(bearing) || !coverage.visitedAt(bearing)) break;
       behind = bearing;
       runDeg += step;
     }
@@ -158,7 +171,7 @@ export class ScanGuidance {
     let ahead = null;
     for (let k = 0; k < n; k++) {
       const bearing = wrap360(headingDeg + dir * k * step);
-      if (!coverage.coveredAt(bearing)) { ahead = bearing; break; }
+      if (!coverage.completeAt(bearing)) { ahead = bearing; break; }
     }
 
     if (ahead === null && behind === null) return null;
@@ -180,7 +193,7 @@ export class ScanGuidance {
     let lead = 0;
     while (!suppressLead && lead + step <= t.leadDeg) {
       const probe = wrap360(chosen + dir * (lead + step));
-      if (coverage.coveredAt(probe)) break;
+      if (coverage.completeAt(probe)) break;
       lead += step;
     }
     let target = wrap360(chosen + dir * lead);
@@ -201,7 +214,9 @@ export class ScanGuidance {
    * `dtSec` since the last call. Returns the current guidance state, which is
    * everything the renderer and the director need and nothing else.
    */
-  update({ coverage, headingDeg, dtSec = 1 / 30, nowMs = 0, hfovDeg = 45 } = {}) {
+  update({
+    coverage, headingDeg, dtSec = 1 / 30, nowMs = 0, hfovDeg = 45, elevationDeg = 0
+  } = {}) {
     const t = this.tuning;
     const summary = coverage.completeness();
     this.complete = summary.complete;
@@ -216,7 +231,7 @@ export class ScanGuidance {
     // Is the sector the camera is on right now still hungry? This decides both
     // whether to lead the dot onward and what the interface says.
     const hereScore = coverage.scoreAt(headingDeg);
-    const hungryHere = !coverage.coveredAt(headingDeg);
+    const hungryHere = !coverage.completeAt(headingDeg);
     this.lastHereScore = hereScore;
     this.lastHungryHere = hungryHere;
 
@@ -244,7 +259,7 @@ export class ScanGuidance {
      * finish where they are, the dot is still exactly where they must go next.
      */
     const stillWanted = this.rawBearingDeg !== null
-      && !coverage.coveredAt(this.rawBearingDeg);
+      && !coverage.completeAt(this.rawBearingDeg);
     // The second half of the same rule: even a target that is still wanted may
     // be reconsidered, but ONLY when some ground actually became covered since
     // the last decision. Turning the phone changes nothing here; covering the
@@ -275,6 +290,28 @@ export class ScanGuidance {
     }
     this.lastRawBearing = this.rawBearingDeg;
 
+    /*
+     * Where the dot sits vertically.
+     *
+     * By default it rides at whatever elevation the camera already holds, so it
+     * asks for a turn and nothing else — two instructions at once is one too
+     * many. But where the map has recorded that something stands above a sector
+     * whose top nobody has measured, the dot climbs to the elevation needed to
+     * see it, and following the dot becomes "tilt up" without a word being said.
+     */
+    const required = coverage.requiredElevationAt(this.rawBearingDeg);
+    const wantsLift = coverage.needsLiftAt(this.rawBearingDeg) && required > 0;
+    const desiredElevation = wantsLift ? required : elevationDeg;
+    if (this.elevationDeg === null) {
+      this.elevationDeg = desiredElevation;
+    } else {
+      const alpha = t.elevationSmoothingSec > 0
+        ? 1 - Math.exp(-dtSec / t.elevationSmoothingSec) : 1;
+      this.elevationDeg += (desiredElevation - this.elevationDeg) * alpha;
+    }
+    this.wantsLift = wantsLift;
+    this.liftDeg = wantsLift ? Math.max(0, required - elevationDeg) : 0;
+
     const behindOperator = distanceAlong(headingDeg, this.rawBearingDeg, t.sweepDirection) > 180;
     this.state = behindOperator ? 'behind'
       : this.waitingSec > t.stalledAfterSec ? 'waiting'
@@ -291,6 +328,10 @@ export class ScanGuidance {
       bearingDeg: this.bearingDeg,
       rawBearingDeg: this.rawBearingDeg,
       offsetDeg: off,
+      /** Vertical aim for the dot, and how far above the camera it is asking. */
+      elevationDeg: this.elevationDeg,
+      wantsLift: this.wantsLift,
+      liftDeg: Number((this.liftDeg || 0).toFixed(1)),
       state: this.state,
       complete: this.complete,
       waitingSec: this.waitingSec,

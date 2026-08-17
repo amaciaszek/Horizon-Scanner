@@ -13,7 +13,7 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.9.0';
+export const VERSION = '0.9.1';
 export const BUILD_DATE = '2026-08-17';
 
 /**
@@ -22,8 +22,8 @@ export const BUILD_DATE = '2026-08-17';
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'Coverage-guided scanning with the guidance dot. Fixes the 2026-08-17 build, '
-  + 'which threw on every frame and recorded nothing.';
+  'The guidance dot now climbs for obstructions taller than the frame, and a '
+  + 'sector is not finished until its top has been seen.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {
