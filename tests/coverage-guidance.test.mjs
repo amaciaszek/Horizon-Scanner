@@ -425,6 +425,88 @@ console.log('\n=== The dot only asks for a tilt where one is needed ===');
     Math.abs(g.elevationDeg - 4) < 1.5, `${g.elevationDeg?.toFixed(2)}° vs 4°`);
 }
 
+console.log('\n=== The tilt request cannot chase the camera upward ===');
+{
+  /*
+   * The 2026-08-17 21:00 failure, reproduced.
+   *
+   * The first version asked for `elevation + vfov * 0.4`, defined relative to
+   * where the camera was — so obeying it moved the reference and the next
+   * clipped frame asked for more again. The operator was ratcheted to 61.6
+   * degrees, the rotation solve failed its tilt sanity gate, and the panorama
+   * fell back to raw poses and came out incoherent exactly where the tilting
+   * had happened.
+   *
+   * Here the obstruction is genuinely tall but finite: its top sits at 30
+   * degrees, so a frame whose upper edge clears 30 sees it.
+   */
+  const map = new CoverageMap();
+  const vfov = 35, obstructionTopDeg = 30;
+  let elevation = 0;
+  const climb = [];
+  for (let step = 0; step < 25; step++) {
+    const topEdge = elevation + vfov / 2;
+    const clipped = topEdge < obstructionTopDeg ? 0.4 : 0;
+    for (let i = 0; i < 12; i++) {
+      map.observe(goodFrame(90, { dtSec: 0.1, vfovDeg: vfov, clippedFraction: clipped, elevationDeg: elevation }));
+    }
+    climb.push(Number(elevation.toFixed(1)));
+    // A perfectly obedient operator: go exactly where asked.
+    elevation = map.requiredElevationAt(90);
+  }
+  console.log(`   asked elevations: ${climb.slice(0, 8).join(', ')} …  final ${climb[climb.length - 1]}`);
+  check('the request settles instead of climbing forever',
+    climb[climb.length - 1] === climb[climb.length - 2], `${climb.slice(-3).join(' -> ')}`);
+  check('it never approaches the harsh angles of the field failure',
+    Math.max(...climb) < 30, `peaked at ${Math.max(...climb)}°`);
+  check('and the sector ends up satisfied', map.needsLiftAt(90) === false);
+}
+
+console.log('\n=== Steep frames are not punished for obeying the dot ===');
+{
+  // The other half of the runaway: tilting up drove the elevation ramp toward
+  // zero, so the sector could never fill no matter how well it was shot.
+  const map = new CoverageMap();
+  // Establish that this bearing needs a 25° look.
+  for (let i = 0; i < 20; i++) {
+    map.observe(goodFrame(90, { dtSec: 0.1, vfovDeg: 35, clippedFraction: 0.4, elevationDeg: 20 }));
+  }
+  const wanted = map.requiredElevationAt(90);
+  const obedient = new CoverageMap();
+  obedient.requiredElevation.set(map.requiredElevation);
+  obedient.obstructionTop.set(map.obstructionTop);
+  let credited = 0;
+  for (let i = 0; i < 30; i++) {
+    const r = obedient.observe(goodFrame(90, {
+      dtSec: 0.1, vfovDeg: 35, clippedFraction: 0, elevationDeg: wanted
+    }));
+    if (r.credited) credited++;
+  }
+  console.log(`   asked for ${wanted.toFixed(1)}°; a look at exactly that scored ${obedient.scoreAt(90).toFixed(3)}`);
+  check('a frame at the requested elevation earns full credit',
+    obedient.scoreAt(90) > 0.9, `${obedient.scoreAt(90).toFixed(3)}`);
+  check('every such frame counted', credited === 30, `${credited}/30`);
+}
+
+console.log('\n=== Beyond tilting, the operator is handed to the probe ===');
+{
+  // Something so tall and close that no reachable tilt frames its top.
+  const map = new CoverageMap();
+  let elevation = 0;
+  for (let step = 0; step < 12; step++) {
+    for (let i = 0; i < 12; i++) {
+      map.observe(goodFrame(200, { dtSec: 0.1, vfovDeg: 35, clippedFraction: 0.6, elevationDeg: elevation }));
+    }
+    elevation = map.requiredElevationAt(200);
+  }
+  console.log(`   settled at ${elevation.toFixed(1)}°, beyondTilt=${map.beyondTiltAt(200)}`);
+  check('the ask stops at the measured ceiling',
+    elevation <= COVERAGE_TUNING.maxRequestedElevationDeg + 1e-6,
+    `${elevation.toFixed(1)}° vs ${COVERAGE_TUNING.maxRequestedElevationDeg}°`);
+  check('the sector is flagged as a probe job', map.beyondTiltAt(200) === true);
+  check('and it stops blocking the scan', map.needsLiftAt(200) === false);
+}
+
 console.log('\n=== An unreachable top does not trap the operator ===');
 {
   // Something enormous and very close. The request is capped, so raising the

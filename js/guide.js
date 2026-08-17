@@ -439,6 +439,14 @@ export class ScanDirector {
      * amount of turning will fix that — which is exactly what the 2026-08-17
      * capture did for eighty-four frames while the dot sat on the horizon.
      */
+    if (g.beyondTilt && away < 25) {
+      return {
+        tone: 'warn',
+        headline: 'Too tall to frame by tilting',
+        detail: 'This stands higher than the camera can take in from here without pointing so steeply that the azimuth stops being reliable. Stop turning and use the high-obstruction probe, keeping the phone in exactly the same spot.',
+        arrow: 0, tilt: +1, phase: this.phase, progress: g.summary.fraction
+      };
+    }
     if (g.wantsLift && away < 25) {
       return {
         tone: 'work',

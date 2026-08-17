@@ -126,15 +126,28 @@ export const COVERAGE_TUNING = {
    *  part the survey exists to measure. */
   clippedFractionForLift: 0.02,
 
-  /** How much of the vertical field to gain per request, as a fraction. Asking
-   *  for the full half-field would overshoot and lose the horizon out of the
-   *  bottom; this converges in two or three looks. */
-  liftFraction: 0.4,
+  /** Where in the frame the top of an obstruction should sit once found, as a
+   *  fraction of the vertical field below the top edge. Asking for it dead
+   *  centre would throw the horizon out of the bottom of the picture. */
+  liftHeadroomFraction: 0.35,
 
-  /** Never ask for more than this. Beyond it yaw becomes unreliable and the
-   *  high-obstruction probe is the right tool, so a sector that still clips
-   *  here is marked satisfied rather than left as an impossible errand. */
-  maxRequestedElevationDeg: 55
+  /**
+   * The highest tilt this will ever ask for.
+   *
+   * 32, and the number is measured rather than chosen. The 2026-08-17 19:15
+   * capture peaked at 27.5 degrees of elevation and its rotation solve
+   * succeeded at 0.307 degrees RMS. The 21:00 capture was driven to 61.6 by a
+   * runaway in this very code, and the solve FAILED its sanity gate — 1.57
+   * degrees of tilt correction against a 1.0 limit — so the panorama fell back
+   * to raw sensor poses and came out incoherent exactly where the tilting had
+   * happened. Steep frames are where azimuth and roll stop being separable, and
+   * a request past this range damages the panorama it was meant to complete.
+   *
+   * Beyond it the answer is not "tilt further", it is the high-obstruction
+   * probe, and the sector is marked satisfied so the operator is never held
+   * hostage to an errand that cannot be run.
+   */
+  maxRequestedElevationDeg: 32
 };
 
 /** Frame states that mean the camera did not usefully observe anything. */
@@ -188,6 +201,12 @@ export class CoverageMap {
     this.requiredElevation = new Float32Array(this.binCount);
     this.satisfiedElevation = new Float32Array(this.binCount);
     this.satisfiedElevation.fill(-Infinity);
+    /** Lower bound on how high the obstruction here actually reaches, from the
+     *  top edge of any frame it overflowed. A fact about the world, so it only
+     *  ever refines upward and never follows the camera. */
+    this.obstructionTop = new Float32Array(this.binCount);
+    /** Taller than tilting can reach. The remedy is the obstruction probe. */
+    this.beyondTilt = new Uint8Array(this.binCount);
     this.lastYawRate = null;
     this.lastObservedAt = null;
     this.totalObservations = 0;
@@ -237,9 +256,25 @@ export class CoverageMap {
       jerk = Math.abs(sample.yawRateDegPerSec - this.lastYawRate) / sample.dtSec;
     }
 
+    /*
+     * Elevation is judged against what THIS BEARING needs, not against zero.
+     *
+     * The ramp exists because a frame pointed at the sky has not observed a
+     * skyline. But once the map has asked the operator to raise the camera for
+     * a tall sector, the raised frame is precisely the observation that was
+     * wanted — and scoring it against a flat horizon meant the two mechanisms
+     * fought. On 2026-08-17 that fight was unwinnable: the dot demanded more
+     * tilt, the tilt drove quality toward zero, the sector never filled, and so
+     * the dot demanded more tilt. Half that session was spent above 32 degrees
+     * earning frame qualities of 0.03.
+     */
+    const wanted = Number.isFinite(sample.requiredElevationDeg) ? sample.requiredElevationDeg : 0;
+    const elevationError = Number.isFinite(sample.elevationDeg)
+      ? sample.elevationDeg - wanted : null;
+
     const factors = [
       fallingRamp(sample.yawRateDegPerSec, t.comfortableRateDegPerSec, t.maxRateDegPerSec),
-      fallingRamp(sample.elevationDeg, t.comfortableElevationDeg, t.maxElevationDeg),
+      fallingRamp(elevationError, t.comfortableElevationDeg, t.maxElevationDeg),
       fallingRamp(sample.rollDeg, t.comfortableRollDeg, t.maxRollDeg),
       fallingRamp(jerk, t.comfortableJerkDegPerSec2, t.maxJerkDegPerSec2),
       fallingRamp(sample.jitterDeg, t.comfortableJitterDeg, t.maxJitterDeg),
@@ -277,7 +312,10 @@ export class CoverageMap {
       ? clamp(sample.dtSec, 0, t.maxFrameGapSec)
       : t.maxFrameGapSec * 0.5;
 
-    const quality = this.observationQuality({ ...sample, dtSec });
+    // What this bearing has already been shown to need, so the quality ramp can
+    // judge the frame against the right target rather than against the horizon.
+    const requiredElevationDeg = this.requiredElevation[this.indexOf(heading)];
+    const quality = this.observationQuality({ ...sample, dtSec, requiredElevationDeg });
     if (Number.isFinite(sample.yawRateDegPerSec)) this.lastYawRate = sample.yawRateDegPerSec;
 
     const hfov = Number.isFinite(sample.hfovDeg) && sample.hfovDeg > 1 ? sample.hfovDeg : 45;
@@ -306,8 +344,26 @@ export class CoverageMap {
        */
       if (Number.isFinite(elevationDeg) && Number.isFinite(vfovDeg) && vfovDeg > 1) {
         if (clippedFraction > t.clippedFractionForLift) {
-          const wanted = Math.min(t.maxRequestedElevationDeg, elevationDeg + vfovDeg * t.liftFraction);
-          if (wanted > this.requiredElevation[index]) this.requiredElevation[index] = wanted;
+          /*
+           * Anchor the requirement to the SCENE, never to the camera.
+           *
+           * The first version of this asked for `elevation + vfov * 0.4`, which
+           * is defined relative to where the camera happens to be — so obeying
+           * it moved the reference, and the next clipped frame asked for more
+           * again. It ratcheted the operator to 61.6 degrees on 2026-08-17 and
+           * wrecked the panorama on the way.
+           *
+           * What a clipped frame actually tells you is a fact about the world:
+           * the skyline here rises above this frame's top edge. That bound is a
+           * property of the obstruction, it only ever gets refined upward, and
+           * the tilt needed to see it follows from it rather than from the
+           * operator's current pose.
+           */
+          const topEdge = elevationDeg + vfovDeg / 2;
+          if (topEdge > this.obstructionTop[index]) this.obstructionTop[index] = topEdge;
+          const wanted = this.obstructionTop[index] - vfovDeg * t.liftHeadroomFraction;
+          this.requiredElevation[index] = Math.min(t.maxRequestedElevationDeg, Math.max(0, wanted));
+          if (wanted > t.maxRequestedElevationDeg) this.beyondTilt[index] = 1;
         } else if (quality > 0 && elevationDeg > this.satisfiedElevation[index]) {
           // An unclipped look here reached this high and saw the top.
           this.satisfiedElevation[index] = elevationDeg;
@@ -383,9 +439,18 @@ export class CoverageMap {
    */
   needsLift(index) {
     const i = ((index % this.binCount) + this.binCount) % this.binCount;
+    // Past the tilt ceiling there is nothing more to ask of a turning camera,
+    // so the sector stops blocking completion and becomes a probe job instead.
+    if (this.beyondTilt[i]) return false;
     const required = this.requiredElevation[i];
     if (!(required > 0)) return false;
     return this.satisfiedElevation[i] < required - 1;
+  }
+
+  /** Too tall to bring into frame by tilting. Reported so the interface can
+   *  point at the high-obstruction probe rather than repeat itself. */
+  beyondTiltAt(headingDeg) {
+    return this.beyondTilt[this.indexOf(headingDeg)] === 1;
   }
 
   needsLiftAt(headingDeg) {

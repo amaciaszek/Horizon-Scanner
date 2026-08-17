@@ -112,6 +112,7 @@ export class ScanGuidance {
     this.elevationDeg = null;
     this.wantsLift = false;
     this.liftDeg = 0;
+    this.beyondTilt = false;
   }
 
   /**
@@ -311,6 +312,10 @@ export class ScanGuidance {
     }
     this.wantsLift = wantsLift;
     this.liftDeg = wantsLift ? Math.max(0, required - elevationDeg) : 0;
+    // Taller than any tilt this will ask for. The remedy is the obstruction
+    // probe, and saying so is better than repeating an instruction that cannot
+    // succeed.
+    this.beyondTilt = coverage.beyondTiltAt(this.rawBearingDeg);
 
     const behindOperator = distanceAlong(headingDeg, this.rawBearingDeg, t.sweepDirection) > 180;
     this.state = behindOperator ? 'behind'
@@ -332,6 +337,7 @@ export class ScanGuidance {
       elevationDeg: this.elevationDeg,
       wantsLift: this.wantsLift,
       liftDeg: Number((this.liftDeg || 0).toFixed(1)),
+      beyondTilt: !!this.beyondTilt,
       state: this.state,
       complete: this.complete,
       waitingSec: this.waitingSec,

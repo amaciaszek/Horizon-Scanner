@@ -725,6 +725,41 @@ The original source ZIP was not modified.
 - Fixed the all-unverified-ring weak-sector case so it cannot falsely report no
   work remaining.
 
+### The tilt runaway, and why it wrecked the panorama (v0.9.2)
+
+The first elevation-aware build drove an operator to 61.6 degrees of tilt and
+produced an incoherent panorama. One root cause, two mistakes, and they
+compounded:
+
+**The request chased the camera.** `requiredElevation` was computed as
+`elevation + vfov * 0.4` — defined relative to where the camera was standing, so
+obeying it moved the reference and the next clipped frame asked for more again.
+It is now anchored to the scene: a clipped frame states a fact about the world,
+that the skyline here rises above this frame's top edge, and `obstructionTop`
+records that bound. It refines upward only, and the tilt follows from it.
+Replaying the real capture, the ask now caps at 32 instead of running to 61.6.
+
+**The quality ramp fought the request.** Elevation was scored against a flat
+horizon, so tilting up — which the dot had just demanded — drove observation
+quality toward zero. The sector could then never fill, so the dot demanded more
+tilt. Half that session sat above 32 degrees earning qualities around 0.03. The
+ramp now judges elevation against what the bearing has been shown to need, and a
+frame at the requested elevation scores 0.999 instead of 0.03.
+
+**The ceiling is measured, not chosen.** `maxRequestedElevationDeg` is 32
+because the 19:15 capture peaked at 27.5 and its rotation solve SUCCEEDED at
+0.307 degrees RMS, while the 21:00 capture reached 61.6 and the solve FAILED its
+sanity gate at 1.57 degrees of tilt correction against a 1.0 limit. The panorama
+then fell back to raw sensor poses and came out incoherent exactly where the
+tilting had happened. Steep frames are where azimuth and roll stop being
+separable, so a request past this range damages the panorama it was meant to
+complete. Beyond the ceiling a sector is flagged `beyondTilt`, stops blocking
+completion, and the interface hands the operator to the high-obstruction probe.
+
+The lesson worth keeping: a guidance signal that changes the thing it measures
+needs its reference anchored outside the control loop, and any gate that scores
+the operator's compliance must score it against what was actually asked.
+
 ### Elevation-aware guidance (v0.9.1)
 
 The 2026-08-17 evening capture worked: 56 photos, coverage reported 99%,
