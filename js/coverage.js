@@ -149,6 +149,11 @@ export const COVERAGE_TUNING = {
    *  part the survey exists to measure. */
   clippedFractionForLift: 0.02,
 
+  /** How much of the frame width has to have found a skyline before its highest
+   *  point is trusted as the top of the obstruction. A handful of columns can
+   *  catch a branch against the sky and say nothing about the roof behind it. */
+  minMeasuredFractionForTop: 0.15,
+
   /** Where in the frame the top of an obstruction should sit once found, as a
    *  fraction of the vertical field below the top edge. Asking for it dead
    *  centre would throw the horizon out of the bottom of the picture. */
@@ -221,7 +226,35 @@ export class CoverageMap {
     this.reset();
   }
 
-  reset() {
+  /**
+   * Clear the map for a new lap.
+   *
+   * `keepWorld` preserves everything that describes the SCENE rather than the
+   * lap: how tall the obstruction at each bearing is, how high the camera must
+   * be raised to frame it, and whether that has been achieved. Those are facts
+   * about a house and some trees; they do not stop being true because a second
+   * lap has begun.
+   *
+   * They used to be wiped. `finishPass1` called a bare reset(), so pass 2 began
+   * knowing nothing about height, could not ask for any lift, and the roof was
+   * simply never revisited — on the 2026-08-18 20:06 capture the exported map
+   * shows binsNeedingLift 0 and highestRequestedElevationDeg 0 for a lap taken
+   * in front of a house whose measured skyline reaches 67 degrees. That is the
+   * regression behind "before we did the two-pass thing we got the roof every
+   * time".
+   *
+   * Coverage confidence is NOT preserved, and should not be: verification is
+   * the whole point of a second lap, and a bin that carried its pass-1 score
+   * into pass 2 would be counted as verified without a second look.
+   */
+  reset({ keepWorld = false } = {}) {
+    const world = keepWorld && this.obstructionTop ? {
+      obstructionTop: this.obstructionTop.slice(),
+      measuredTop: this.measuredTop.slice(),
+      requiredElevation: this.requiredElevation.slice(),
+      satisfiedElevation: this.satisfiedElevation.slice(),
+      beyondTilt: this.beyondTilt.slice()
+    } : null;
     this.score = new Float32Array(this.binCount);
     this.observations = new Uint16Array(this.binCount);
     // Every bin the camera has pointed at, whether or not the frame was worth
@@ -236,6 +269,10 @@ export class CoverageMap {
     this.requiredElevation = new Float32Array(this.binCount);
     this.satisfiedElevation = new Float32Array(this.binCount);
     this.satisfiedElevation.fill(-Infinity);
+    /** The top of the obstruction as actually TRACED, where a frame has managed
+     *  to contain it. Unlike `obstructionTop` this is a measurement, not a
+     *  bound, and it is what satisfaction is judged against. */
+    this.measuredTop = new Float32Array(this.binCount);
     /** Lower bound on how high the obstruction here actually reaches, from the
      *  top edge of any frame it overflowed. A fact about the world, so it only
      *  ever refines upward and never follows the camera. */
@@ -252,6 +289,15 @@ export class CoverageMap {
      * far the phone turned. This is the mechanism that makes "the dot advances
      * because the horizon got covered" true rather than merely intended. */
     this.generation = 0;
+
+    // Put the scene back, if the caller is starting a lap rather than a survey.
+    if (world) {
+      this.obstructionTop.set(world.obstructionTop);
+      this.measuredTop.set(world.measuredTop);
+      this.requiredElevation.set(world.requiredElevation);
+      this.satisfiedElevation.set(world.satisfiedElevation);
+      this.beyondTilt.set(world.beyondTilt);
+    }
   }
 
   /** Bin index containing a bearing. */
@@ -378,6 +424,38 @@ export class CoverageMap {
        * the information got thrown away.
        */
       if (Number.isFinite(elevationDeg) && Number.isFinite(vfovDeg) && vfovDeg > 1) {
+        /*
+         * A DIRECT measurement of the obstruction's top, when the frame has one.
+         *
+         * This is the stronger of the two pieces of evidence available and it
+         * used to be discarded. A clipped frame yields only a bound — "the top
+         * is somewhere above this edge" — which is why `obstructionTop` sits a
+         * median 9.3 degrees below the truth on real captures. A frame that
+         * traced the top yields the answer outright.
+         *
+         * Recording it matters most for the thing it replaces. Satisfaction was
+         * `satisfiedElevation = elevationDeg`: point the camera high enough and
+         * the sector is marked done, whether or not the roofline was in the
+         * picture. Aiming OVER a roof into clear sky satisfied it fastest of
+         * all, because nothing clipped. Now a sector is satisfied only when the
+         * top has been seen with room to spare beneath the frame's top edge.
+         */
+        const measured = Number(sample.skylineTopDeg);
+        const measuredFraction = Number(sample.skylineMeasuredFraction) || 0;
+        const frameTop = elevationDeg + vfovDeg / 2;
+        if (Number.isFinite(measured) && measuredFraction >= t.minMeasuredFractionForTop
+            && clippedFraction <= t.clippedFractionForLift) {
+          if (measured > this.measuredTop[index]) this.measuredTop[index] = measured;
+          // Framed with headroom, so a top sitting on the very edge does not
+          // count. This is the test the old code should have been making.
+          const headroom = vfovDeg * t.liftHeadroomFraction;
+          if (measured <= frameTop - headroom * 0.5 && quality > 0) {
+            if (measured > this.satisfiedElevation[index]) {
+              this.satisfiedElevation[index] = measured;
+            }
+          }
+        }
+
         if (clippedFraction > t.clippedFractionForLift) {
           /*
            * Anchor the requirement to the SCENE, never to the camera.
@@ -396,12 +474,11 @@ export class CoverageMap {
            */
           const topEdge = elevationDeg + vfovDeg / 2;
           if (topEdge > this.obstructionTop[index]) this.obstructionTop[index] = topEdge;
-          const wanted = this.obstructionTop[index] - vfovDeg * t.liftHeadroomFraction;
+          // Prefer the measured top where one exists; fall back to the bound.
+          const best = Math.max(this.obstructionTop[index], this.measuredTop[index]);
+          const wanted = best - vfovDeg * t.liftHeadroomFraction;
           this.requiredElevation[index] = Math.min(t.maxRequestedElevationDeg, Math.max(0, wanted));
           if (wanted > t.maxRequestedElevationDeg) this.beyondTilt[index] = 1;
-        } else if (quality > 0 && elevationDeg > this.satisfiedElevation[index]) {
-          // An unclipped look here reached this high and saw the top.
-          this.satisfiedElevation[index] = elevationDeg;
         }
       }
 
@@ -652,6 +729,7 @@ export class CoverageMap {
        * arrays only the truth is recoverable and the reasoning is invisible.
        */
       obstructionTop: Array.from(this.obstructionTop, v => Number(v.toFixed(2))),
+      measuredTop: Array.from(this.measuredTop, v => Number(v.toFixed(2))),
       requiredElevation: Array.from(this.requiredElevation, v => Number(v.toFixed(2))),
       satisfiedElevation: Array.from(this.satisfiedElevation, v => Number(v.toFixed(2))),
       beyondTilt: Array.from(this.beyondTilt),

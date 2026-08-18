@@ -392,6 +392,68 @@ await check('the mosaic offers both blended and hard-cut modes', () => {
   return 'blend + nearest-axis';
 });
 
+/*
+ * The skyline top is the entire product. These three guard the path that
+ * measures it, and each corresponds to a specific way it has already failed.
+ */
+
+// 1. Satisfaction must come from seeing the top, not from pointing high.
+//    On the 2026-08-18 20:06 capture one frame aimed over the roof set
+//    satisfiedElevation to 56.5 on thirteen bins at once and the roof was never
+//    captured.
+await check('aiming over an obstruction does not mark it measured', () => {
+  const map = new coverage.CoverageMap();
+  map.reset();
+  const az = 90;
+  const i = map.indexOf(az);
+  // A frame high above the roof, clear sky, nothing traced.
+  map.observe({
+    headingDeg: az, elevationDeg: 56.5, vfovDeg: 33, clippedFraction: 0,
+    skylineTopDeg: null, skylineMeasuredFraction: 0,
+    skylineConfidence: 0.8, visualQuality: 0.6, dtSec: 0.1, atMs: 1
+  });
+  if (map.satisfiedElevation[i] > 0) {
+    throw new Error(`empty sky satisfied the bin at ${map.satisfiedElevation[i]}°`);
+  }
+  return 'not satisfied';
+});
+
+// 2. A frame that actually traces the top, with headroom, does satisfy it.
+await check('tracing the top with headroom satisfies the bin', () => {
+  const map = new coverage.CoverageMap();
+  map.reset();
+  const az = 90, i = map.indexOf(az);
+  map.observe({
+    headingDeg: az, elevationDeg: 40, vfovDeg: 33, clippedFraction: 0,
+    skylineTopDeg: 44, skylineMeasuredFraction: 0.9,
+    skylineConfidence: 0.8, visualQuality: 0.6, dtSec: 0.1, atMs: 1
+  });
+  if (!(map.measuredTop[i] >= 44)) throw new Error(`measuredTop ${map.measuredTop[i]}`);
+  if (!(map.satisfiedElevation[i] >= 44)) {
+    throw new Error(`traced top did not satisfy: ${map.satisfiedElevation[i]}`);
+  }
+  return `measuredTop ${map.measuredTop[i]}°`;
+});
+
+// 3. The height model must survive the pass boundary. This is the regression
+//    behind "before the two-pass thing we got the roof every time".
+await check('the height model survives a new lap', () => {
+  const map = new coverage.CoverageMap();
+  map.reset();
+  const az = 90, i = map.indexOf(az);
+  map.obstructionTop[i] = 60;
+  map.measuredTop[i] = 58;
+  map.requiredElevation[i] = 48;
+  map.score[i] = 0.95;
+  map.reset({ keepWorld: true });
+  if (map.requiredElevation[i] !== 48) throw new Error('required elevation was wiped');
+  if (map.obstructionTop[i] !== 60) throw new Error('obstruction top was wiped');
+  if (map.measuredTop[i] !== 58) throw new Error('measured top was wiped');
+  // ...but coverage confidence must NOT survive, or pass 2 verifies nothing.
+  if (map.score[i] !== 0) throw new Error('coverage score survived, so pass 2 verifies nothing');
+  return 'heights kept, confidence cleared';
+});
+
 await check('PHASE values', () => Object.values(guide.PHASE).join(','));
 await check('ScanDirector constructs', () => new guide.ScanDirector({ keyframes: [], coverage: () => ({}) }).phase);
 await check('guidance exports', () => Object.keys(guidance).join(','));

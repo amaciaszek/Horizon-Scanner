@@ -126,6 +126,10 @@ const state = {
   analysis: null,
   /** Fraction of the last traced skyline that ran off the top of the frame. */
   clippedFraction: null,
+  /** World elevation of the highest point the last frame actually traced, and
+   *  how much of the frame width contributed to it. */
+  skylineTopDeg: null,
+  skylineMeasuredFraction: 0,
   captureAudit: { counts: {}, events: [], lastReason: null, lastAt: 0 }
 };
 
@@ -540,6 +544,40 @@ async function processFrame() {
       // drove each lift decision, rather than leaving it inferable only by
       // recomputing every boundary offline.
       state.clippedFraction = clippedFraction;
+
+      /*
+       * The highest point of the skyline this frame actually traced, in world
+       * elevation.
+       *
+       * This is the measurement the lift model was missing. Until now a frame
+       * that did NOT clip contributed nothing but the camera's own pose, so a
+       * frame aimed over the top of a roof — containing no roofline at all —
+       * marked the sector "top seen". On the 2026-08-18 20:06 capture that put
+       * satisfiedElevation at 56.5 degrees across thirteen consecutive bins,
+       * all of them from one high frame, and the roof was never captured.
+       *
+       * The boundary rows are exactly where the skyline was found, so the top
+       * of the obstruction is simply the smallest row among the columns that
+       * found one. Flag 1 means the column ran off the top edge and flag 2
+       * means no obstruction was visible; neither measures a top.
+       */
+      let topRow = Infinity, measuredCols = 0;
+      for (let i = 0; i < seg.flags.length; i++) {
+        if (seg.flags[i] !== 0) continue;
+        measuredCols++;
+        const row = seg.boundary[i];
+        if (row < topRow) topRow = row;
+      }
+      if (measuredCols > 0 && Number.isFinite(topRow)) {
+        const rows = seg.height || seg.boundary.length;
+        const v = 1 - (topRow / rows) * 2;                 // +1 top .. -1 bottom
+        const intr = camera.intrinsics();
+        state.skylineTopDeg = att.elevation + Math.atan(v * intr.tanHalfV) * RAD;
+        state.skylineMeasuredFraction = measuredCols / seg.flags.length;
+      } else {
+        state.skylineTopDeg = null;
+        state.skylineMeasuredFraction = 0;
+      }
       // A sky boundary can only be measured if there is light to measure it
       // by. At night the whole premise inverts — the sky is the dark region and
       // the ground carries the bright lights — so every cue the segmenter uses
@@ -587,6 +625,10 @@ async function processFrame() {
         // sector has a top nobody has measured.
         vfovDeg: camera.intrinsics().vfovDeg,
         clippedFraction,
+        // Where the skyline actually was, so satisfaction is a measurement
+        // rather than an inference from where the camera was pointing.
+        skylineTopDeg: state.skylineTopDeg,
+        skylineMeasuredFraction: state.skylineMeasuredFraction,
         dtSec,
         atMs: t
       });
@@ -1481,7 +1523,11 @@ async function runPass1Analysis() {
 
   setAnalysisStep(4);
   await new Promise(r => setTimeout(r, 0));
-  coverage.reset();
+  // Keep what the lap learned about how tall things are. Coverage confidence
+  // still resets — the second lap has to earn its own — but the height model
+  // describes the world, not the lap, and wiping it left pass 2 unable to ask
+  // for any lift at all.
+  coverage.reset({ keepWorld: true });
   guidance.reset();
   state.lastCoverageAt = null;
   state.guidance = null;
