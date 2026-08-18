@@ -108,7 +108,6 @@ export function crossLapFocalCheck({
   for (let i = 0; i < n; i++) {
     const kf = keyframes[i];
     if (!features?.[i] || !finite(kf?.tanHalfV) || kf.tanHalfV <= 0) continue;
-    if (kf.captureKind === 'obstruction-probe') continue;
     usable.push({
       i, kf,
       // Placed pose when the caller has one — the datum and loop correction are

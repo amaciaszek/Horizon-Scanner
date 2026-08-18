@@ -120,10 +120,6 @@ const state = {
   thumbs: {},
   targetLuma: null,
   sensorCal: { stage: 'idle', startedAt: 0 },
-  obstructionProbe: {
-    active: false, anchorYaw: null, startedAt: 0, frames: 0,
-    lastCaptureAt: 0, parallax: false
-  },
   captureAudit: { counts: {}, events: [], lastReason: null, lastAt: 0 }
 };
 
@@ -329,8 +325,7 @@ async function processFrame() {
           ? Math.max(0, t - orientation.lastGyroAt) : null
       }
     };
-    const highElevation = Math.abs(att.elevation) > VISUAL_YAW_MAX_ELEVATION ||
-      state.obstructionProbe.active;
+    const highElevation = Math.abs(att.elevation) > VISUAL_YAW_MAX_ELEVATION;
     state.frameCount++;
 
     // Predict the pixel shift from the orientation stream so the visual search
@@ -478,16 +473,6 @@ async function processFrame() {
         state.trackingLost = true;
       }
 
-      // A high-obstruction probe intentionally tilts the view, so the image's
-      // horizontal translation is no longer a trustworthy yaw measurement.
-      // While the phone is supposed to be still, however, a large residual
-      // image shift is useful evidence that the operator translated the phone
-      // and introduced parallax.
-      if (state.obstructionProbe.active && pose.gyro.stillness > 0.65 &&
-          r.quality > 0.45 && Math.abs(dGyro) < 0.5 &&
-          Math.hypot(r.dx, r.dy) > 3.5) {
-        state.obstructionProbe.parallax = true;
-      }
     } else if (gyroTrusted) {
       // A blank, blurred, or near-zenith view may give vision nothing useful.
       // The gyroscope remains a valid metric rotation source, so do not erase
@@ -536,7 +521,6 @@ async function processFrame() {
         state.glareFraction = exposure.saturatedFraction;
       }
       state.frameStatus = Math.abs(att.elevation) > ELEVATION_HARD_LIMIT_DEG ? 'tooHigh'
-      : state.obstructionProbe.parallax ? 'parallax'
       : state.trackingLost ? 'trackingLost'
       : (state.sceneLuma !== null && state.sceneLuma < 26) ? 'tooDark'
         : seg.noSky ? 'noSky'
@@ -650,7 +634,6 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     recordCaptureDecision(`frame-${state.frameStatus}`, { pose, t, exposure });
     return;
   }
-  const probe = state.obstructionProbe;
   // Roll is deliberately NOT a reason to reject a keyframe. It is carried
   // through the projection quaternion like every other part of the attitude,
   // and rejecting on it threw away every frame of an iPad session whose screen
@@ -658,9 +641,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   const instantRate = Number.isFinite(pose.gyro.yawRateDegPerSec)
     ? Math.abs(pose.gyro.yawRateDegPerSec)
     : Math.abs(pose.gyro.rotationRateDegPerSec);
-  if (!keyframeMotionAccepted(instantRate, {
-    probe: probe.active, mode: director.mode.id
-  })) {
+  if (!keyframeMotionAccepted(instantRate, { mode: director.mode.id })) {
     recordCaptureDecision('motion-too-fast', { pose, t, exposure, detail: { instantRate } });
     return;
   }
@@ -672,12 +653,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   const last = survey.keyframes[survey.keyframes.length - 1];
   let accept = false;
 
-  if (probe.active) {
-    accept = Math.abs(pose.att.elevation) >= 20 &&
-      Math.abs(pose.att.elevation) <= ELEVATION_WARN_DEG &&
-      pose.gyro.stillness > 0.65 &&
-      (t - probe.lastCaptureAt) > 500;
-  } else if (!last) accept = true;
+  if (!last) accept = true;
   else if (director.phase === PHASE.PASS1) {
     // Far enough past a full circle that no plausible gyro scale error explains
     // it, and every further sweep frame lands on a bearing that already has one.
@@ -705,17 +681,15 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     });
   }
   if (!accept) {
-    const reason = probe.active
-      ? 'probe-not-still-or-elevation'
-      : (director.phase === PHASE.PASS2 && !director.verificationSweep
-          ? 'off-target-or-not-still'
-          : 'spacing-not-reached');
+    const reason = director.phase === PHASE.PASS2 && !director.verificationSweep
+      ? 'off-target-or-not-still'
+      : 'spacing-not-reached';
     recordCaptureDecision(reason, { pose, t, exposure, detail: { stepDeg } });
     return;
   }
 
   const intr = camera.intrinsics();
-  const captureYaw = probe.active ? probe.anchorYaw : state.fusedYaw;
+  const captureYaw = state.fusedYaw;
   const motionWindow = orientation.motionWindow(t);
   const kf = survey.addKeyframe({
     t: capturedFrame.timing.wallClockMs,
@@ -731,9 +705,8 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     yawRaw: pose.rawYaw,
     yawFused: captureYaw,
     yawBase: angDiff(captureYaw, pose.rawYaw),
-    captureKind: probe.active
-      ? 'obstruction-probe'
-      : (director.phase === PHASE.PASS2 && !director.verificationSweep ? 'targeted-cleanup' : 'sweep'),
+    captureKind: director.phase === PHASE.PASS2 && !director.verificationSweep
+      ? 'targeted-cleanup' : 'sweep',
     elevation: pose.att.elevation,
     roll: pose.att.roll,
     compass: pose.compassHeading,
@@ -769,12 +742,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     detail: { keyframeIndex: kf.index, captureKind: kf.captureKind }
   });
 
-  if (probe.active) {
-    probe.frames++;
-    probe.lastCaptureAt = t;
-  } else {
-    state.fusedYawAtKeyframe = state.fusedYaw;
-  }
+  state.fusedYawAtKeyframe = state.fusedYaw;
   state.lastKeyframeAt = t;
 
   survey._projectKeyframe(kf, camera.intrinsics());
@@ -1464,10 +1432,6 @@ function resetSurvey() {
   state.lastGuidanceState = null;
   state.frameErrors = 0;
   state.lastFrameError = null;
-  state.obstructionProbe = {
-    active: false, anchorYaw: null, startedAt: 0, frames: 0,
-    lastCaptureAt: 0, parallax: false
-  };
   state.frame = null;
   state.thumbs = {};
   state.thumbBudget = newThumbBudget();
@@ -1641,48 +1605,12 @@ function renderLive() {
       progress: 0,
       arrow: null
     };
-  } else if (state.obstructionProbe.active) {
-    const probe = state.obstructionProbe;
-    const elevation = Math.abs(att.elevation);
-    if (probe.parallax) {
-      d = {
-        tone: 'fix',
-        headline: 'Phone position moved',
-        detail: 'Finish this probe and retry from the original spot. For a nearby roof, even a small sideways movement changes the measured direction.',
-        progress: 0,
-        arrow: null
-      };
-    } else if (elevation > ELEVATION_WARN_DEG) {
-      d = {
-        tone: 'fix',
-        headline: 'Tilt down below 70°',
-        detail: `Currently ${elevation.toFixed(1)}°. Do not point near the zenith; yaw becomes inaccurate there and frames above ${ELEVATION_HARD_LIMIT_DEG}° are rejected.`,
-        progress: clamp(probe.frames / 4, 0, 1),
-        arrow: null
-      };
-    } else if (Math.abs(orientation.rotationRate) > 3 || orientation.stillness < 0.65) {
-      d = {
-        tone: 'work',
-        headline: 'Hold the phone still',
-        detail: 'Keep it in the same physical spot and aim at the roof/sky boundary. Capturing begins automatically once the motion settles.',
-        progress: clamp(probe.frames / 4, 0, 1),
-        arrow: null
-      };
-    } else {
-      d = {
-        tone: probe.frames >= 4 ? 'good' : 'work',
-        headline: probe.frames >= 4 ? 'High obstruction captured' : 'Capturing high obstruction',
-        detail: `${probe.frames} still frame${probe.frames === 1 ? '' : 's'} captured at this azimuth. Press Finish probe, tilt back down, and continue counter-clockwise.`,
-        progress: clamp(probe.frames / 4, 0, 1),
-        arrow: null
-      };
-    }
   } else if ((director.phase === PHASE.PASS1 || director.phase === PHASE.PASS2) &&
              Math.abs(att.elevation) > ELEVATION_WARN_DEG) {
     d = {
       tone: 'fix',
-      headline: 'Tilt down — use the obstruction probe',
-      detail: `Continuous rotation this high is inaccurate. Tilt below ${ELEVATION_WARN_DEG}°, keep the phone in one spot, then press Capture high obstruction for the nearby roof.`,
+      headline: `Tilt down below ${ELEVATION_WARN_DEG}°`,
+      detail: `Currently ${Math.abs(att.elevation).toFixed(1)}°. Near the zenith yaw and roll stop being separable, and frames above ${ELEVATION_HARD_LIMIT_DEG}° are rejected outright. Come back down and keep turning — the guide will ask for height where it needs it.`,
       progress: d.progress,
       arrow: null
     };
@@ -1843,8 +1771,8 @@ function reportText(r) {
     lines.push(`Lens changes mid-scan  ${survey.lensChanges.length} (${survey.lensChanges.map(c => c.ratio.toFixed(2) + 'x').join(', ')})`);
   }
   lines.push(`Keyframes              ${survey.keyframes.length}`);
-  lines.push(`  normal sweep         ${survey.keyframes.filter(k => k.captureKind !== 'obstruction-probe').length}`);
-  lines.push(`  high obstruction     ${survey.keyframes.filter(k => k.captureKind === 'obstruction-probe').length}`);
+  lines.push(`  pass 1 sweep         ${survey.keyframes.filter(k => (k.pass || 1) === 1).length}`);
+  lines.push(`  pass 2               ${survey.keyframes.filter(k => k.pass === 2).length}`);
   lines.push('Profile provenance     measured / interpolated / uncertain');
   // Both axes, because altitude depends on the VERTICAL one and that is the
   // half that used to be derived rather than measured.
@@ -1879,13 +1807,9 @@ function reportText(r) {
 
 function syncControls() {
   const p = director.phase;
-  const btn = $('primaryBtn'), probeBtn = $('probeBtn'), sec = $('secondaryBtn'), abort = $('abortBtn');
+  const btn = $('primaryBtn'), sec = $('secondaryBtn'), abort = $('abortBtn');
   sec.hidden = !state.running;
   abort.hidden = !state.running;
-  probeBtn.hidden = !state.running || (p !== PHASE.PASS1 && p !== PHASE.PASS2);
-  probeBtn.textContent = state.obstructionProbe.active
-    ? `Finish probe (${state.obstructionProbe.frames} frames)`
-    : 'Capture high obstruction';
   sec.textContent = state.paused ? 'Resume' : 'Pause';
 
   if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
@@ -1983,38 +1907,6 @@ function onPrimary() {
     return director.verificationSweep ? finishVerificationPass() : finishSurvey();
   }
   if (p === PHASE.COMPLETE) return resetSurvey();
-}
-
-function toggleObstructionProbe() {
-  if (director.phase !== PHASE.PASS1 && director.phase !== PHASE.PASS2) return;
-  const probe = state.obstructionProbe;
-  if (!probe.active) {
-    probe.active = true;
-    probe.anchorYaw = state.fusedYaw;
-    probe.startedAt = performance.now();
-    probe.frames = 0;
-    probe.lastCaptureAt = 0;
-    probe.parallax = false;
-    pipeline.resetRegistration();
-    log('info', 'HIGH_OBSTRUCTION_PROBE started', {
-      anchorYaw: probe.anchorYaw,
-      heading: currentHeading(),
-      recommendedMaxElevationDeg: ELEVATION_WARN_DEG,
-      hardLimitDeg: ELEVATION_HARD_LIMIT_DEG
-    });
-  } else {
-    log(probe.parallax || probe.frames < 2 ? 'warn' : 'info', 'HIGH_OBSTRUCTION_PROBE finished', {
-      anchorYaw: probe.anchorYaw,
-      frames: probe.frames,
-      parallaxRejected: probe.parallax,
-      durationMs: Math.round(performance.now() - probe.startedAt)
-    });
-    probe.active = false;
-    probe.anchorYaw = null;
-    state.fusedYawAtKeyframe = state.fusedYaw;
-    pipeline.resetRegistration();
-  }
-  syncControls();
 }
 
 /* -------------------------------------------------- true-bearing landmarks */
@@ -2777,10 +2669,9 @@ function debugSnapshot() {
         lastEvent: state.captureAudit.events[state.captureAudit.events.length - 1] || null
       },
       keyframeSources: {
-        sweep: survey.keyframes.filter(k => k.captureKind !== 'obstruction-probe').length,
-        highObstruction: survey.keyframes.filter(k => k.captureKind === 'obstruction-probe').length
+        pass1: survey.keyframes.filter(k => (k.pass || 1) === 1).length,
+        pass2: survey.keyframes.filter(k => k.pass === 2).length
       },
-      obstructionProbe: { ...state.obstructionProbe },
       elevationPolicyDeg: {
         visualYawDisabledAbove: VISUAL_YAW_MAX_ELEVATION,
         warnAbove: ELEVATION_WARN_DEG,
@@ -2886,7 +2777,6 @@ function wire() {
   L.captureConsole();
 
   $('primaryBtn').addEventListener('click', onPrimary);
-  $('probeBtn').addEventListener('click', toggleObstructionProbe);
   $('secondaryBtn').addEventListener('click', () => {
     if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === 'failed'
       && state.sensorCal.reason !== 'no-samples') return skipSensorTest();

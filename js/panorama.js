@@ -425,9 +425,7 @@ export function drawPanorama(ctx, mosaic, tracks, bins, extras = {}) {
   // Per-keyframe skylines. Thin, low alpha, so overlap darkens into a band
   // whose thickness IS the disagreement.
   for (const t of tracks) {
-    ctx.strokeStyle = t.kind === 'obstruction-probe'
-      ? 'rgba(180,140,242,0.55)'
-      : t.pass === 2 ? 'rgba(224,163,60,0.45)' : 'rgba(46,199,230,0.40)';
+    ctx.strokeStyle = t.pass === 2 ? 'rgba(224,163,60,0.45)' : 'rgba(46,199,230,0.40)';
     ctx.lineWidth = 1;
     for (const seg of t.segs) {
       ctx.beginPath();

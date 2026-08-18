@@ -6,8 +6,7 @@ export function keyframeStepDeg(horizontalFovDeg) {
 }
 
 /** Instantaneous yaw-rate ceiling at the exposure, not a smoothed later rate. */
-export function maxKeyframeYawRate({ probe = false, mode = 'handheld' } = {}) {
-  if (probe) return 3;
+export function maxKeyframeYawRate({ mode = 'handheld' } = {}) {
   return mode === 'tripod' ? 20 : 35;
 }
 

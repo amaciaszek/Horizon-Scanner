@@ -312,9 +312,9 @@ export class ScanGuidance {
     }
     this.wantsLift = wantsLift;
     this.liftDeg = wantsLift ? Math.max(0, required - elevationDeg) : 0;
-    // Taller than any tilt this will ask for. The remedy is the obstruction
-    // probe, and saying so is better than repeating an instruction that cannot
-    // succeed.
+    // Taller than any tilt this will ask for, even at the 50-degree ceiling.
+    // Recorded and reported rather than repeated at the operator, since there is
+    // no instruction here that could succeed.
     this.beyondTilt = coverage.beyondTiltAt(this.rawBearingDeg);
 
     const behindOperator = distanceAlong(headingDeg, this.rawBearingDeg, t.sweepDirection) > 180;

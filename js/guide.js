@@ -442,9 +442,9 @@ export class ScanDirector {
     if (g.beyondTilt && away < 25) {
       return {
         tone: 'warn',
-        headline: 'Too tall to frame by tilting',
-        detail: 'This stands higher than the camera can take in from here without pointing so steeply that the azimuth stops being reliable. Stop turning and use the high-obstruction probe, keeping the phone in exactly the same spot.',
-        arrow: 0, tilt: +1, phase: this.phase, progress: g.summary.fraction
+        headline: 'Too tall to frame — noted, keep going',
+        detail: 'This stands higher than the camera can take in from here without pointing so steeply that azimuth stops being reliable. Its height is recorded as unmeasured and this sector will not hold up the survey. Carry on turning.',
+        arrow: 0, tilt: null, phase: this.phase, progress: g.summary.fraction
       };
     }
     if (g.wantsLift && away < 25) {
@@ -495,7 +495,7 @@ export class ScanDirector {
       const pointingDown = Number.isFinite(ctx.elevation) && ctx.elevation < 0;
       return pointingDown
         ? { tone: 'fix', headline: 'Raise the camera to the horizon', detail: 'The camera is pointing at the ground, so there is no skyline in the picture to measure. Bring it up until the horizon sits across the middle of the frame.', arrow: null, tilt: +1, phase: this.phase }
-        : { tone: 'fix', headline: 'Tilt down — too close to straight up', detail: 'Measurements above 78° elevation are rejected because yaw becomes unstable near the zenith. Tilt down below 70°, then use the high-obstruction probe while keeping the phone in the same place.', arrow: null, tilt: -1, phase: this.phase };
+        : { tone: 'fix', headline: 'Tilt down — too close to straight up', detail: 'Measurements above 78° elevation are rejected because yaw becomes unstable near the zenith. Tilt down below 70° and keep turning.', arrow: null, tilt: -1, phase: this.phase };
     }
     if (ctx.frameStatus === 'parallax') {
       return { tone: 'fix', headline: 'Phone position moved', detail: 'Return the phone to the same spot and hold it still. Moving sideways while viewing a nearby roof changes its apparent direction and cannot be corrected as rotation.', arrow: null, tilt: null, phase: this.phase };

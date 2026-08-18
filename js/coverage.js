@@ -134,20 +134,25 @@ export const COVERAGE_TUNING = {
   /**
    * The highest tilt this will ever ask for.
    *
-   * 32, and the number is measured rather than chosen. The 2026-08-17 19:15
-   * capture peaked at 27.5 degrees of elevation and its rotation solve
-   * succeeded at 0.307 degrees RMS. The 21:00 capture was driven to 61.6 by a
-   * runaway in this very code, and the solve FAILED its sanity gate — 1.57
-   * degrees of tilt correction against a 1.0 limit — so the panorama fell back
-   * to raw sensor poses and came out incoherent exactly where the tilting had
-   * happened. Steep frames are where azimuth and roll stop being separable, and
-   * a request past this range damages the panorama it was meant to complete.
+   * Was 32, for a reason that turned out to be a different bug. The 21:00
+   * capture on 2026-08-17 was driven to 61.6 degrees and its solve FAILED its
+   * sanity gate — 1.57 degrees of tilt correction against a 1.0 limit — so the
+   * panorama fell back to raw sensor poses. The ceiling was dropped to 32 to
+   * stop that happening again.
    *
-   * Beyond it the answer is not "tilt further", it is the high-obstruction
-   * probe, and the sector is marked satisfied so the operator is never held
-   * hostage to an errand that cannot be run.
+   * But the gate was the fault, not the tilt. It tested the MAXIMUM tilt
+   * correction over every frame, so a handful of weakly-constrained frames —
+   * typically the last few of a lap, where a frame has fewest neighbours —
+   * discarded the corrections of all the others. It now clamps those frames
+   * individually and judges the solution on its median, so a steep capture is
+   * no longer rejected wholesale. See `js/panorama-optimize.js`.
+   *
+   * With that repaired the ceiling can go back up. 50 is still well clear of the
+   * 70-degree warning and the 78-degree hard reject, which mark where azimuth
+   * and roll genuinely stop being separable near the zenith. Those limits are
+   * real and are not being touched.
    */
-  maxRequestedElevationDeg: 32
+  maxRequestedElevationDeg: 50
 };
 
 /** Frame states that mean the camera did not usefully observe anything. */
@@ -205,7 +210,7 @@ export class CoverageMap {
      *  top edge of any frame it overflowed. A fact about the world, so it only
      *  ever refines upward and never follows the camera. */
     this.obstructionTop = new Float32Array(this.binCount);
-    /** Taller than tilting can reach. The remedy is the obstruction probe. */
+    /** Taller than tilting can reach. Recorded, not repaired. */
     this.beyondTilt = new Uint8Array(this.binCount);
     this.lastYawRate = null;
     this.lastObservedAt = null;
@@ -440,15 +445,19 @@ export class CoverageMap {
   needsLift(index) {
     const i = ((index % this.binCount) + this.binCount) % this.binCount;
     // Past the tilt ceiling there is nothing more to ask of a turning camera,
-    // so the sector stops blocking completion and becomes a probe job instead.
+    // so the sector stops blocking completion rather than holding the operator
+    // hostage to an errand that cannot be run. It is recorded, not repaired:
+    // `beyondTilt` is reported so the summary can say this sector's obstruction
+    // was never fully seen.
     if (this.beyondTilt[i]) return false;
     const required = this.requiredElevation[i];
     if (!(required > 0)) return false;
     return this.satisfiedElevation[i] < required - 1;
   }
 
-  /** Too tall to bring into frame by tilting. Reported so the interface can
-   *  point at the high-obstruction probe rather than repeat itself. */
+  /** Too tall to bring into frame by tilting, even at the 50-degree ceiling.
+   *  Reported so the summary can say so rather than the guidance repeating an
+   *  instruction the operator cannot carry out. */
   beyondTiltAt(headingDeg) {
     return this.beyondTilt[this.indexOf(headingDeg)] === 1;
   }

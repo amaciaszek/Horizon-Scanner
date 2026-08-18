@@ -13,7 +13,7 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.9.2';
+export const VERSION = '0.10.0';
 export const BUILD_DATE = '2026-08-17';
 
 /**
@@ -22,8 +22,9 @@ export const BUILD_DATE = '2026-08-17';
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'Fixes the tilt runaway: the lift request is anchored to the obstruction '
-  + 'rather than the camera, and stops at 32 degrees.';
+  'The high-obstruction probe is gone. The guide asks you to tilt up to 50 '
+  + 'degrees instead, and the panorama solve no longer throws away a whole '
+  + 'capture because of a few steep frames.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {
