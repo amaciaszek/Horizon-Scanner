@@ -13,8 +13,8 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.13.0';
-export const BUILD_DATE = '2026-08-17';
+export const VERSION = '0.14.1';
+export const BUILD_DATE = '2026-08-18';
 
 /**
  * Coverage-guided scanning, and the field failure that shaped this release.
@@ -22,9 +22,8 @@ export const BUILD_DATE = '2026-08-17';
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'The lens step now counts its pairs and says what is wrong with the view '
-  + 'you are pointed at — featureless, too slow, too fast — instead of the '
-  + 'same hint regardless.';
+  'Seams are blended now, so the stitched view stops looking like a mosaic. '
+  + 'Coverage demands the whole ring instead of 98.5%, and tripod mode is gone.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {

@@ -10,7 +10,7 @@
      Bump it with VERSION in js/version.js; iPad Safari holds CSS aggressively
      and the resulting half-styled page looks like a broken build, not a stale
      one, which is a bad thing to be debugging in a field. -->
-<link rel="stylesheet" href="styles.css?v=0.13.0" />
+<link rel="stylesheet" href="styles.css?v=0.14.1" />
 </head>
 <body>
 
@@ -145,6 +145,7 @@
 
   <div class="row">
     <label class="toggle"><input type="checkbox" id="panoImagery" checked /> <span>Use keyframe photos</span></label>
+    <label class="toggle"><input type="checkbox" id="panoBlend" checked /> <span>Blend seams</span></label>
     <label class="zoom">Detail
       <select id="panoScale">
         <option value="4">4 px/°</option>
@@ -163,7 +164,7 @@
 
   <div class="pano-wrap"><canvas id="pano" class="pano"></canvas></div>
 
-  <p class="hint" id="panoStatus">Build this after a survey to see the profile drawn over the imagery it came from. Scroll sideways; the ruler is azimuth.</p>
+  <p class="hint" id="panoStatus">Build this after a survey to see the profile drawn over the imagery it came from. Scroll sideways; the ruler is azimuth. Turn off <em>Blend seams</em> to see each frame cut hard against its neighbour — uglier, but a step in a roofline is then a measurable geometry error rather than something smoothed away.</p>
 
   <div class="landmarks">
     <div class="row">
@@ -252,14 +253,6 @@
 <section class="card">
   <details>
     <summary><span class="kicker">ADVANCED</span> Capture geometry and thresholds</summary>
-
-    <label class="slider">Capture mode
-      <select id="modeSelect">
-        <option value="handheld" selected>Handheld — pivot around the phone</option>
-        <option value="tripod">Tripod / mount — fixed optical centre</option>
-      </select>
-    </label>
-    <p class="hint" id="modeHint">Tripod mode holds the optical centre still, so there is no parallax on nearby structures. It tightens the roll, rate, and overlap gates to match. Choose it before starting the survey.</p>
 
     <label class="slider">Lens
       <select id="lensSelect"><option value="">Default rear camera</option></select>

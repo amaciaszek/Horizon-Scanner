@@ -124,6 +124,8 @@ const state = {
   /** Which step of the post-lap analysis is running, so a long computation can
    *  say so instead of looking like a hang. Null whenever nothing is running. */
   analysis: null,
+  /** Fraction of the last traced skyline that ran off the top of the frame. */
+  clippedFraction: null,
   captureAudit: { counts: {}, events: [], lastReason: null, lastAt: 0 }
 };
 
@@ -188,7 +190,29 @@ function recordGuidanceSample(t, pose, att, quality) {
       ? Number(pose.gyro.yawRateDegPerSec.toFixed(2)) : null,
     frameStatus: state.frameStatus,
     glareFraction: Number.isFinite(state.glareFraction)
-      ? Number(state.glareFraction.toFixed(4)) : null
+      ? Number(state.glareFraction.toFixed(4)) : null,
+    /*
+     * The vertical half of the instruction, sampled over time.
+     *
+     * "The dot went up the side of the house and then decided it did not need
+     * the roof" is a statement about a sequence, and none of the state that
+     * would explain it survived to the archive. These five fields say, at every
+     * sampled moment: how high the map wanted the camera here, how high it had
+     * already been satisfied by, whether it was still asking, and which way.
+     * Reading them along a bearing shows exactly where the climb stopped and
+     * which term ended it.
+     */
+    requiredElevationDeg: Number(coverage.requiredElevationAt(currentHeading()).toFixed(2)),
+    restElevationDeg: Number(coverage.restElevationAt(currentHeading()).toFixed(2)),
+    wantsLift: !!g.wantsLift,
+    liftDeg: Number.isFinite(g.liftDeg) ? Number(g.liftDeg.toFixed(2)) : 0,
+    wantsDrop: !!g.wantsDrop,
+    dropDeg: Number.isFinite(g.dropDeg) ? Number(g.dropDeg.toFixed(2)) : 0,
+    beyondTilt: !!g.beyondTilt,
+    /* What the frame itself said about the skyline running off the top edge —
+     * the input that drives the whole lift decision. */
+    clippedFraction: Number.isFinite(state.clippedFraction)
+      ? Number(state.clippedFraction.toFixed(4)) : null
   });
   if (state.guidanceTrail.length > 4000) {
     state.guidanceTrail.splice(0, state.guidanceTrail.length - 4000);
@@ -512,6 +536,10 @@ async function processFrame() {
       let clippedTop = 0;
       for (let i = 0; i < seg.flags.length; i++) if (seg.flags[i] === 1) clippedTop++;
       clippedFraction = seg.flags.length ? clippedTop / seg.flags.length : 0;
+      // Kept on state purely so the guidance trail can record the input that
+      // drove each lift decision, rather than leaving it inferable only by
+      // recomputing every boundary offline.
+      state.clippedFraction = clippedFraction;
       // A sky boundary can only be measured if there is light to measure it
       // by. At night the whole premise inverts — the sky is the dark region and
       // the ground carries the bright lights — so every cue the segmenter uses
@@ -1529,8 +1557,6 @@ function restoreMode(project) {
   if (!id) return;
   director.phase = PHASE.IDLE;
   if (director.setMode(id)) {
-    $('modeSelect').value = id;
-    $('modeHint').textContent = director.mode.setupDetail;
   }
 }
 
@@ -1599,16 +1625,45 @@ function resetSurvey() {
 function guidanceView() {
   if (!state.guidance || !state.running) return null;
   const att = orientation.attitude();
+
+  /*
+   * Keep the dot alive through targeted cleanup.
+   *
+   * There are two different notions of "done" here and they disagree by
+   * design. The coverage map calls the ring complete once its tolerance is met
+   * — 98.9% on the 2026-08-18 capture — and `ScanGuidance` then drops its
+   * bearing to null, correctly, because it has nothing left to lead anyone to.
+   * But the DIRECTOR keeps its own list of weak sectors and photo gaps, and
+   * that list was still full. So the text went on issuing instructions
+   * ("Nudge left 5°") while the only thing the operator was actually following
+   * disappeared off the screen.
+   *
+   * Whenever the director still has somewhere to be, the dot goes there.
+   */
+  let g = state.guidance;
+  if (g.rawBearingDeg === null && director.target) {
+    const centre = wrap360(director.target.fromDeg + director.target.widthDeg / 2);
+    g = {
+      ...g,
+      bearingDeg: centre,
+      rawBearingDeg: centre,
+      offsetDeg: angDiff(centre, currentHeading()),
+      state: 'advancing',
+      complete: false,
+      // Cleanup targets are about azimuth; hold the dot at the camera's own
+      // height so it never also implies a tilt that nobody asked for.
+      elevationDeg: att.elevation
+    };
+  }
   const intr = camera.intrinsics();
   const placed = quatMul(
     yawQuat(angDiff(state.fusedYaw, orientation.rawYaw()) + (survey.yawDatum || 0)),
     screenQuat(orientation.quat, orientation.screenAngle)
   );
   return {
-    ...state.guidance,
+    ...g,
     headingDeg: currentHeading(),
-    altitudeDeg: Number.isFinite(state.guidance.elevationDeg)
-      ? state.guidance.elevationDeg : att.elevation,
+    altitudeDeg: Number.isFinite(g.elevationDeg) ? g.elevationDeg : att.elevation,
     cameraElevationDeg: att.elevation,
     quat: placed,
     tanHalfH: intr.tanHalfH,
@@ -1631,6 +1686,11 @@ function coverageCoveredFlags() {
 function renderLive() {
   const att = orientation.attitude();
   const heading = currentHeading();
+
+  // The buttons describe progress, so they are refreshed as often as progress
+  // changes. `syncControls` only touches the DOM when something actually
+  // differs, so this costs a couple of comparisons per frame.
+  syncControls();
 
   const ctx = {
     heading,
@@ -1947,6 +2007,41 @@ function reportText(r) {
 
 /* ---------------------------------------------------------------- controls */
 
+/**
+ * Apply the primary button's text and enabled state, but only when they have
+ * actually changed.
+ *
+ * `syncControls` is now called every frame, so it has to be cheap and it has to
+ * be idempotent. Writing the same textContent sixty times a second would fight
+ * the compositor and, on iPad Safari, flicker the label.
+ */
+const lastControl = { primaryText: null, primaryDisabled: null };
+function setPrimary(btn, text, disabled) {
+  if (lastControl.primaryText !== text) {
+    btn.textContent = text;
+    lastControl.primaryText = text;
+  }
+  if (lastControl.primaryDisabled !== disabled) {
+    btn.disabled = disabled;
+    lastControl.primaryDisabled = disabled;
+  }
+}
+
+/**
+ * Bring the buttons into line with the phase and the survey's progress.
+ *
+ * This used to be called only at phase transitions and a handful of events,
+ * never from the render loop — which meant the primary button froze at whatever
+ * it said when a phase began, while the directive above it went on updating
+ * every frame. On 2026-08-18 that produced a screen reading "Stop, the lap is
+ * done, tap the button below to close the lap" directly above a DISABLED button
+ * still labelled "Keep going - 0% of the horizon covered" from the start of the
+ * lap, 476 degrees earlier. The operator had no way forward except Pause, which
+ * only worked because it happens to call this function on the way back.
+ *
+ * A control that describes progress must be refreshed as often as the progress
+ * changes. It is called from renderLive now, and made idempotent to suit.
+ */
 function syncControls() {
   const p = director.phase;
   const btn = $('primaryBtn'), sec = $('secondaryBtn'), abort = $('abortBtn');
@@ -1954,80 +2049,79 @@ function syncControls() {
   abort.hidden = !state.running;
   sec.textContent = state.paused ? 'Resume' : 'Pause';
 
-  if (!state.running) { btn.textContent = 'Start camera and sensors'; btn.disabled = false; return; }
+  if (!state.running) { setPrimary(btn, 'Start camera and sensors', false); return; }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === BRIEF_STAGE) {
-    btn.textContent = (BRIEFS[state.sensorCal.next] || BRIEFS.stationary).button;
-    btn.disabled = false;
+    setPrimary(btn, (BRIEFS[state.sensorCal.next] || BRIEFS.stationary).button, false);
     return;
   }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === FREEFORM_STAGE) {
-    btn.textContent = 'Use what I have';
-    btn.disabled = false;
+    setPrimary(btn, 'Use what I have', false);
     return;
   }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === LENS_STAGE) {
-    btn.textContent = 'Skip — keep the default lens';
-    btn.disabled = false;
+    setPrimary(btn, 'Skip — keep the default lens', false);
     return;
   }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'stationary') {
-    btn.textContent = 'Measuring stationary sensors…';
-    btn.disabled = true;
+    setPrimary(btn, 'Measuring stationary sensors…', true);
     return;
   }
   if (p === PHASE.CALIBRATING && state.sensorCal.stage === 'failed') {
     const reason = state.sensorCal.reason;
     if (reason === 'no-samples') {
-      btn.textContent = 'Reload and retry sensors';
+      setPrimary(btn, 'Reload and retry sensors', false);
       sec.hidden = true;
     } else {
-      btn.textContent = 'Retry — wave it again';
+      setPrimary(btn, 'Retry — wave it again', false);
       // The escape hatch: only offered while the gyro is producing samples —
       // with no sensors there is nothing to proceed with.
       sec.hidden = false;
       sec.textContent = 'Continue anyway — azimuth unverified';
     }
-    btn.disabled = false;
     return;
   }
-  if (p === PHASE.CALIBRATING) { btn.textContent = 'Calibrating…'; btn.disabled = true; return; }
+  if (p === PHASE.CALIBRATING) { setPrimary(btn, 'Calibrating…', true); return; }
   if (p === PHASE.PASS1) {
     // Coverage is the primary signal now: the lap is done when the horizon has
     // been observed well enough, not when the phone has been turned far enough.
     // The travel and bin-count tests stay as a fallback so a session running
     // without usable coverage data — no camera, an unfed map — is never trapped.
     const done = coverage.completeness();
-    const enough = done.complete
-      || Math.abs(director.pass1Travel) >= 300
-      || survey.coverage().observedBins >= 700;
-    btn.textContent = done.complete
+    const travelled = Math.abs(director.pass1Travel);
+    const over = pass1OverTravel(director.pass1Travel);
+    const enough = done.complete || travelled >= 300 || survey.coverage().observedBins >= 700;
+    // Past a full circle the label must be an instruction, not a progress
+    // report. The guide is already saying "stop, the lap is done" at this
+    // point, and a button reading "keep going" directly underneath it told the
+    // operator to do the opposite of what the screen above said.
+    const text = done.complete
       ? 'Horizon covered — plan verification'
-      : enough
-        ? 'Close the loop and plan verification'
-        : `Keep going — ${Math.round(done.fraction * 100)}% of the horizon covered`;
+      : over.prompt
+        ? `Close the lap — ${travelled.toFixed(0)}° turned, more than a full circle`
+        : enough
+          ? 'Close the loop and plan verification'
+          : `Keep going — ${Math.round(done.fraction * 100)}% of the horizon covered`;
     // Never trap the operator behind a counter. If the ring shows the circle is
     // covered, the lap happened, whatever the accumulator says.
-    btn.disabled = false;
-    btn.disabled = !enough;
+    setPrimary(btn, text, !enough);
     return;
   }
-  if (p === PHASE.ANALYSING) { btn.textContent = 'Analysing…'; btn.disabled = true; return; }
+  if (p === PHASE.ANALYSING) { setPrimary(btn, 'Analysing…', true); return; }
   if (p === PHASE.PASS2) {
     if (director.verificationSweep) {
       const binCoverage = survey.coverage();
       const enough = Math.abs(director.pass2Travel) >= 300 || binCoverage.verifiedBins >= 700;
-      btn.textContent = enough
+      setPrimary(btn, enough
         ? 'Finish verification lap'
-        : `Keep turning - ${Math.abs(director.pass2Travel).toFixed(0)} degrees of 360 degrees (${binCoverage.verifiedBins} bins verified)`;
-      btn.disabled = !enough;
+        : `Keep turning — ${Math.abs(director.pass2Travel).toFixed(0)}° of 360° (${binCoverage.verifiedBins} bins verified)`,
+      !enough);
     } else {
-      btn.textContent = 'Finish survey';
-      btn.disabled = false;
+      setPrimary(btn, 'Finish survey', false);
     }
     return;
   }
-  if (p === PHASE.COMPLETE) { btn.textContent = 'Start a new survey'; btn.disabled = false; return; }
-  btn.textContent = 'Working…'; btn.disabled = true;
+  if (p === PHASE.COMPLETE) { setPrimary(btn, 'Start a new survey', false); return; }
+  setPrimary(btn, 'Working…', true);
 }
 
 function onPrimary() {
@@ -2438,7 +2532,10 @@ async function buildPanorama() {
 
     const pxPerDeg = Number($('panoScale').value) || 6;
     const maxAlt = Number($('maxAltSelect').value) || 60;
-    const opts = { pxPerDeg, altMin: -10, altMax: Math.min(89, maxAlt + 2), azStart: 0 };
+    const opts = {
+      pxPerDeg, altMin: -10, altMax: Math.min(89, maxAlt + 2), azStart: 0,
+      blend: $('panoBlend').checked
+    };
 
     const t0 = performance.now();
     const mosaic = buildMosaic({
@@ -3197,16 +3294,6 @@ function wire() {
     log('info', `Pre-flight started. Turn steadily through at least ${MIN_SWEEP_DEG}°, then back, keeping a textured scene in frame.`);
   });
 
-  $('modeSelect').addEventListener('change', e => {
-    if (director.setMode(e.target.value)) {
-      const m = director.mode;
-      log('info', `Capture mode set to ${m.label}: max ${m.maxRate}°/s, roll within ±${m.rollLimitScan}°, minimum overlap ${(m.minOverlap * 100).toFixed(0)}%.`);
-      $('modeHint').textContent = m.setupDetail;
-    } else {
-      e.target.value = director.mode.id;
-      log('warn', 'Capture mode cannot change once the survey has started. Reset first.');
-    }
-  });
   $('rotSelect').addEventListener('change', e => {
     if (e.target.value === 'auto') { camera.autoRotation = true; camera.detectRotation(orientation.screenAngle); }
     else camera.setRotation(Number(e.target.value));

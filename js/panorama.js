@@ -124,6 +124,34 @@ export function buildMosaic({ keyframes, sources = [], yawDatum = 0, ...over }) 
   const owner = new Int32Array(width * height).fill(-1);
   const axisDist = new Float32Array(width * height).fill(Infinity);
 
+  /*
+   * Two ways to fill a pixel, and they exist for opposite reasons.
+   *
+   * Nearest-axis (blend = false) is the diagnostic mode this file was written
+   * for: one frame wins each pixel outright, so a rotation or focal error shows
+   * up as a hard step in a roofline that can be measured off the azimuth scale.
+   * It is unforgiving on purpose and it is what should be trusted when
+   * something looks wrong.
+   *
+   * Feathered (blend = true) is what the offline reference does and what a
+   * person actually wants to look at. Each frame contributes with a weight that
+   * falls to zero at its own edges, so contributions cross-fade over the whole
+   * overlap instead of stopping dead at a seam. The weight is
+   * ((1-|u|)(1-|v|))^2 — one on the optical axis, zero at the frame border,
+   * squared so the centre of a frame decisively outvotes the corner of its
+   * neighbour.
+   *
+   * Blending does hide misregistration, which is exactly the objection above.
+   * That is why the mode is a switch and not a replacement: `owner` and
+   * `axisDist` are still filled by the nearest-axis rule in both modes, so
+   * every overlay and every number derived from them is unchanged.
+   */
+  const blend = !!opts.blend;
+  const accR = blend ? new Float32Array(width * height) : null;
+  const accG = blend ? new Float32Array(width * height) : null;
+  const accB = blend ? new Float32Array(width * height) : null;
+  const accW = blend ? new Float32Array(width * height) : null;
+
   // Precompute the world ray for every output pixel column/row once.
   const azFor = new Float64Array(width);
   for (let x = 0; x < width; x++) azFor[x] = wrap360(azStart + (x + 0.5) / pxPerDeg);
@@ -162,15 +190,39 @@ export function buildMosaic({ keyframes, sources = [], yawDatum = 0, ...over }) 
         if (!uv) continue;
         const d = Math.max(Math.abs(uv[0]), Math.abs(uv[1]));
         const i = y * width + x;
+
+        if (blend && src) {
+          // Every frame that can see this pixel contributes, so this runs
+          // before the nearest-axis test rather than inside it.
+          const fu = 1 - Math.abs(uv[0]);
+          const fv = 1 - Math.abs(uv[1]);
+          if (fu > 0 && fv > 0) {
+            const w = (fu * fv) * (fu * fv);
+            sampleRGB(src, (uv[0] + 1) / 2 * src.w - 0.5, (1 - uv[1]) / 2 * src.h - 0.5, px);
+            accR[i] += px[0] * w; accG[i] += px[1] * w; accB[i] += px[2] * w;
+            accW[i] += w;
+          }
+        }
+
         if (d >= axisDist[i]) continue;         // an earlier frame saw it better
         axisDist[i] = d;
         if (owner[i] === -1) painted++;
         owner[i] = k;
-        if (!src) continue;
+        if (!src || blend) continue;
         sampleRGB(src, (uv[0] + 1) / 2 * src.w - 0.5, (1 - uv[1]) / 2 * src.h - 0.5, px);
         const p = i * 4;
         rgba[p] = px[0]; rgba[p + 1] = px[1]; rgba[p + 2] = px[2]; rgba[p + 3] = 255;
       }
+    }
+  }
+
+  if (blend) {
+    for (let i = 0; i < width * height; i++) {
+      const w = accW[i];
+      if (!(w > 0)) continue;
+      const p = i * 4;
+      rgba[p] = accR[i] / w; rgba[p + 1] = accG[i] / w; rgba[p + 2] = accB[i] / w;
+      rgba[p + 3] = 255;
     }
   }
 

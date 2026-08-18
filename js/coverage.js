@@ -44,11 +44,19 @@ export const COVERAGE_TUNING = {
   /** Angular resolution of the coverage map. 360 must divide by this. */
   binSizeDeg: 2,
 
-  /** Confidence at which a bin counts as covered. */
-  coverageThreshold: 0.75,
+  /** Confidence at which a bin counts as covered.
+   *
+   *  Raised from 0.75. The 2026-08-18 capture finished with a mean score of
+   *  0.938 and a weakest bin of 0.783 — everything technically over the line,
+   *  and yet the far side of the roof was never visited. A bar that the whole
+   *  ring clears while obvious work remains is set too low. This survey is data
+   *  constrained: extra frames cost seconds, missing ones cost a return trip. */
+  coverageThreshold: 0.88,
   /** Independent observations a bin needs regardless of how good they were.
-   *  Stops one lucky frame from declaring a sector done. */
-  minObservations: 5,
+   *  Stops one lucky frame from declaring a sector done, and raised for the same
+   *  reason as the threshold — more looks per bearing is the cheap direction to
+   *  be wrong in. */
+  minObservations: 8,
 
   /** How fast confidence accumulates, per second of ideal-quality viewing at
    *  the centre of frame. 2.0 puts a bin near 0.9 after about 1.5 s. */
@@ -106,9 +114,24 @@ export const COVERAGE_TUNING = {
    *  and the traced skyline with it. */
   maxGlareFraction: 0.04,
 
-  /** Fraction of the circle allowed to remain uncovered at completion. 0.015 is
-   *  about five degrees, roughly two bins. */
-  completionTolerance: 0.015,
+  /**
+   * Fraction of the circle allowed to remain uncovered at completion.
+   *
+   * Zero. Every bin must be covered before the map calls itself complete.
+   *
+   * It was 0.015 — about five degrees, two bins — and on the 2026-08-18 capture
+   * that was enough to end the survey with the far side and the centre of the
+   * roof never visited, and several trees never returned to. Worse, a "complete"
+   * map makes `ScanGuidance` drop its bearing, so the dot vanished while the
+   * director still had cleanup targets: the tolerance did not just permit gaps,
+   * it withdrew the one thing that would have closed them.
+   *
+   * Zero is safe here only because the operator is never trapped by it. The
+   * primary button is enabled on travel alone past 300 degrees, so the lap can
+   * always be closed by hand; this figure now decides when the app STOPS ASKING,
+   * and the answer to that is: not until it has everything.
+   */
+  completionTolerance: 0,
 
   /* ---- elevation ---------------------------------------------------------
    * A sector is not surveyed just because the camera looked at its horizon. If
@@ -614,7 +637,30 @@ export class CoverageMap {
       gaps: this.gaps().slice(0, 12),
       score: Array.from(this.score, v => Number(v.toFixed(4))),
       observations: Array.from(this.observations),
-      visits: Array.from(this.visits)
+      visits: Array.from(this.visits),
+
+      /*
+       * The elevation model, per bin, exported because it cannot be
+       * reconstructed from anything else in the archive.
+       *
+       * The traced boundaries let an offline tool recover what the skyline
+       * ACTUALLY was at every bearing. What they cannot show is what the app
+       * BELIEVED at the time — which bins it thought still had an unmeasured
+       * top, how high it asked the operator to tilt, and where it decided it was
+       * satisfied. Diagnosing "the dot stopped climbing before the roof was
+       * centred" needs the belief and the truth side by side; without these four
+       * arrays only the truth is recoverable and the reasoning is invisible.
+       */
+      obstructionTop: Array.from(this.obstructionTop, v => Number(v.toFixed(2))),
+      requiredElevation: Array.from(this.requiredElevation, v => Number(v.toFixed(2))),
+      satisfiedElevation: Array.from(this.satisfiedElevation, v => Number(v.toFixed(2))),
+      beyondTilt: Array.from(this.beyondTilt),
+      needsLift: Array.from({ length: this.binCount }, (_, i) => (this.needsLift(i) ? 1 : 0)),
+      elevationTuning: {
+        clippedFractionForLift: this.tuning.clippedFractionForLift,
+        liftHeadroomFraction: this.tuning.liftHeadroomFraction,
+        maxRequestedElevationDeg: this.tuning.maxRequestedElevationDeg
+      }
     };
   }
 }

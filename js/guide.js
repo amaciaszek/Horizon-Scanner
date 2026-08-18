@@ -34,17 +34,15 @@ const IDEAL_RATE = 25;     // deg/s — a lap in about 15 s
 const MAX_RATE = 70;       // beyond this, blur starts to cost real precision
 
 /**
- * Capture modes.
+ * The capture mode.
  *
- * handheld: the operator pivots their body around the phone. The optical centre
- *   wanders by a few centimetres per frame, which is harmless for distant trees
- *   and matters for a house at 12 m, so the roll and rate gates stay loose
- *   enough to be achievable and the overlap requirement absorbs the rest.
- *
- * tripod: the phone is clamped to the mount or a tripod head and the head is
- *   rotated. The optical centre is genuinely fixed, so there is no parallax to
- *   absorb and the geometry is only limited by how carefully the operator turns
- *   the head. Everything tightens accordingly.
+ * There was a `tripod` mode alongside this, with tighter roll, rate and overlap
+ * gates for a clamped phone whose optical centre genuinely does not move. It is
+ * gone: this is a handheld instrument, nobody ever selected the other option,
+ * and a settings control that changes acceptance thresholds is not a harmless
+ * thing to leave lying around — it silently re-judges what counts as a good
+ * frame. `MODES` is kept as a single-entry object so the shape the rest of the
+ * code reads is unchanged.
  */
 export const MODES = {
   handheld: {
@@ -58,18 +56,6 @@ export const MODES = {
     targetOverlap: 0.45,
     setupDetail: 'Stand where the telescope sits and hold the phone at the optical height. Rotate your body around the phone, not the phone around you.',
     calDetail: 'Keep the phone upright and steady.'
-  },
-  tripod: {
-    id: 'tripod',
-    label: 'Tripod / mount',
-    idealRate: 15,
-    maxRate: 45,
-    rollLimitCal: 5,
-    rollLimitScan: 8,
-    minOverlap: 0.45,
-    targetOverlap: 0.60,
-    setupDetail: 'Clamp the phone so its rear camera sits on the mount azimuth axis at the optical height. Rotate the head only — do not move the tripod between passes.',
-    calDetail: 'Lock the altitude axis and leave the head untouched while the sensors settle.'
   }
 };
 
@@ -207,7 +193,6 @@ export class ScanDirector {
       // on a derived angle that has already been observed to be wrong.
       if (ctx.stillness < 0.6) {
         // Distinguish "you are moving" from "the sensor is noisy". Telling a
-        // person to hold still when they are already on a tripod is useless.
         if (ctx.jitterDeg > 1.2) {
           return say('warn', 'Sensor noise, not you',
             `The orientation stream is scattering ±${(ctx.jitterDeg / 2).toFixed(1)}°. Move away from steel, magnets, and motors. The survey will start on a relative azimuth in a few seconds regardless — the mount supplies the real azimuth later.`);
@@ -327,7 +312,14 @@ export class ScanDirector {
           delta > 0 ? +Math.abs(delta) : -Math.abs(delta));
       }
       if (Math.abs(delta) > 3) {
-        return say('work', `Nudge ${delta > 0 ? 'right' : 'left'} ${Math.abs(delta).toFixed(0)}°`, 'Centre the highlighted sector in the frame.', delta > 0 ? +1 : -1);
+        // "Centre the highlighted sector" was the whole instruction, and when
+        // the coverage map had already called itself complete there was no
+        // highlight and no dot left on screen to centre. Say where to go in
+        // terms that survive with nothing drawn, and pass the real magnitude so
+        // the turn cue points.
+        return say('work', `Nudge ${delta > 0 ? 'right' : 'left'} ${Math.abs(delta).toFixed(0)}°`,
+          `Bring the target dot to the middle of the frame — it is at ${wrap360(centre).toFixed(0)}°, you are at ${wrap360(ctx.heading).toFixed(0)}°. Then hold still.`,
+          delta > 0 ? +Math.abs(delta) : -Math.abs(delta));
       }
       if (ctx.stillness < 0.5) return say('fix', 'Hold still', 'Collecting confirmation frames for this sector.');
       return say('good', t.kind === 'photo-gap' ? 'Filling photo gap' : 'Holding on target',
@@ -356,7 +348,7 @@ export class ScanDirector {
       hfovDeg: ctx.hfovDeg,
       reason: ctx.lastRejectReason,
       hasAcceptedFrame: ctx.hasAcceptedFrame !== false,
-      // The active mode's floor, so a tripod survey — which needs more overlap
+      // The mode's overlap floor, so the live warning, the recovery bearings and
       // than a handheld one — is warned at its own limit rather than at the
       // looser default.
       minOverlap: overlapFloor(this.mode)
@@ -532,10 +524,7 @@ export class ScanDirector {
       return { tone: 'fix', headline: 'Too dark to survey', detail: 'Sky segmentation needs daylight. At night the sky is the dark region and the ground carries the bright lights, so every cue inverts and the traced line is meaningless. Come back in daylight — flat overcast is ideal.', arrow: null, tilt: null, phase: this.phase };
     }
     if (ctx.frameStatus === 'noSky') {
-      const how = this.mode.id === 'tripod'
-        ? 'Raise the altitude axis without moving the tripod.'
-        : 'Tilt the camera upward without stepping forward.';
-      return { tone: 'fix', headline: 'No sky visible', detail: `${how} The sky boundary has to be inside the frame.`, arrow: null, tilt: +1, phase: this.phase };
+      return { tone: 'fix', headline: 'No sky visible', detail: 'Tilt the camera upward without stepping forward. The sky boundary has to be inside the frame.', arrow: null, tilt: +1, phase: this.phase };
     }
     if (ctx.frameStatus === 'allSky') {
       return { tone: 'fix', headline: 'No obstruction visible', detail: 'Tilt downward until the skyline enters the frame.', arrow: null, tilt: -1, phase: this.phase };

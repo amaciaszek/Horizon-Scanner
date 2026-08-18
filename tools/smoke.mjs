@@ -320,6 +320,78 @@ await check('progress is countable and moves to the tilt axis', () => {
   return `pan ${d.nPan} ready, now asking for ${d.axis}`;
 });
 
+/*
+ * The 2026-08-18 dead end. After 476 degrees of turning the guide said "stop,
+ * the lap is done, tap the button below" while the button underneath still read
+ * "Keep going - 0% of the horizon covered" and was disabled, because the
+ * controls were only refreshed at phase transitions. The label and the enabled
+ * state both have to be functions of the CURRENT travel.
+ */
+await check('past a full circle the lap can always be closed', () => {
+  const over = policy.pass1OverTravel(476);
+  if (!over.prompt) throw new Error('476 degrees did not read as over-travel');
+  // The button's `enough` test, mirrored: travel alone must be sufficient, with
+  // no dependence on coverage having been fed.
+  const enough = 476 >= 300;
+  if (!enough) throw new Error('travel alone would not enable the button');
+  return `prompt at ${policy.PASS1_PROMPT_DEG}°, enabled from 300°`;
+});
+
+await check('the close-the-lap label never says "keep going"', () => {
+  const html = readFileSync(join(here, '..', 'js', 'main.js'), 'utf8');
+  const block = html.slice(html.indexOf('if (p === PHASE.PASS1) {'));
+  const label = block.slice(0, block.indexOf('return;'));
+  if (!label.includes('over.prompt')) {
+    throw new Error('the pass-1 label does not consider over-travel');
+  }
+  if (!/setPrimary\(btn, text, !enough\)/.test(label)) {
+    throw new Error('the pass-1 button is not driven through setPrimary');
+  }
+  return 'over-travel label wired';
+});
+
+await check('controls are refreshed from the render loop', () => {
+  const src = readFileSync(join(here, '..', 'js', 'main.js'), 'utf8');
+  const live = src.slice(src.indexOf('function renderLive() {'));
+  const head = live.slice(0, live.indexOf('const ctx = {'));
+  if (!head.includes('syncControls()')) {
+    throw new Error('renderLive does not refresh the controls, so labels can go stale');
+  }
+  return 'syncControls called per frame';
+});
+
+// Coverage must not call itself done while work remains. A non-zero tolerance
+// both permitted gaps AND made ScanGuidance drop its bearing, so the dot
+// disappeared exactly when cleanup targets were still outstanding.
+await check('coverage demands the whole ring', () => {
+  const t = coverage.COVERAGE_TUNING;
+  if (t.completionTolerance !== 0) {
+    throw new Error(`tolerance ${t.completionTolerance} still permits uncovered bins`);
+  }
+  if (!(t.coverageThreshold >= 0.85)) throw new Error(`threshold ${t.coverageThreshold} too low`);
+  if (!(t.minObservations >= 8)) throw new Error(`minObservations ${t.minObservations} too low`);
+  return `tol 0, threshold ${t.coverageThreshold}, ${t.minObservations} looks`;
+});
+
+await check('one capture mode only', () => {
+  const ids = Object.keys(guide.MODES);
+  if (ids.length !== 1 || ids[0] !== 'handheld') throw new Error(`modes: ${ids.join(',')}`);
+  const html = readFileSync(join(here, '..', 'index.html'), 'utf8');
+  if (html.includes('modeSelect')) throw new Error('the mode picker is still in the markup');
+  return ids[0];
+});
+
+// Feathering is what makes the panorama readable rather than a diagnostic
+// instrument; the hard-cut mode must survive as a switch, not be replaced.
+await check('the mosaic offers both blended and hard-cut modes', () => {
+  const src = readFileSync(join(here, '..', 'js', 'panorama.js'), 'utf8');
+  if (!src.includes('const blend = !!opts.blend')) throw new Error('no blend option');
+  if (!src.includes('axisDist[i]')) throw new Error('nearest-axis diagnostic mode is gone');
+  const html = readFileSync(join(here, '..', 'index.html'), 'utf8');
+  if (!html.includes('panoBlend')) throw new Error('no toggle in the markup');
+  return 'blend + nearest-axis';
+});
+
 await check('PHASE values', () => Object.values(guide.PHASE).join(','));
 await check('ScanDirector constructs', () => new guide.ScanDirector({ keyframes: [], coverage: () => ({}) }).phase);
 await check('guidance exports', () => Object.keys(guidance).join(','));

@@ -1,17 +1,8 @@
 {
   "version": "0.0.1",
   "configurations": [
-    {
-      "name": "horizon-scanner",
-      "runtimeExecutable": "python",
-      "runtimeArgs": ["-m", "http.server", "8642"],
-      "port": 8642
-    },
-    {
-      "name": "stitch-lab",
-      "runtimeExecutable": ".venv-stitch/Scripts/python.exe",
-      "runtimeArgs": ["-m", "http.server", "8644", "--directory", "lab"],
-      "port": 8644
-    }
+    { "name": "horizon-scanner", "runtimeExecutable": "python", "runtimeArgs": ["-m", "http.server", "8642"], "port": 8642 },
+    { "name": "stitch-lab", "runtimeExecutable": ".venv-stitch/Scripts/python.exe", "runtimeArgs": ["-m", "http.server", "8644", "--directory", "lab"], "port": 8644 },
+    { "name": "blend-lab", "runtimeExecutable": ".venv-stitch/Scripts/python.exe", "runtimeArgs": ["-m", "http.server", "8645", "--directory", "lab2"], "port": 8645 }
   ]
 }
