@@ -6,7 +6,11 @@
 <meta name="theme-color" content="#060d11" />
 <meta name="description" content="Guided multi-pass horizon survey for the OnStep Advanced Telescope Controller." />
 <title>Horizon Survey</title>
-<link rel="stylesheet" href="styles.css" />
+<!-- Version query so a device cannot pair new markup with a cached stylesheet.
+     Bump it with VERSION in js/version.js; iPad Safari holds CSS aggressively
+     and the resulting half-styled page looks like a broken build, not a stale
+     one, which is a bad thing to be debugging in a field. -->
+<link rel="stylesheet" href="styles.css?v=0.13.0" />
 </head>
 <body>
 
@@ -149,6 +153,12 @@
       </select>
     </label>
     <button id="panoSaveBtn" class="btn small" disabled>Save PNG</button>
+  </div>
+
+  <div class="build-progress" id="buildProgress" hidden>
+    <p class="build-progress-label"><span id="buildStage">Preparing…</span><span id="buildEta"></span></p>
+    <div class="directive-bar"><i id="buildBar"></i></div>
+    <p class="hint" id="buildNote">The camera and sensors are paused. You can put the phone down — this runs on its own.</p>
   </div>
 
   <div class="pano-wrap"><canvas id="pano" class="pano"></canvas></div>

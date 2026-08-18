@@ -269,6 +269,16 @@ export class ScanDirector {
     }
 
     if (this.phase === PHASE.ANALYSING) {
+      // Named step and elapsed seconds rather than a spinner. "Building the
+      // profile" with no other movement is indistinguishable from a hang, and
+      // on 2026-08-17 it WAS a hang — an exception left the phase pinned here
+      // with nothing on screen to say so.
+      const a = ctx.analysis;
+      if (a) {
+        const secs = Math.max(0, (performance.now() - a.startedAt) / 1000);
+        return say('work', `Building the profile — step ${a.step + 1} of ${a.total}`,
+          `${a.label}. ${secs.toFixed(0)}s elapsed.`, null, (a.step + 1) / a.total);
+      }
       return say('work', 'Building the profile', 'Optimising the camera path, closing the loop, and merging observations.');
     }
 
@@ -453,6 +463,21 @@ export class ScanDirector {
         headline: `Tilt up ${Math.max(1, Math.round(g.liftDeg))}° — this is taller than the frame`,
         detail: `The top of what stands here has never been inside a picture, so its height is unmeasured. Raise the camera until the target sits on it, keeping the same spot on the ground. ${pct}% of the horizon done.`,
         arrow: 0, tilt: +1, phase: this.phase, progress: g.summary.fraction
+      };
+    }
+    /*
+     * Coming back down off something tall. Said in words, not just in the dot's
+     * position, because this is the moment the operator reported getting stuck:
+     * past the edge of a roof the camera is still pointing well above a skyline
+     * that is now near the horizon, every frame up there is empty sky, and
+     * nothing fills until the camera comes down.
+     */
+    if (g.wantsDrop && away < 25) {
+      return {
+        tone: 'work',
+        headline: `Tilt down ${Math.max(1, Math.round(g.dropDeg))}° — the skyline has dropped`,
+        detail: `You are past the tall part. The camera is still aimed above where the skyline sits here, so these frames are all sky and count for nothing. Follow the target down and keep turning. ${pct}% of the horizon done.`,
+        arrow: 0, tilt: -1, phase: this.phase, progress: g.summary.fraction
       };
     }
 

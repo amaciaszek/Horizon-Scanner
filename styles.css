@@ -427,3 +427,14 @@ details[open] > *:not(summary) { margin-top: 14px; }
   color: var(--ink-2);
   opacity: .75;
 }
+
+/* Build progress. Shown only while a long computation is running, because a
+   progress bar that is always present stops meaning anything. */
+.build-progress { margin: 10px 0 4px; }
+.build-progress-label {
+  display: flex; justify-content: space-between; gap: 12px;
+  margin: 0 0 2px; font-size: 12px; color: var(--ink-3);
+}
+.build-progress-label #buildEta { color: var(--signal); white-space: nowrap; }
+.build-progress .directive-bar { margin-top: 4px; }
+#buildNote { margin-top: 6px; }

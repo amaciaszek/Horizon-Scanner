@@ -147,12 +147,19 @@ export const COVERAGE_TUNING = {
    * individually and judges the solution on its median, so a steep capture is
    * no longer rejected wholesale. See `js/panorama-optimize.js`.
    *
-   * With that repaired the ceiling can go back up. 50 is still well clear of the
-   * 70-degree warning and the 78-degree hard reject, which mark where azimuth
-   * and roll genuinely stop being separable near the zenith. Those limits are
-   * real and are not being touched.
+   * With that repaired the ceiling can go back up. 60 is deliberately
+   * aggressive — it is above the 2026-08-17 runaway's own peak — and it is
+   * chosen because a tall near roof simply cannot be topped from close range at
+   * anything less. It still sits below the 65-degree point where visual yaw is
+   * abandoned, the 70-degree warning, and the 78-degree hard reject, which mark
+   * where azimuth and roll genuinely stop being separable near the zenith.
+   * Those three limits are real and are not being touched.
+   *
+   * What makes 60 safe now is not optimism about the solver, it is that the
+   * descent is guided (see `restElevationAt`). The old failure was not the
+   * height itself; it was arriving at height and being left there.
    */
-  maxRequestedElevationDeg: 50
+  maxRequestedElevationDeg: 60
 };
 
 /** Frame states that mean the camera did not usefully observe anything. */
@@ -431,6 +438,24 @@ export class CoverageMap {
    */
   requiredElevationAt(headingDeg) {
     return this.requiredElevation[this.indexOf(headingDeg)];
+  }
+
+  /**
+   * The elevation the camera should be HOLDING over this sector — the height at
+   * which its skyline is actually framed.
+   *
+   * The dot needs this to bring the operator back down. Coming off a tall roof
+   * at 60 degrees and turning into open garden, every frame is sky, nothing
+   * earns coverage credit, and without a target to descend to the dot simply
+   * rides along at 60 waiting for a sector that can never fill. Guiding the way
+   * up and not the way down is what made the operator feel stuck at the edge of
+   * the house.
+   *
+   * Where something stands, that is the lift this sector needed. Where nothing
+   * does, it is the horizon.
+   */
+  restElevationAt(headingDeg) {
+    return Math.max(0, this.requiredElevation[this.indexOf(headingDeg)] || 0);
   }
 
   /**

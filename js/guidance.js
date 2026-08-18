@@ -69,6 +69,13 @@ export const GUIDANCE_TUNING = {
    *  the interface starts saying "tilt up" in words as well as in position. */
   liftPromptDeg: 8,
 
+  /** How far ABOVE this sector's skyline the camera has to be before the dot
+   *  starts leading the operator back down. Larger than `liftPromptDeg` on
+   *  purpose: being a little high costs a slightly cropped foreground, while
+   *  being a little low costs the measurement itself, so the descent should be
+   *  the less twitchy of the two. */
+  descentPromptDeg: 12,
+
   /** Smoothing for the dot's vertical travel, in seconds. Slower than the
    *  horizontal: a target that bobs vertically while the operator is trying to
    *  frame a roofline is worse than one that arrives a moment late. */
@@ -78,8 +85,13 @@ export const GUIDANCE_TUNING = {
    *  before the dot will turn the operator around for it. Every sweep leaves a
    *  thin under-exposed sliver at the trailing edge of wherever it began, and
    *  sending someone back for two degrees would be maddening — that sliver gets
-   *  picked up for free when the lap closes. */
-  minFrontierRunDeg: 8
+   *  picked up for free when the lap closes.
+   *
+   *  Lowered from 8 to 4: the cost of going back is a few seconds and some
+   *  frames, and frames are the thing the survey is short of. The only real
+   *  floor is the width below which the operator cannot aim accurately enough
+   *  for the trip to achieve anything, which is nearer 4 degrees than 8. */
+  minFrontierRunDeg: 4
 };
 
 /** Signed angular distance from `from` to `to` measured the sweep way round. */
@@ -302,7 +314,25 @@ export class ScanGuidance {
      */
     const required = coverage.requiredElevationAt(this.rawBearingDeg);
     const wantsLift = coverage.needsLiftAt(this.rawBearingDeg) && required > 0;
-    const desiredElevation = wantsLift ? required : elevationDeg;
+
+    /*
+     * And where it sits on the way back DOWN.
+     *
+     * Riding at the camera's own elevation whenever no lift is wanted is
+     * correct while the operator is near the skyline, and it is why the dot
+     * normally asks for a turn and nothing else. But it is exactly wrong just
+     * after a tall obstruction: the operator is at 60 degrees, the next sector
+     * needs nothing, so `wantsLift` is false, the dot mirrors the camera at 60,
+     * and the sector below never fills because every frame up there is sky.
+     * The dot has to lead down as deliberately as it led up.
+     *
+     * The prompt threshold keeps this quiet in ordinary use. Only a camera well
+     * above where this sector's skyline actually is gets pulled down, so the
+     * operator is never fighting the dot over a degree or two of framing.
+     */
+    const rest = coverage.restElevationAt(this.rawBearingDeg);
+    const wantsDrop = !wantsLift && (elevationDeg - rest) > t.descentPromptDeg;
+    const desiredElevation = wantsLift ? required : (wantsDrop ? rest : elevationDeg);
     if (this.elevationDeg === null) {
       this.elevationDeg = desiredElevation;
     } else {
@@ -312,6 +342,8 @@ export class ScanGuidance {
     }
     this.wantsLift = wantsLift;
     this.liftDeg = wantsLift ? Math.max(0, required - elevationDeg) : 0;
+    this.wantsDrop = wantsDrop;
+    this.dropDeg = wantsDrop ? Math.max(0, elevationDeg - rest) : 0;
     // Taller than any tilt this will ask for, even at the 50-degree ceiling.
     // Recorded and reported rather than repeated at the operator, since there is
     // no instruction here that could succeed.
@@ -337,6 +369,9 @@ export class ScanGuidance {
       elevationDeg: this.elevationDeg,
       wantsLift: this.wantsLift,
       liftDeg: Number((this.liftDeg || 0).toFixed(1)),
+      /** ...and how far below, coming off an obstruction. */
+      wantsDrop: this.wantsDrop,
+      dropDeg: Number((this.dropDeg || 0).toFixed(1)),
       beyondTilt: !!this.beyondTilt,
       state: this.state,
       complete: this.complete,

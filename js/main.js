@@ -10,6 +10,7 @@ import { OrientationSource } from './orientation.js';
 import { Survey, RULES, BIN_COUNT, BIN_STEP, STATUS } from './survey.js';
 import { ScanDirector, PHASE } from './guide.js';
 import { CoverageMap } from './coverage.js';
+import { BuildProgress } from './build-progress.js';
 import { ScanGuidance } from './guidance.js';
 import { Pipeline } from './pipeline.js';
 import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
@@ -120,6 +121,9 @@ const state = {
   thumbs: {},
   targetLuma: null,
   sensorCal: { stage: 'idle', startedAt: 0 },
+  /** Which step of the post-lap analysis is running, so a long computation can
+   *  say so instead of looking like a hang. Null whenever nothing is running. */
+  analysis: null,
   captureAudit: { counts: {}, events: [], lastReason: null, lastAt: 0 }
 };
 
@@ -1182,13 +1186,60 @@ function pollLens(now) {
 }
 
 /** What the measurement still needs, in something the operator can act on. */
-function lensHint(r) {
-  if (!r || (!r.nPan && !r.nTilt)) {
-    return 'Point at something with detail — a tree, a fence, a rooftop. Blank sky or a plain wall gives the matcher nothing to hold onto.';
+/**
+ * What to tell the operator during the lens measurement.
+ *
+ * The old version of this said "point at something with detail" until the first
+ * pair arrived and "keep panning" thereafter, regardless of whether anything
+ * was working. The operator's complaint was exact: no idea what it was using,
+ * and no idea whether it was getting anywhere. Both are knowable — the
+ * calibrator counts its pairs and knows why it is rejecting the rest — so both
+ * are now said out loud.
+ *
+ * Order matters. A live problem outranks progress, because progress that is not
+ * moving is not the thing to report when the reason it is not moving is
+ * available.
+ */
+function lensGuidance(diag) {
+  if (!diag) {
+    return {
+      advice: 'Point at something with hard edges — a tree, a fence, a rooftop. Blank sky or a plain wall gives the matcher nothing to hold onto.',
+      tone: 'work', counts: ''
+    };
   }
-  if (!r.panReady) return 'Keep panning left and right, smoothly.';
-  if (!r.tiltReady) return 'Horizontal done. Now tilt it up and down, the same slow sweep.';
-  return 'Almost there.';
+  const counts = diag.axis === 'done'
+    ? `${diag.nPan} sideways and ${diag.nTilt} up-down pairs.`
+    : `Sideways ${Math.min(diag.nPan, diag.need)}/${diag.need}, up-down ${Math.min(diag.nTilt, diag.need)}/${diag.need}.`;
+
+  // A live problem with the current view, named specifically.
+  const problems = {
+    quality: ['fix', 'This view gives it nothing to hold onto. Aim at hard edges — a roofline against sky, a fence, bare branches. Move off blank wall, water, or plain sky.'],
+    tooSlow: ['fix', 'Too slow to measure — the picture is barely moving between frames. Sweep noticeably faster.'],
+    tooFast: ['fix', 'Too fast — consecutive frames barely overlap. Slow the sweep down.'],
+    absurd: ['fix', 'The match keeps jumping, which usually means a repeating pattern like siding or railings. Aim at something less repetitive.']
+  };
+  if (diag.problem && problems[diag.problem]) {
+    const [tone, advice] = problems[diag.problem];
+    return { tone, advice, counts };
+  }
+
+  // Nothing wrong: say which half is being worked on and that it is landing.
+  const locked = diag.lock !== null && diag.lock > 0.5;
+  if (diag.axis === 'pan') {
+    return {
+      tone: locked ? 'good' : 'work',
+      advice: locked ? 'Holding well. Keep sweeping left and right.' : 'Sweep left and right, smoothly.',
+      counts
+    };
+  }
+  if (diag.axis === 'tilt') {
+    return {
+      tone: locked ? 'good' : 'work',
+      advice: 'Sideways is done. Now tilt up and down, the same steady sweep.',
+      counts
+    };
+  }
+  return { tone: 'good', advice: 'Both directions measured.', counts };
 }
 
 function finishLens(r) {
@@ -1297,11 +1348,56 @@ async function startCapture() {
   }
 }
 
+/**
+ * Steps of `finishPass1`, named so the operator can be told which one is
+ * running. There is deliberately no ETA: these steps take wildly different
+ * times depending on frame count and none of them is predictable enough to put
+ * a countdown on without lying. Naming the step and counting the seconds is
+ * honest, and it answers the only question that matters — is it still working.
+ */
+const ANALYSIS_STEPS = [
+  'Matching the closing view',
+  'Checking the rotation scale',
+  'Applying loop closure',
+  'Reprojecting the survey',
+  'Planning the second pass'
+];
+
+function setAnalysisStep(index) {
+  state.analysis = {
+    step: index,
+    total: ANALYSIS_STEPS.length,
+    label: ANALYSIS_STEPS[index] || '',
+    startedAt: state.analysis?.startedAt || performance.now()
+  };
+}
+
 async function finishPass1() {
   director.setPhase(PHASE.ANALYSING);
+  state.analysis = null;
+  setAnalysisStep(0);
   syncControls();
   await new Promise(r => setTimeout(r, 30));
+  try {
+    await runPass1Analysis();
+  } catch (err) {
+    // A throw in here used to leave the phase pinned at ANALYSING with the
+    // button disabled and nothing on screen — the survey looked frozen and the
+    // operator had no way to tell whether it was working or dead. Whatever
+    // fails, say so and hand control back.
+    log('error', 'Analysis failed:', err);
+    $('stageBlockerText').textContent =
+      `Analysis failed: ${err?.message || err}. The capture is intact — you can still export the debug bundle.`;
+    $('stageBlocker').hidden = false;
+  } finally {
+    state.analysis = null;
+    if (director.phase === PHASE.ANALYSING) director.beginPass2();
+    updateReport();
+    syncControls();
+  }
+}
 
+async function runPass1Analysis() {
   let accumulated = director.pass1Travel;
   let residual = null;
   const luma = camera.grabLuma();
@@ -1320,6 +1416,8 @@ async function finishPass1() {
   // degrees, so a lap logged as 176 is not off by an offset, it is off by a
   // factor — and no amount of additive closure will fix that. Rescale first,
   // and take the true field of view out of the same ratio.
+  setAnalysisStep(1);
+  await new Promise(r => setTimeout(r, 0));
   const laps = Math.max(1, Math.round(Math.abs(accumulated) / 360));
   const offBy = Math.abs(accumulated) / (360 * laps);
   if (offBy < 0.8 || offBy > 1.25) {
@@ -1336,6 +1434,8 @@ async function finishPass1() {
     }
   }
 
+  setAnalysisStep(2);
+  await new Promise(r => setTimeout(r, 0));
   const k = Math.round(accumulated / 360) || (accumulated >= 0 ? 1 : -1);
   if (residual !== null) {
     const closure = accumulated + residual;
@@ -1346,22 +1446,53 @@ async function finishPass1() {
     survey.applyLoopClosure(error);
   }
 
+  setAnalysisStep(3);
+  await new Promise(r => setTimeout(r, 0));
   survey.reproject(camera.intrinsics());
   logCaptureGaps('First lap');
+
+  setAnalysisStep(4);
+  await new Promise(r => setTimeout(r, 0));
   coverage.reset();
   guidance.reset();
   state.lastCoverageAt = null;
   state.guidance = null;
   director.beginPass2();
   log('info', `Verification pass planned: ${director.targets.length} sector(s) need more evidence.`);
-  updateReport();
-  syncControls();
+}
+
+/**
+ * Anything that runs between two phases must not be able to strand the survey
+ * in the first one.
+ *
+ * On 2026-08-17 a ReferenceError inside `logCaptureGaps` threw partway through
+ * the end-of-lap work. The phase had already been set to ANALYSING, the primary
+ * button was already disabled, and the exception went to an unhandled rejection
+ * — so the app sat at "Building the profile" forever with nothing on screen to
+ * say it had died, and the operator had no way to reach their own capture.
+ * Every one of these boundaries is now wrapped: a failure is reported, and the
+ * phase moves on regardless so the capture stays reachable.
+ */
+function guardPhaseStep(what, fn, recover) {
+  try {
+    return fn();
+  } catch (err) {
+    log('error', `${what} failed:`, err);
+    $('stageBlockerText').textContent =
+      `${what} failed: ${err?.message || err}. Your capture is intact — you can still export the debug bundle.`;
+    $('stageBlocker').hidden = false;
+    try { recover?.(); } catch (_) { /* recovery is best-effort by definition */ }
+    return null;
+  }
 }
 
 function finishVerificationPass() {
   director.verificationSweep = false;
-  survey.recompute();
-  const gapReport = logCaptureGaps('Verification lap');
+  const gapReport = guardPhaseStep('Verification lap analysis', () => {
+    survey.recompute();
+    return logCaptureGaps('Verification lap');
+  });
+  if (!gapReport) return finishSurvey();
   director.refreshTargets();
   if (!director.targets.length) return finishSurvey();
 
@@ -1378,8 +1509,12 @@ function finishVerificationPass() {
 
 function finishSurvey() {
   director.setPhase(PHASE.VALIDATING);
-  survey.recompute();
-  updateReport();
+  guardPhaseStep('Validation', () => {
+    survey.recompute();
+    updateReport();
+  });
+  // Unconditional: VALIDATING has no controls of its own, so being left in it
+  // is indistinguishable from a hang.
   director.setPhase(PHASE.COMPLETE);
   state.paused = true;
   syncControls();
@@ -1503,6 +1638,7 @@ function renderLive() {
     roll: att.roll,
     rotationRate: Math.abs(orientation.rotationRate),
     stillness: orientation.stillness,
+    analysis: state.analysis || null,
     overlap: state.overlap,
     frameStatus: state.frameStatus,
     visualQuality: state.visualQuality,
@@ -1571,13 +1707,19 @@ function renderLive() {
     $('primaryBtn').disabled = false;
   } else if (director.phase === PHASE.CALIBRATING && state.sensorCal.stage === LENS_STAGE) {
     const r = state.sensorCal.lens;
-    const measured = r && r.hfovDeg
-      ? ` So far it reads ${r.hfovDeg.toFixed(0)}° across${r.vfovDeg ? ` and ${r.vfovDeg.toFixed(0)}° down` : ''}.` : '';
+    const diag = lensCal.diagnose();
+    const g = lensGuidance(diag);
+    const reading = r && r.hfovDeg
+      ? ` Reading ${r.hfovDeg.toFixed(0)}° across${r.vfovDeg ? ` and ${r.vfovDeg.toFixed(0)}° down` : ''}, ±${(diag.uncertainty * 100).toFixed(1)}%.`
+      : '';
     d = {
-      tone: r && r.ready ? 'good' : 'work',
-      headline: 'Measuring the lens',
-      detail: `Point at something with detail and sweep the phone slowly — left and right, then up and down. This measures how many degrees the frame actually covers, which sets every altitude. ${lensHint(r)}${measured}`,
-      progress: director.calibrationProgress,
+      tone: r && r.ready ? 'good' : g.tone,
+      headline: diag.axis === 'tilt' ? 'Measuring the lens — now up and down' : 'Measuring the lens',
+      detail: `${g.advice} ${g.counts}${reading}`,
+      // Progress against the pairs actually needed, rather than against a
+      // timer. A bar driven by elapsed time while nothing is being collected
+      // is the thing that made this step feel like it might not be working.
+      progress: Math.min(1, ((Math.min(diag.nPan, diag.need) + Math.min(diag.nTilt, diag.need)) / (2 * diag.need))),
       arrow: null,
       figure: 'lens'
     };
@@ -2169,13 +2311,17 @@ async function loadKeyframeBlobs({ waitForPending = false } = {}) {
   return byIndex;
 }
 
-async function loadKeyframeSources(keyframes) {
+async function loadKeyframeSources(keyframes, onProgress = null) {
   const byIndex = await loadKeyframeBlobs();
   const scratch = document.createElement('canvas');
   const sctx = scratch.getContext('2d', { willReadFrequently: true });
   const sources = [];
   let found = 0;
   for (const kf of keyframes) {
+    onProgress?.(sources.length, keyframes.length);
+    // Decoding a long capture blocks for many seconds otherwise, and a progress
+    // bar that cannot paint is no better than no progress bar.
+    if (sources.length % 4 === 3) await new Promise(r => setTimeout(r, 0));
     const blob = byIndex.get(kf.index);
     if (!blob) { sources.push(null); continue; }
     try {
@@ -2212,13 +2358,35 @@ async function buildPanorama() {
   const label = btn.textContent;
   btn.disabled = true; btn.textContent = 'Building…';
   status.textContent = `Reprojecting ${kfs.length} keyframes…`;
+
+  /*
+   * Put the phone down.
+   *
+   * The build can run for minutes on a long capture, and the operator has no
+   * way to know whether they are still required. Holding a camera steady for a
+   * computation that does not use it is a small misery, and worse, they cannot
+   * tell it apart from a hang. So the camera and the sensor stream stop, the
+   * panel says so in as many words, and the progress bar gives them the one
+   * thing that lets them walk away: an idea of when to come back.
+   */
+  const wasRunning = state.running && !state.paused;
+  if (wasRunning) {
+    state.paused = true;
+    syncControls();
+    log('info', 'Camera and sensors paused for the panorama build.');
+  }
+
+  const progress = new BuildProgress(paintBuildProgress);
+  $('buildProgress').hidden = false;
+  paintBuildProgress(progress.snapshot());
   // Yield so the button state paints before the synchronous mosaic pass.
   await new Promise(r => requestAnimationFrame(() => r()));
 
   try {
     const wantImagery = $('panoImagery').checked;
     const { sources, found } = wantImagery
-      ? await loadKeyframeSources(kfs)
+      ? await loadKeyframeSources(kfs, (done, total) =>
+        progress.update('decoding', done, total, `Decoding photo ${done} of ${total}`))
       : { sources: [], found: 0 };
 
     let renderKeyframes = kfs;
@@ -2230,13 +2398,18 @@ async function buildPanorama() {
         keyframes: kfs,
         sources,
         yawDatum: renderYawDatum,
-        onProgress: progress => {
-          if (progress.stage === 'features') {
-            status.textContent = `Finding fixed features below the skyline: ${progress.completed}/${progress.total} photos…`;
-          } else if (progress.stage === 'matching') {
-            status.textContent = `Checking photo overlaps: ${progress.completed}/${progress.total} pairs, ${progress.verifiedPairs} verified…`;
+        onProgress: p => {
+          if (p.stage === 'features') {
+            status.textContent = `Finding fixed features below the skyline: ${p.completed}/${p.total} photos…`;
+            progress.update('features', p.completed, p.total,
+              `Finding features, photo ${p.completed} of ${p.total}`);
+          } else if (p.stage === 'matching') {
+            status.textContent = `Checking photo overlaps: ${p.completed}/${p.total} pairs, ${p.verifiedPairs} verified…`;
+            progress.update('matching', p.completed, p.total,
+              `Matching overlaps, pair ${p.completed} of ${p.total}`);
           } else {
             status.textContent = `Refining azimuth while holding elevation to gravity…`;
+            progress.update('solving', 1, 1, 'Solving the camera path');
           }
         }
       });
@@ -2325,7 +2498,23 @@ async function buildPanorama() {
     log('error', 'Panorama build failed', { error: String(e && e.stack || e) });
   } finally {
     btn.disabled = false; btn.textContent = label;
+    progress.finish();
+    $('buildProgress').hidden = true;
+    // Whatever happened, give the operator their camera back. Leaving it paused
+    // after a failed build would look exactly like the app having died.
+    if (wasRunning) {
+      state.paused = false;
+      syncControls();
+      log('info', 'Camera and sensors resumed.');
+    }
   }
+}
+
+/** Paint one BuildProgress snapshot. Cheap enough to call on every update. */
+function paintBuildProgress(p) {
+  $('buildStage').textContent = p.label || 'Preparing…';
+  $('buildEta').textContent = p.etaText || '';
+  $('buildBar').style.width = `${(p.fraction * 100).toFixed(1)}%`;
 }
 
 /**

@@ -72,6 +72,10 @@ const MIN_QUALITY = 0.2;
  * long ones, where the pixel shifts happen to be large.
  */
 const READY_N = 45;
+/** Attempts kept for live advice. At roughly 10 Hz this is the last two or
+ *  three seconds — long enough to be a verdict on the view rather than on one
+ *  unlucky frame, short enough to change when the operator moves. */
+const RECENT_WINDOW = 24;
 /**
  * 2%, not the 1.5% this started at. On a 50° lens 2% is about one degree,
  * which is nothing beside the discrepancies this exists to catch — and 1.5%
@@ -113,6 +117,67 @@ export class LensCalibrator {
     this.pan = [];
     this.tilt = [];
     this.rejected = { angle: 0, shift: 0, quality: 0, absurd: 0 };
+    /**
+     * A short rolling window of recent attempts, kept separately from the
+     * cumulative counters above.
+     *
+     * The cumulative counts say what happened over the whole attempt; they
+     * cannot say whether what the camera is pointed at RIGHT NOW is any good.
+     * An operator who spent thirty seconds on blank sky and then found a tree
+     * would still be reading a mostly-rejected total, and would be told to move
+     * off the one view that was finally working. Advice has to come from the
+     * last second or two.
+     */
+    this.recent = [];
+  }
+
+  _note(ok, reason) {
+    this.recent.push({ ok, reason });
+    if (this.recent.length > RECENT_WINDOW) this.recent.shift();
+    return ok;
+  }
+
+  /**
+   * What the operator should do next, and why — from the last few attempts.
+   *
+   * This is the difference between "point at something with detail" printed
+   * unconditionally forever, and being told that THIS view is not working and
+   * what specifically is wrong with it. The calibrator already knows: it
+   * rejects for distinct reasons and the dominant recent reason names the fix.
+   */
+  diagnose() {
+    const r = this.result();
+    const need = READY_N;
+    const axis = !r.panReady ? 'pan' : (!r.tiltReady ? 'tilt' : 'done');
+
+    const window = this.recent;
+    const accepted = window.filter(s => s.ok).length;
+    const lock = window.length ? accepted / window.length : null;
+
+    // Dominant recent failure, if the window is long enough to mean anything.
+    let worst = null;
+    if (window.length >= RECENT_WINDOW / 2 && lock !== null && lock < 0.35) {
+      const tally = {};
+      for (const s of window) if (!s.ok) tally[s.reason] = (tally[s.reason] || 0) + 1;
+      worst = Object.entries(tally).sort((a, b) => b[1] - a[1])[0]?.[0] || null;
+    }
+
+    return {
+      axis,
+      nPan: r.nPan,
+      nTilt: r.nTilt,
+      need,
+      panReady: r.panReady,
+      tiltReady: r.tiltReady,
+      /** Fraction of recent frames that produced a usable pair. Null until
+       *  there is a window worth quoting. */
+      lock,
+      /** Recent dominant rejection, or null when things are going well. */
+      problem: worst,
+      hfovDeg: r.hfovDeg,
+      vfovDeg: r.vfovDeg,
+      uncertainty: Math.max(r.uncertaintyH ?? 1, r.uncertaintyV ?? 1)
+    };
   }
 
   /**
@@ -138,18 +203,22 @@ export class LensCalibrator {
   }
 
   _add(bucket, shiftPx, angleDeg, quality, extentPx) {
-    if (!(quality >= MIN_QUALITY)) { this.rejected.quality++; return false; }
-    if (!(angleDeg >= MIN_ANGLE_DEG && angleDeg <= MAX_ANGLE_DEG)) { this.rejected.angle++; return false; }
+    // Rejections are reported by CAUSE, separating too-slow from too-fast,
+    // because they call for opposite corrections and telling an operator who is
+    // already sweeping too fast to sweep faster is worse than saying nothing.
+    if (!(quality >= MIN_QUALITY)) { this.rejected.quality++; return this._note(false, 'quality'); }
+    if (!(angleDeg >= MIN_ANGLE_DEG)) { this.rejected.angle++; return this._note(false, 'tooSlow'); }
+    if (!(angleDeg <= MAX_ANGLE_DEG)) { this.rejected.angle++; return this._note(false, 'tooFast'); }
     const focal = shiftPx / Math.tan(angleDeg * DEG);
     // A focal length outside this range would mean a fisheye or a telescope;
     // either is a failed match, not a lens.
     if (!Number.isFinite(focal) || focal < extentPx * 0.15 || focal > extentPx * 20) {
-      this.rejected.absurd++; return false;
+      this.rejected.absurd++; return this._note(false, 'absurd');
     }
     // Larger rotations carry proportionally less matcher noise, so weight by
     // the angle as well as by the match quality.
     bucket.push({ v: focal, w: angleDeg * quality, angle: angleDeg });
-    return true;
+    return this._note(true, null);
   }
 
   /**

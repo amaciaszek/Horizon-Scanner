@@ -45,7 +45,11 @@ function horizontalFovDeg(kf) {
 export function captureGapReport(keyframes, yawDatumDeg = 0, {
   minOverlap = 0.35
 } = {}) {
-  const sweeps = (keyframes || []).filter(kf => (kf.captureKind || 'sweep') === 'sweep');
+  // Every frame can bridge a gap, including targeted cleanup shots that are not
+  // part of any chronological lap. Only the lap-ordering below is restricted to
+  // sweeps.
+  const usable = keyframes || [];
+  const sweeps = usable.filter(kf => (kf.captureKind || 'sweep') === 'sweep');
   const grouped = new Map();
   for (const kf of sweeps) {
     const pass = finite(kf.pass) ? kf.pass : 1;

@@ -109,8 +109,23 @@ export function captureStall({
  * rising and the archive says why. Pressing the button remains the only way on,
  * and it was already the right move a hundred degrees earlier.
  */
+/*
+ * The refusal moved from 500 to 900 on 2026-08-17.
+ *
+ * The reasoning above still holds for the PROMPT: past 400 degrees the operator
+ * should be told to close the lap, because verification needs frames labelled
+ * pass 2 and they are not getting any. But refusing to record was the wrong
+ * remedy. A frame that lands on a bearing which already has one is not waste —
+ * it is a second look from a slightly different pose, which is precisely what
+ * the bundle adjustment lives on, and the field experience of the counter
+ * silently stopping is indistinguishable from the app having broken.
+ *
+ * So the prompt stays where it was and the refusal moves out to two and a half
+ * laps, where continued turning genuinely means the operator has lost track of
+ * what they are doing rather than deliberately gathering more.
+ */
 export const PASS1_PROMPT_DEG = 400;
-export const PASS1_REFUSE_DEG = 500;
+export const PASS1_REFUSE_DEG = 900;
 
 export function pass1OverTravel(travelDeg) {
   const travelled = Math.abs(Number(travelDeg) || 0);
@@ -132,5 +147,16 @@ export function pass2CaptureAccepted({
   elapsedMs = 0
 } = {}) {
   if (verificationSweep) return Math.abs(angularTravelDeg) >= stepDeg;
-  return onTarget && stillness > 0.5 && elapsedMs > 380;
+
+  // Holding on a target is the fast path: stand on the sector that needs help,
+  // keep still, and frames accrue without having to turn for them.
+  if (onTarget && stillness > 0.5 && elapsedMs > 380) return true;
+
+  // But a cleanup lap must also just WORK anywhere. Requiring `onTarget` was
+  // the only rule here, which meant that on the second lap the operator could
+  // turn to something they could see needed another look and get nothing at all
+  // for it — the app silently declining to photograph what it was being shown.
+  // Ordinary sweep spacing is the floor everywhere, so turning always captures
+  // and lingering captures faster.
+  return Math.abs(angularTravelDeg) >= stepDeg;
 }
