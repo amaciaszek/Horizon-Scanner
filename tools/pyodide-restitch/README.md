@@ -33,8 +33,11 @@ The current pipeline:
 - tests up to 24 candidate neighbours per frame to retain cross-row bridges;
 - measures and reports connected components after pruning;
 - renders the largest visually solved component;
-- keeps a disconnected frame only when it contributes unique altitude coverage,
-  and labels it as sensor-placed rather than solved;
+- omits every disconnected frame, including unique altitude islands whose pose
+  cannot be verified by visual overlap;
+- fits a guarded smooth 6×5 residual mesh to connected frames whose matched
+  features show a real local perspective improvement; this correction is
+  render-only and cannot move the spherical horizon solution;
 - chooses low-disagreement seams below the archived skyline while feathering
   the sky, with global exposure compensation;
 - derives the vertical output range from the projected frames instead of
@@ -59,12 +62,11 @@ seconds:
 - 0.101° median residual and 0.297° p90;
 - focal scale 0.9757;
 - 182/200 frames in the largest solved graph;
-- one downward unique-coverage frame retained at its sensor pose;
-- 17 overlapping disconnected frames omitted to prevent false ghosting;
-- output altitude -61° to +73°, producing a 2880 x 1072 PNG.
+- all disconnected frames omitted to prevent false ghosting;
+- output bounds derived only from the visually connected component.
 
 The most downward frame is centered at -43.94° and has zero surviving visual
 connections; the next frame is at -11.50°. No offline algorithm can infer an
-image-to-image registration across that 32° no-overlap jump. It is displayed
-as sensor-only coverage, and future captures must enforce overlap between tilt
-rows if that region needs to join the solved panorama.
+image-to-image registration across that 32° no-overlap jump. It is now omitted,
+and future captures must enforce overlap between tilt rows if that region needs
+to join the solved panorama.

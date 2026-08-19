@@ -28,7 +28,7 @@ function refreshRunButton() {
 
 function createWorker() {
   runtimeReady = false;
-  worker = new Worker('./worker.js?v=20260819-connectivity-2', { type: 'module' });
+  worker = new Worker('./worker.js?v=20260819-perspective-3', { type: 'module' });
   worker.addEventListener('message', onWorkerMessage);
   worker.addEventListener('error', event => fail(event.message || 'worker failed'));
   worker.postMessage({ type: 'init' });
@@ -133,15 +133,16 @@ function renderMetrics(r) {
     ['largest solved graph', `${graph.largestComponentFrames ?? r.frames}/${r.frames}`],
     ['graph components', graph.components ?? 1]
   ];
+  const perspective = r.perspectiveCorrection || {};
+  const corrected = perspective.acceptedFrames?.length || 0;
+  values.push(['locally warped frames', corrected]);
   $('metrics').innerHTML = values.map(([k, v]) => `<div class="metric"><span>${k}</span><b>${v}</b></div>`).join('');
   const excluded = graph.excludedFrameIndices || [];
-  const fallback = graph.sensorFallbackFrameIndices || [];
-  const omitted = Math.max(0, excluded.length - fallback.length);
   $('quality').textContent = excluded.length
     ? `${graph.largestComponentFrames}/${r.frames} frames were visually connected. ` +
-      `${fallback.length} unique-coverage frame${fallback.length === 1 ? '' : 's'} used sensor placement; ` +
-      `${omitted} overlapping disconnected frame${omitted === 1 ? '' : 's'} omitted to prevent ghosting.`
-    : 'Every frame belongs to one visually connected solution.';
+      `All ${excluded.length} disconnected frame${excluded.length === 1 ? '' : 's'} were omitted; ` +
+      `${corrected} connected frame${corrected === 1 ? '' : 's'} passed the guarded local perspective correction.`
+    : `Every frame belongs to one visually connected solution; ${corrected} passed the guarded local perspective correction.`;
   $('result').hidden = false;
 }
 

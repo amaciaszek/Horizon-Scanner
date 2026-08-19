@@ -24,7 +24,7 @@ async function initialize() {
   // The worker and Python CLI must be updated as one unit. Browsers otherwise
   // may reuse an older stitch_lab.py while loading a newer worker.js, leaving
   // new command-line options unrecognized.
-  const response = await fetch('../stitch_lab.py?v=20260819-connectivity-2', {
+  const response = await fetch('../stitch_lab.py?v=20260819-perspective-3', {
     cache: 'no-store'
   });
   if (!response.ok) throw new Error(`could not load stitch_lab.py (${response.status})`);

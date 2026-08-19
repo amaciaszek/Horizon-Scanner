@@ -12,11 +12,12 @@ recurring mistake has been a change that looked principled and made things
 worse without anyone noticing, so nothing here is trusted because it sounds
 right.
 
-WHAT THE GEOMETRY ACTUALLY IS. The operator turns a camera about a point. That
-makes every frame a rotation of the same view sphere, so the model is three
-angles per frame plus one shared focal length — not a homography per pair, which
-has eight parameters and will happily absorb parallax, drift and noise into a
-plausible-looking lie. Rotation-only is both fewer unknowns and the truth.
+WHAT THE GEOMETRY ACTUALLY IS. The global solve is three angles per frame plus
+one shared focal length. That is the stable model for the distant horizon. A
+hand-held capture is not a perfect turn about one point, however, so after that
+solve a tightly guarded per-frame mesh may correct the remaining local
+perspective/parallax error for rendering. It is never allowed to steer the
+global pose.
 
     py -m venv .venv-stitch
     .venv-stitch\\Scripts\\python.exe -m pip install -r tools\\requirements-stitch.txt
@@ -749,6 +750,206 @@ def altitude_bounds(frames, rotations, scale, padding=1.0):
             min(89.0, math.ceil(max(highs) + padding)))
 
 
+def _project_world_to_frame(world, frame, rotation, scale):
+    """World directions -> pixels under the solved spherical camera."""
+    h, w = frame.image.shape[:2]
+    cam = world @ rotation
+    depth = -cam[:, 2]
+    safe = np.where(depth > 1e-6, depth, 1.0)
+    u = cam[:, 0] / safe / (frame.tan_h * scale)
+    v = cam[:, 1] / safe / (frame.tan_v * scale)
+    x = (u + 1.0) * 0.5 * w - 0.5
+    y = (1.0 - v) * 0.5 * h - 0.5
+    return np.stack([x, y], axis=1)
+
+
+def _mesh_basis(points, width, height, grid_width, grid_height):
+    """Bilinear interpolation matrix from mesh nodes to arbitrary pixels."""
+    points = np.asarray(points, dtype=np.float64)
+    gx = np.clip(points[:, 0] / max(width - 1, 1) * (grid_width - 1),
+                 0.0, grid_width - 1.000001)
+    gy = np.clip(points[:, 1] / max(height - 1, 1) * (grid_height - 1),
+                 0.0, grid_height - 1.000001)
+    x0 = np.floor(gx).astype(int)
+    y0 = np.floor(gy).astype(int)
+    fx, fy = gx - x0, gy - y0
+    A = np.zeros((len(points), grid_width * grid_height), dtype=np.float64)
+    rows = np.arange(len(points))
+    for ox, oy, weight in (
+            (0, 0, (1.0 - fx) * (1.0 - fy)),
+            (1, 0, fx * (1.0 - fy)),
+            (0, 1, (1.0 - fx) * fy),
+            (1, 1, fx * fy)):
+        columns = (y0 + oy) * grid_width + (x0 + ox)
+        A[rows, columns] += weight
+    return A
+
+
+def _apply_render_warp(x, y, warp):
+    """Ideal spherical source coordinates -> corrected photograph coordinates."""
+    if warp is None:
+        return x, y
+    grid_width, grid_height = warp['gridWidth'], warp['gridHeight']
+    gx = np.clip(x / max(warp['width'] - 1, 1) * (grid_width - 1),
+                 0.0, grid_width - 1.000001)
+    gy = np.clip(y / max(warp['height'] - 1, 1) * (grid_height - 1),
+                 0.0, grid_height - 1.000001)
+    x0 = np.floor(gx).astype(int)
+    y0 = np.floor(gy).astype(int)
+    fx, fy = gx - x0, gy - y0
+    nodes = warp['nodes']
+    delta = (nodes[y0, x0] * ((1.0 - fx) * (1.0 - fy))[..., None] +
+             nodes[y0, x0 + 1] * (fx * (1.0 - fy))[..., None] +
+             nodes[y0 + 1, x0] * ((1.0 - fx) * fy)[..., None] +
+             nodes[y0 + 1, x0 + 1] * (fx * fy)[..., None])
+    return x + delta[..., 0], y + delta[..., 1]
+
+
+def _mesh_is_safe(nodes, width, height, min_area_ratio=0.72, max_area_ratio=1.38):
+    """Reject any locally folded or excessively stretched mesh cell."""
+    grid_height, grid_width = nodes.shape[:2]
+    xs = np.linspace(0.0, width - 1.0, grid_width)
+    ys = np.linspace(0.0, height - 1.0, grid_height)
+    for y in range(grid_height - 1):
+        for x in range(grid_width - 1):
+            base = np.array([[xs[x], ys[y]], [xs[x + 1], ys[y]],
+                             [xs[x + 1], ys[y + 1]], [xs[x], ys[y + 1]]])
+            delta = np.array([nodes[y, x], nodes[y, x + 1],
+                              nodes[y + 1, x + 1], nodes[y + 1, x]])
+            quad = (base + delta).astype(np.float32)
+            base_area = max(float(cv2.contourArea(base.astype(np.float32))), 1.0)
+            ratio = abs(float(cv2.contourArea(quad))) / base_area
+            if (not cv2.isContourConvex(quad) or ratio < min_area_ratio or
+                    ratio > max_area_ratio):
+                return False
+    return True
+
+
+def fit_render_warps(frames, pairs, rotations, scale, component,
+                     min_points=30, grid_width=6, grid_height=5, log=print):
+    """Fit a guarded smooth residual mesh for each frame.
+
+    Every surviving correspondence first gets one common world direction: the
+    normalized mean of the directions assigned by the two solved cameras. That
+    common ray is projected back into each photograph. A small smooth mesh maps
+    those ideal spherical pixels to the pixels where the feature was actually
+    seen. It is a locally projective correction rather than one rigid global
+    homography, because hand-held parallax changes across scene depth.
+
+    This is deliberately a render-only correction. It can absorb the dominant
+    plane error caused by a small hand translation, especially in tilted views,
+    but it cannot change the globally solved horizon or rescue a disconnected
+    photograph. Curvature and identity priors plus a per-cell fold/stretch test
+    leave a frame unwarped rather than accepting a visually dangerous fit.
+    """
+    component = set(component)
+    predicted = [[] for _ in frames]
+    observed = [[] for _ in frames]
+    for pair in pairs:
+        if pair.i not in component or pair.j not in component:
+            continue
+        di = _rescale(pixels_to_rays(pair.pts_i, frames[pair.i]),
+                      frames[pair.i], scale)
+        dj = _rescale(pixels_to_rays(pair.pts_j, frames[pair.j]),
+                      frames[pair.j], scale)
+        wi = di @ rotations[pair.i].T
+        wj = dj @ rotations[pair.j].T
+        world = wi + wj
+        world /= np.maximum(np.linalg.norm(world, axis=1, keepdims=True), 1e-12)
+        predicted[pair.i].append(_project_world_to_frame(
+            world, frames[pair.i], rotations[pair.i], scale))
+        observed[pair.i].append(pair.pts_i.astype(np.float64))
+        predicted[pair.j].append(_project_world_to_frame(
+            world, frames[pair.j], rotations[pair.j], scale))
+        observed[pair.j].append(pair.pts_j.astype(np.float64))
+
+    warps = [None for _ in frames]
+    accepted = []
+    rejected = {'few-points': 0, 'fit': 0, 'improvement': 0, 'shape': 0}
+    for i in sorted(component):
+        if not predicted[i]:
+            rejected['few-points'] += 1
+            continue
+        src = np.concatenate(predicted[i]).astype(np.float64)
+        dst = np.concatenate(observed[i]).astype(np.float64)
+        h, w = frames[i].image.shape[:2]
+        finite = np.isfinite(src).all(axis=1) & np.isfinite(dst).all(axis=1)
+        finite &= ((src[:, 0] >= -8) & (src[:, 0] <= w + 7) &
+                   (src[:, 1] >= -8) & (src[:, 1] <= h + 7))
+        src, dst = src[finite], dst[finite]
+        if len(src) < min_points:
+            rejected['few-points'] += 1
+            continue
+        A = _mesh_basis(src, w, h, grid_width, grid_height)
+        target = dst - src
+        node_count = grid_width * grid_height
+        regularizer = np.eye(node_count) * 4.0
+        # Penalize curvature, while still allowing a coherent translation,
+        # scale or perspective-like shear when the data consistently asks for it.
+        for y in range(grid_height):
+            for x in range(1, grid_width - 1):
+                row = np.zeros(node_count)
+                row[y * grid_width + x - 1:y * grid_width + x + 2] = (1, -2, 1)
+                regularizer += 24.0 * np.outer(row, row)
+        for y in range(1, grid_height - 1):
+            for x in range(grid_width):
+                row = np.zeros(node_count)
+                row[(y - 1) * grid_width + x] = 1
+                row[y * grid_width + x] = -2
+                row[(y + 1) * grid_width + x] = 1
+                regularizer += 24.0 * np.outer(row, row)
+        robust = np.ones(len(src))
+        nodes_flat = None
+        try:
+            for _ in range(4):
+                normal = A.T @ (A * robust[:, None]) + regularizer
+                rhs = A.T @ (target * robust[:, None])
+                nodes_flat = np.linalg.solve(normal, rhs)
+                residual = np.linalg.norm(A @ nodes_flat - target, axis=1)
+                robust = np.minimum(1.0, 2.5 / np.maximum(residual, 1e-6))
+        except np.linalg.LinAlgError:
+            rejected['fit'] += 1
+            continue
+        nodes = nodes_flat.reshape(grid_height, grid_width, 2)
+        max_allowed = min(24.0, 0.04 * math.hypot(w, h))
+        max_move = float(np.linalg.norm(nodes, axis=2).max())
+        if max_move > max_allowed:
+            nodes *= max_allowed / max_move
+            max_move = max_allowed
+
+        warp = {'width': w, 'height': h, 'gridWidth': grid_width,
+                'gridHeight': grid_height, 'nodes': nodes}
+        after_points = src + _mesh_basis(
+            src, w, h, grid_width, grid_height) @ nodes.reshape(-1, 2)
+        before = np.linalg.norm(src - dst, axis=1)
+        after = np.linalg.norm(after_points - dst, axis=1)
+        before_median = float(np.median(before))
+        after_median = float(np.median(after))
+        if after_median > before_median * 0.86 or before_median - after_median < 0.15:
+            rejected['improvement'] += 1
+            continue
+        if not np.isfinite(nodes).all() or not _mesh_is_safe(nodes, w, h):
+            rejected['shape'] += 1
+            continue
+
+        warps[i] = warp
+        accepted.append({
+            'frame': int(frames[i].index), 'points': int(len(src)),
+            'beforeMedianPx': before_median, 'afterMedianPx': after_median,
+            'maxNodeMovePx': max_move,
+            'centerAltitudeDeg': float(frames[i].altitude),
+        })
+
+    if accepted:
+        log(f'  perspective correction: {len(accepted)}/{len(component)} frames; '
+            f'median feature error {np.median([x["beforeMedianPx"] for x in accepted]):.2f}px '
+            f'-> {np.median([x["afterMedianPx"] for x in accepted]):.2f}px; '
+            f'max mesh move {max(x["maxNodeMovePx"] for x in accepted):.1f}px')
+    else:
+        log('  perspective correction: no frame passed the safety checks')
+    return warps, {'acceptedFrames': accepted, 'rejected': rejected}
+
+
 def report(name, errs, log=print):
     log(f'  {name:34s} mean {errs.mean():6.3f}°  median {np.median(errs):6.3f}°  '
         f'p90 {np.percentile(errs, 90):6.3f}°  max {errs.max():6.2f}°  n={len(errs)}')
@@ -841,20 +1042,12 @@ def main():
             f'{frames[i].index}@{frames[i].altitude:.1f}°' for i in excluded)
         print(f'  outside largest solved component: {excluded_text}')
 
-    # A disconnected frame cannot improve pose geometry, but one that extends
-    # the surveyed altitude may still be useful coverage. Keep only such frames
-    # at their sensor pose; overlapping disconnected frames are excluded because
-    # they are exactly what creates false ghosts.
-    main_lo, main_hi = altitude_bounds(
-        [frames[i] for i in main_component], [R[i] for i in main_component], scale)
-    sensor_fallback = []
-    for i in excluded:
-        lo, hi = altitude_bounds([frames[i]], [R[i]], scale)
-        if lo < main_lo - 2.0 or hi > main_hi + 2.0:
-            sensor_fallback.append(i)
-    if sensor_fallback:
-        print('  sensor-only unique coverage: ' + ', '.join(
-            f'{frames[i].index}@{frames[i].altitude:.1f}°' for i in sensor_fallback))
+    # No visual evidence connects an excluded frame to the solved panorama.
+    # Even if it extends the altitude range, painting it from its sensor pose
+    # creates exactly the detached island the connectivity test is meant to
+    # prevent. Disconnected therefore means omitted, without exceptions.
+    render_warps_all, perspective_stats = fit_render_warps(
+        frames, pairs, R, scale, main_component)
 
     pair_count = len(pairs)
     match_count = int(sum(len(p.pts_i) for p in pairs))
@@ -872,15 +1065,16 @@ def main():
     if not args.no_render:
         print('Rendering')
         render_indices = (list(range(len(frames))) if args.render_disconnected
-                          else sorted(main_component + sensor_fallback))
+                          else sorted(main_component))
         if len(render_indices) != len(frames):
             print(f'  using largest solved component: {len(render_indices)}/{len(frames)} frames')
         render_frames = [frames[i] for i in render_indices]
         render_rotations = [R[i] for i in render_indices]
+        render_warps = [render_warps_all[i] for i in render_indices]
         solved, stats, _ = render_equirect(
             render_frames, render_rotations, scale,
             px_per_deg=args.px_per_deg, blend=args.blend,
-            feather_power=args.feather_power)
+            feather_power=args.feather_power, render_warps=render_warps)
         stats['renderedFrames'] = len(render_indices)
         cv2.imwrite(str(args.out / 'panorama-solved.png'), solved)
 
@@ -891,7 +1085,8 @@ def main():
             px_per_deg=args.px_per_deg,
             alt_min=stats['altitudeMin'], alt_max=stats['altitudeMax'],
             blend=args.blend,
-            feather_power=args.feather_power, log=lambda *_: None)
+            feather_power=args.feather_power, render_warps=None,
+            log=lambda *_: None)
         sensor_stats['renderedFrames'] = len(render_indices)
         cv2.imwrite(str(args.out / 'panorama-sensor.png'), sensor)
 
@@ -950,8 +1145,8 @@ def main():
             'largestComponentFrames': len(components[0]) if components else 0,
             'isolatedFrames': sum(len(component) == 1 for component in components),
             'excludedFrameIndices': [int(frames[i].index) for i in excluded],
-            'sensorFallbackFrameIndices': [int(frames[i].index) for i in sensor_fallback],
         },
+        'perspectiveCorrection': perspective_stats,
         'render': stats,
         'renderFromSensorPoses': sensor_stats,
     }, indent=2), encoding='utf-8')
@@ -968,7 +1163,7 @@ def main():
 # --------------------------------------------------------------------------
 
 def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None,
-                    blend='best', feather_power=8.0, log=print):
+                    blend='best', feather_power=8.0, render_warps=None, log=print):
     """
     Paint the sphere.
 
@@ -1001,11 +1196,14 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None
     weight = np.zeros((height, width), np.float64)
     disagreement = np.zeros((height, width), np.float64)
     painted_by = np.zeros((height, width), np.int16)
+    if render_warps is None:
+        render_warps = [None for _ in frames]
 
     seam_masks = seam_gains = None
     if blend == 'seam':
         seam_masks, seam_gains = find_seam_masks(
-            frames, R, scale, alt_min=alt_min, alt_max=alt_max, log=log)
+            frames, R, scale, alt_min=alt_min, alt_max=alt_max,
+            render_warps=render_warps, log=log)
 
     az_axis = (np.arange(width) + 0.5) / px_per_deg
     alt_axis = alt_max - (np.arange(height) + 0.5) / px_per_deg
@@ -1046,12 +1244,16 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None
         safe = np.where(ok, depth, 1.0)
         u = cam[..., 0] / safe / (f.tan_h * scale)
         v = cam[..., 1] / safe / (f.tan_v * scale)
-        ok &= (np.abs(u) <= 1) & (np.abs(v) <= 1)
+        x = (u + 1) / 2 * iw - 0.5
+        y = (1 - v) / 2 * ih - 0.5
+        warped_x, warped_y = _apply_render_warp(x, y, render_warps[n])
+        ok &= ((warped_x >= -0.5) & (warped_x <= iw - 0.5) &
+               (warped_y >= -0.5) & (warped_y <= ih - 0.5))
         if not ok.any():
             continue
 
-        x = ((u + 1) / 2 * iw - 0.5).astype(np.float32)
-        y = ((1 - v) / 2 * ih - 0.5).astype(np.float32)
+        x = warped_x.astype(np.float32)
+        y = warped_y.astype(np.float32)
         sampled = cv2.remap(img, x, y, cv2.INTER_LINEAR,
                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
         sub = (slice(row0, row1), cols)
@@ -1134,7 +1336,7 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None
 
 
 def find_seam_masks(frames, R, scale, alt_min=-12.0, alt_max=62.0,
-                    seam_px_per_deg=1.0, log=print):
+                    seam_px_per_deg=1.0, render_warps=None, log=print):
     """Choose low-disagreement ownership regions before the full render."""
     width = int(round(360.0 * seam_px_per_deg))
     height = int(round((alt_max - alt_min) * seam_px_per_deg))
@@ -1149,6 +1351,8 @@ def find_seam_masks(frames, R, scale, alt_min=-12.0, alt_max=62.0,
 
     images = []
     masks = []
+    if render_warps is None:
+        render_warps = [None for _ in frames]
     for n, frame in enumerate(frames):
         ih, iw = frame.image.shape[:2]
         cam = world @ R[n]
@@ -1157,9 +1361,13 @@ def find_seam_masks(frames, R, scale, alt_min=-12.0, alt_max=62.0,
         safe = np.where(ok, depth, 1.0)
         u = cam[..., 0] / safe / (frame.tan_h * scale)
         v = cam[..., 1] / safe / (frame.tan_v * scale)
-        ok &= (np.abs(u) <= 1) & (np.abs(v) <= 1)
-        x = ((u + 1) / 2 * iw - 0.5).astype(np.float32)
-        y = ((1 - v) / 2 * ih - 0.5).astype(np.float32)
+        x = (u + 1) / 2 * iw - 0.5
+        y = (1 - v) / 2 * ih - 0.5
+        warped_x, warped_y = _apply_render_warp(x, y, render_warps[n])
+        ok &= ((warped_x >= -0.5) & (warped_x <= iw - 0.5) &
+               (warped_y >= -0.5) & (warped_y <= ih - 0.5))
+        x = warped_x.astype(np.float32)
+        y = warped_y.astype(np.float32)
         warped = cv2.remap(frame.image, x, y, cv2.INTER_LINEAR,
                            borderMode=cv2.BORDER_CONSTANT)
         mask = (ok.astype(np.uint8) * 255)
