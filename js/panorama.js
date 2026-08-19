@@ -147,6 +147,31 @@ export function buildMosaic({ keyframes, sources = [], yawDatum = 0, ...over }) 
    * every overlay and every number derived from them is unchanged.
    */
   const blend = !!opts.blend;
+  /*
+   * Exposure compensation is OFF by default, and the reason is measured.
+   *
+   * The phone's exposure really does wander — fitted gains on the 2026-08-19
+   * iPad capture span 0.65 to 1.51, a 2.3x range across one lap — so the idea is
+   * sound and the patchwork it aims at is real. It simply does not pay:
+   *
+   *     mode                seam step   sky spread   time
+   *     nearest-axis            21.7        96       3.9 s
+   *     feathered               -0.12       84       4.6 s
+   *     feathered + exposure    -0.11       85.7    23.1 s
+   *
+   * Feathering alone already drives the seam to zero — a frame boundary becomes
+   * statistically indistinguishable from ordinary neighbouring pixels — and it
+   * absorbs the exposure step along the way. What is left in "sky spread" is
+   * mostly the sky's own gradient, bright near the sun and dark away from it,
+   * and fitting ONE gain per frame against a spatially varying consensus pulls
+   * a frame that legitimately saw brighter sky back toward the mean. Five times
+   * the cost, marginally worse on both measures.
+   *
+   * Kept, not deleted: it becomes worth having the moment seam CUTTING replaces
+   * feathering, because a hard seam cannot hide an exposure step the way a
+   * cross-fade does. Enable with `exposure: true`.
+   */
+  const exposure = opts.exposure === true;
   const accR = blend ? new Float32Array(width * height) : null;
   const accG = blend ? new Float32Array(width * height) : null;
   const accB = blend ? new Float32Array(width * height) : null;
@@ -161,6 +186,17 @@ export function buildMosaic({ keyframes, sources = [], yawDatum = 0, ...over }) 
   const px = [0, 0, 0];
   let painted = 0;
 
+  /**
+   * One geometry pass over every frame.
+   *
+   * `visit(k, i, uv, d)` is called for each output pixel a frame can see, with
+   * the frame index, the output index, its normalised image coordinates and its
+   * distance from the optical axis. Hoisting the loop out like this is what
+   * makes exposure compensation affordable: the same traversal serves the
+   * consensus build, the gain estimate and the final render, and none of them
+   * has to duplicate the projection maths.
+   */
+  const sweep = visit => {
   for (let k = 0; k < keyframes.length; k++) {
     const kf = keyframes[k];
     const src = sources[k];
@@ -190,29 +226,101 @@ export function buildMosaic({ keyframes, sources = [], yawDatum = 0, ...over }) 
         if (!uv) continue;
         const d = Math.max(Math.abs(uv[0]), Math.abs(uv[1]));
         const i = y * width + x;
-
-        if (blend && src) {
-          // Every frame that can see this pixel contributes, so this runs
-          // before the nearest-axis test rather than inside it.
-          const fu = 1 - Math.abs(uv[0]);
-          const fv = 1 - Math.abs(uv[1]);
-          if (fu > 0 && fv > 0) {
-            const w = (fu * fv) * (fu * fv);
-            sampleRGB(src, (uv[0] + 1) / 2 * src.w - 0.5, (1 - uv[1]) / 2 * src.h - 0.5, px);
-            accR[i] += px[0] * w; accG[i] += px[1] * w; accB[i] += px[2] * w;
-            accW[i] += w;
-          }
-        }
-
-        if (d >= axisDist[i]) continue;         // an earlier frame saw it better
-        axisDist[i] = d;
-        if (owner[i] === -1) painted++;
-        owner[i] = k;
-        if (!src || blend) continue;
-        sampleRGB(src, (uv[0] + 1) / 2 * src.w - 0.5, (1 - uv[1]) / 2 * src.h - 0.5, px);
-        const p = i * 4;
-        rgba[p] = px[0]; rgba[p + 1] = px[1]; rgba[p + 2] = px[2]; rgba[p + 3] = 255;
+        visit(k, i, uv, d, src);
       }
+    }
+  }
+  };
+
+  /* -- pass 1: nearest-axis ownership, and the un-corrected blend ---------- */
+  sweep((k, i, uv, d, src) => {
+    if (blend && src) {
+      const fu = 1 - Math.abs(uv[0]);
+      const fv = 1 - Math.abs(uv[1]);
+      if (fu > 0 && fv > 0) {
+        const w = (fu * fv) * (fu * fv);
+        sampleRGB(src, (uv[0] + 1) / 2 * src.w - 0.5, (1 - uv[1]) / 2 * src.h - 0.5, px);
+        accR[i] += px[0] * w; accG[i] += px[1] * w; accB[i] += px[2] * w;
+        accW[i] += w;
+      }
+    }
+    if (d >= axisDist[i]) return;              // an earlier frame saw it better
+    axisDist[i] = d;
+    if (owner[i] === -1) painted++;
+    owner[i] = k;
+    if (!src || blend) return;
+    sampleRGB(src, (uv[0] + 1) / 2 * src.w - 0.5, (1 - uv[1]) / 2 * src.h - 0.5, px);
+    const p = i * 4;
+    rgba[p] = px[0]; rgba[p + 1] = px[1]; rgba[p + 2] = px[2]; rgba[p + 3] = 255;
+  });
+
+  /*
+   * -- exposure compensation ----------------------------------------------
+   *
+   * The phone re-exposes constantly while it turns, so neighbouring frames
+   * disagree about how bright the same sky is by far more than the geometry
+   * disagrees about where it is. Feathering averages that disagreement into a
+   * soft gradient and the result is the large tonal patchwork visible across
+   * the sky in every capture so far — the single ugliest thing in the output,
+   * and nothing to do with alignment.
+   *
+   * One multiplicative gain per frame, fitted against the consensus rather than
+   * pairwise. Each frame is compared with the blend it is already part of, over
+   * its own footprint and weighted the same way it contributed, which makes the
+   * fit a handful of sums instead of a system of equations and needs no solver
+   * at all. Two rounds are enough because the consensus itself barely moves.
+   *
+   * Gains are clamped hard. A frame that genuinely saw something brighter — the
+   * sun coming out from behind a cloud — must not have that scrubbed out; the
+   * target is the exposure step, not the scene.
+   */
+  let gains = null;
+  if (blend && exposure && sources.some(Boolean)) {
+    gains = new Float32Array(keyframes.length).fill(1);
+    for (let round = 0; round < 2; round++) {
+      const own = new Float64Array(keyframes.length);
+      const ref = new Float64Array(keyframes.length);
+      sweep((k, i, uv, d, src) => {
+        if (!src || accW[i] <= 0) return;
+        const fu = 1 - Math.abs(uv[0]);
+        const fv = 1 - Math.abs(uv[1]);
+        if (!(fu > 0 && fv > 0)) return;
+        const w = (fu * fv) * (fu * fv);
+        sampleRGB(src, (uv[0] + 1) / 2 * src.w - 0.5, (1 - uv[1]) / 2 * src.h - 0.5, px);
+        const mine = (px[0] + px[1] + px[2]) / 3 * gains[k];
+        const cons = (accR[i] + accG[i] + accB[i]) / (3 * accW[i]);
+        // Mid-tones only. Blown highlights carry no ratio information and deep
+        // shadow is dominated by sensor noise; both would bias the fit.
+        if (mine < 12 || mine > 243 || cons < 12 || cons > 243) return;
+        own[k] += mine * w;
+        ref[k] += cons * w;
+      });
+      let sum = 0, n = 0;
+      for (let k = 0; k < keyframes.length; k++) {
+        if (own[k] <= 0) continue;
+        gains[k] *= clamp(ref[k] / own[k], 0.6, 1.6);
+        sum += gains[k]; n++;
+      }
+      // Normalise so the panorama keeps the overall brightness it was shot at
+      // rather than drifting toward whatever the first frame happened to be.
+      if (n > 0) {
+        const mean = sum / n;
+        for (let k = 0; k < keyframes.length; k++) gains[k] /= mean;
+      }
+      // Re-blend with the new gains so the next round compares against a
+      // consensus that already reflects them.
+      accR.fill(0); accG.fill(0); accB.fill(0); accW.fill(0);
+      sweep((k, i, uv, d, src) => {
+        if (!src) return;
+        const fu = 1 - Math.abs(uv[0]);
+        const fv = 1 - Math.abs(uv[1]);
+        if (!(fu > 0 && fv > 0)) return;
+        const w = (fu * fv) * (fu * fv);
+        sampleRGB(src, (uv[0] + 1) / 2 * src.w - 0.5, (1 - uv[1]) / 2 * src.h - 0.5, px);
+        const g = gains[k];
+        accR[i] += px[0] * g * w; accG[i] += px[1] * g * w; accB[i] += px[2] * g * w;
+        accW[i] += w;
+      });
     }
   }
 
@@ -226,7 +334,12 @@ export function buildMosaic({ keyframes, sources = [], yawDatum = 0, ...over }) 
     }
   }
 
-  return { rgba, owner, axisDist, width, height, painted, opts, yawDatum };
+  return {
+    rgba, owner, axisDist, width, height, painted, opts, yawDatum,
+    /** Per-frame exposure gains applied, or null when compensation was off.
+     *  Exported so a capture can be asked how far its exposure wandered. */
+    exposureGains: gains ? Array.from(gains, v => Number(v.toFixed(4))) : null
+  };
 }
 
 /**

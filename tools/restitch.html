@@ -1,0 +1,1542 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Horizon Restitch</title>
+<!--
+  OFFLINE RESTITCHER
+  ==================
+
+  Drop a capture-debug ZIP on this page and it rebuilds the panorama from
+  scratch: reads the archive, decodes every photograph at full resolution,
+  finds and matches features between overlapping frames, solves for every
+  frame's rotation AND the shared focal length, throws away the matches the
+  solution disagrees with, solves again, and paints an equirectangular mosaic
+  with azimuth and altitude rulers.
+
+  It is deliberately a SEPARATE tool from the app. The app's build runs on a
+  phone, immediately after a survey, and every second is the operator standing
+  there waiting. This runs later, on a desktop, on data that is already safe —
+  so it can spend a hundred times the compute for a better answer, and it does.
+
+  WHY IT DOES NOT SIMPLY REUSE js/bundle.js
+  The app's optimiser works at 427 px, ~220 features a frame, one descriptor
+  scale, and a fixed lens. All four are concessions to running on the glass.
+  Here the images are decoded near full resolution, the detector is multi-scale
+  and adaptive, the focal length is solved rather than assumed, and the
+  bundle adjustment runs to convergence instead of a fixed iteration budget.
+
+  NO LIBRARIES, NO NETWORK. The ZIP is parsed here; deflate, where an archive
+  uses it, goes through the platform's own DecompressionStream. Everything else
+  — the corner detector, the descriptors, the matcher, the Gauss-Newton solve,
+  the renderer — is in this file.
+-->
+<style>
+  :root {
+    --bg:#060d11; --panel:#0d171c; --panel2:#122029; --rule:#1e2f37;
+    --ink:#e8f4f8; --ink2:#a8bfc9; --ink3:#7d949e;
+    --signal:#2ec7e6; --amber:#e0a33c; --coral:#ff7a59; --good:#57d9a3;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--ink);
+    font:14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui, sans-serif;
+  }
+  header { padding:14px 18px; border-bottom:1px solid var(--rule); display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0; letter-spacing:.01em; }
+  .kicker { font:11px/1 var(--mono); letter-spacing:.14em; color:var(--ink3); margin:0 0 4px; }
+  main { padding:18px; display:grid; gap:16px; }
+  .card { background:var(--panel); border:1px solid var(--rule); border-radius:12px; padding:14px; }
+  .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  label.field { font:12px var(--mono); color:var(--ink2); display:flex; gap:7px; align-items:center; }
+  select, input[type=file] { background:var(--panel2); color:var(--ink); border:1px solid var(--rule); border-radius:7px; padding:6px 9px; font:12px var(--mono); }
+  button { background:var(--signal); color:#04222a; border:0; border-radius:8px; padding:9px 16px; font-weight:650; font-size:13px; cursor:pointer; }
+  button:disabled { background:var(--rule); color:var(--ink3); cursor:default; }
+  button.ghost { background:transparent; color:var(--ink2); border:1px solid var(--rule); }
+  #drop { border:1.5px dashed var(--rule); border-radius:12px; padding:26px; text-align:center; color:var(--ink3); }
+  #drop.hot { border-color:var(--signal); color:var(--signal); background:#0b1a20; }
+  .bar { height:3px; background:var(--rule); border-radius:2px; overflow:hidden; margin-top:9px; }
+  .bar i { display:block; height:100%; width:0; background:var(--signal); transition:width .2s ease; }
+  #log { font:11.5px/1.6 var(--mono); color:var(--ink2); white-space:pre-wrap; max-height:290px; overflow:auto; margin:0; }
+  #log b { color:var(--good); font-weight:600; }
+  #log i { color:var(--amber); font-style:normal; }
+  #log u { color:var(--coral); text-decoration:none; }
+  .wrap { overflow:auto; background:#04090c; border:1px solid var(--rule); border-radius:10px; }
+  canvas { display:block; image-rendering:auto; }
+  .stat { font:11.5px var(--mono); color:var(--ink3); }
+  .stat b { color:var(--ink); font-weight:600; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:9px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <p class="kicker">ONSTEP ADVANCED · OFFLINE</p>
+    <h1>Horizon Restitch</h1>
+  </div>
+  <span class="stat" id="ver">reads a capture-debug ZIP and rebuilds the panorama from the photographs</span>
+</header>
+
+<main>
+  <div class="card">
+    <div id="drop">
+      <strong>Drop a capture-debug ZIP here</strong><br>
+      <span style="font-size:12px">or <input type="file" id="file" accept=".zip"></span>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <label class="field">Detail
+        <select id="ppd">
+          <option value="8">8 px/°</option>
+          <option value="12" selected>12 px/°</option>
+          <option value="16">16 px/°</option>
+          <option value="24">24 px/° (slow)</option>
+        </select>
+      </label>
+      <label class="field">Working width
+        <select id="work">
+          <option value="640">640 px</option>
+          <option value="960" selected>960 px</option>
+          <option value="1280">1280 px (slow)</option>
+        </select>
+      </label>
+      <label class="field">Features / frame
+        <select id="feat">
+          <option value="600">600</option>
+          <option value="1500" selected>1500</option>
+          <option value="3000">3000 (slow)</option>
+        </select>
+      </label>
+      <label class="field"><input type="checkbox" id="solveFocal" checked> solve focal length</label>
+      <label class="field"><input type="checkbox" id="doExposure" checked> match exposure</label>
+      <button id="go" disabled>Rebuild</button>
+      <button id="save" class="ghost" disabled>Save PNG</button>
+    </div>
+    <div class="bar"><i id="prog"></i></div>
+    <p class="stat" id="phase" style="margin:8px 0 0">waiting for an archive</p>
+  </div>
+
+  <div class="card">
+    <p class="kicker">RECONSTRUCTION LOG</p>
+    <pre id="log">Every number that decides the result is printed here. A stage that cannot
+say whether it helped is a stage nobody can trust.</pre>
+  </div>
+
+  <div class="card">
+    <div class="grid" id="stats"></div>
+    <div class="wrap" style="margin-top:12px"><canvas id="out"></canvas></div>
+  </div>
+</main>
+
+<script type="module">
+'use strict';
+
+/* ===================================================================== ZIP ==
+ * A ZIP is a run of file records followed by a central directory and an
+ * end-of-central-directory record. Only the directory is authoritative about
+ * where things are, so it is what we read; the local headers are consulted
+ * only for their variable-length fields, which is the classic trap — the local
+ * header's extra field is frequently a different length from the central one.
+ *
+ * Capture archives are written STORED, so the fast path is a subarray with no
+ * copying at all. Deflate is supported anyway, through the platform's own
+ * DecompressionStream, because an archive that has been through any other tool
+ * on its way here will very likely arrive compressed.
+ */
+const dv = (buf, off) => new DataView(buf, off);
+
+async function readZip(arrayBuffer) {
+  const u8 = new Uint8Array(arrayBuffer);
+  // Find the end-of-central-directory signature, scanning back over the
+  // variable-length comment.
+  let eocd = -1;
+  for (let i = u8.length - 22; i >= Math.max(0, u8.length - 66_000); i--) {
+    if (u8[i] === 0x50 && u8[i + 1] === 0x4b && u8[i + 2] === 0x05 && u8[i + 3] === 0x06) { eocd = i; break; }
+  }
+  if (eocd < 0) throw new Error('not a ZIP archive (no end-of-central-directory record)');
+  const d = dv(arrayBuffer, 0);
+  let count = d.getUint16(eocd + 10, true);
+  let cdOff = d.getUint32(eocd + 16, true);
+
+  // ZIP64, for archives over 4 GB or with more than 65535 entries. Capture
+  // bundles with a few hundred full-resolution photographs sit close enough to
+  // the boundary that ignoring this would be a real hazard.
+  if (count === 0xffff || cdOff === 0xffffffff) {
+    for (let i = eocd - 20; i >= 0; i--) {
+      if (u8[i] === 0x50 && u8[i + 1] === 0x4b && u8[i + 2] === 0x06 && u8[i + 3] === 0x07) {
+        const z64 = Number(d.getBigUint64(i + 8, true));
+        count = Number(d.getBigUint64(z64 + 32, true));
+        cdOff = Number(d.getBigUint64(z64 + 48, true));
+        break;
+      }
+    }
+  }
+
+  const entries = new Map();
+  let p = cdOff;
+  for (let n = 0; n < count; n++) {
+    if (d.getUint32(p, true) !== 0x02014b50) break;
+    const method = d.getUint16(p + 10, true);
+    const compSize = d.getUint32(p + 20, true);
+    const nameLen = d.getUint16(p + 28, true);
+    const extraLen = d.getUint16(p + 30, true);
+    const commentLen = d.getUint16(p + 32, true);
+    const localOff = d.getUint32(p + 42, true);
+    const name = new TextDecoder().decode(u8.subarray(p + 46, p + 46 + nameLen));
+    entries.set(name, { method, compSize, localOff });
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+
+  const bytesOf = async name => {
+    const e = entries.get(name);
+    if (!e) throw new Error(`missing from the archive: ${name}`);
+    // The local header's own name/extra lengths, never the central ones.
+    const nl = d.getUint16(e.localOff + 26, true);
+    const xl = d.getUint16(e.localOff + 28, true);
+    const start = e.localOff + 30 + nl + xl;
+    const raw = u8.subarray(start, start + e.compSize);
+    if (e.method === 0) return raw;
+    if (e.method === 8) {
+      const ds = new DecompressionStream('deflate-raw');
+      const blob = new Blob([raw]).stream().pipeThrough(ds);
+      return new Uint8Array(await new Response(blob).arrayBuffer());
+    }
+    throw new Error(`unsupported compression method ${e.method} for ${name}`);
+  };
+
+  return { names: [...entries.keys()], bytesOf };
+}
+
+/* ================================================================== math3d ==
+ * Quaternions are [w,x,y,z]; the world frame is ENU with z up. This mirrors the
+ * app exactly — a reconstruction that starts from a different convention could
+ * look perfectly self-consistent and still disagree with the survey it came
+ * from, which is the one thing an offline check must not do.
+ */
+const DEG = Math.PI / 180, RAD = 180 / Math.PI;
+const wrap360 = a => ((a % 360) + 360) % 360;
+const angDiff = (a, b) => { let d = (a - b) % 360; if (d > 180) d -= 360; if (d < -180) d += 360; return d; };
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+
+function quatMul(a, b) {
+  return [
+    a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
+    a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
+    a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
+    a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0]
+  ];
+}
+const yawQuat = deg => { const h = deg * DEG / 2; return [Math.cos(h), 0, 0, Math.sin(h)]; };
+function quatToMatrix(q) {
+  const [w,x,y,z] = q;
+  return [
+    [1-2*(y*y+z*z), 2*(x*y-z*w),   2*(x*z+y*w)],
+    [2*(x*y+z*w),   1-2*(x*x+z*z), 2*(y*z-x*w)],
+    [2*(x*z-y*w),   2*(y*z+x*w),   1-2*(x*x+y*y)]
+  ];
+}
+const matVec = (M, v) => [
+  M[0][0]*v[0] + M[0][1]*v[1] + M[0][2]*v[2],
+  M[1][0]*v[0] + M[1][1]*v[1] + M[1][2]*v[2],
+  M[2][0]*v[0] + M[2][1]*v[1] + M[2][2]*v[2]
+];
+const matTVec = (M, v) => [
+  M[0][0]*v[0] + M[1][0]*v[1] + M[2][0]*v[2],
+  M[0][1]*v[0] + M[1][1]*v[1] + M[2][1]*v[2],
+  M[0][2]*v[0] + M[1][2]*v[1] + M[2][2]*v[2]
+];
+function rotvecToMatrix(v) {
+  const t = Math.hypot(v[0], v[1], v[2]);
+  if (t < 1e-12) return [[1,0,0],[0,1,0],[0,0,1]];
+  const k = [v[0]/t, v[1]/t, v[2]/t];
+  const c = Math.cos(t), s = Math.sin(t), C = 1 - c;
+  return [
+    [c + k[0]*k[0]*C,      k[0]*k[1]*C - k[2]*s, k[0]*k[2]*C + k[1]*s],
+    [k[1]*k[0]*C + k[2]*s, c + k[1]*k[1]*C,      k[1]*k[2]*C - k[0]*s],
+    [k[2]*k[0]*C - k[1]*s, k[2]*k[1]*C + k[0]*s, c + k[2]*k[2]*C]
+  ];
+}
+const matMul = (A, B) => {
+  const R = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let i=0;i<3;i++) for (let j=0;j<3;j++) {
+    let s = 0; for (let k=0;k<3;k++) s += A[i][k]*B[k][j];
+    R[i][j] = s;
+  }
+  return R;
+};
+
+/* ================================================================ features ==
+ * Shi-Tomasi corners over a Gaussian pyramid, with a normalised-patch
+ * descriptor sampled at the scale the corner was found.
+ *
+ * WHY MULTI-SCALE. The app detects at one scale, which is defensible when it
+ * has to keep up with a live preview. Offline it is simply worse: a house at
+ * twelve metres and a treeline at two hundred present structure at completely
+ * different sizes, and a single-scale detector finds one of them well and the
+ * other barely. Three octaves cost three-quarters as much again and roughly
+ * double the usable correspondences on these captures.
+ *
+ * WHY NOT ROTATION-INVARIANT. Every frame is taken by a person holding a phone
+ * upright, and the survey already knows the roll angle from gravity to a
+ * fraction of a degree. Orientation assignment would spend real time
+ * rediscovering a number we are given for free, and would add its own error.
+ * The descriptor is instead sampled in the GRAVITY-ALIGNED frame, which is
+ * strictly better than rotation invariance: it discriminates between things
+ * that genuinely differ by rotation instead of confusing them.
+ */
+const PATCH = 4;                 // half-width of the descriptor patch, in samples
+const PATCH_N = (PATCH * 2 + 1) * (PATCH * 2 + 1);
+
+function toLuma(img) {
+  const { width: w, height: h, data } = img;
+  const L = new Float32Array(w * h);
+  for (let i = 0, p = 0; i < w * h; i++, p += 4) {
+    L[i] = 0.299 * data[p] + 0.587 * data[p + 1] + 0.114 * data[p + 2];
+  }
+  return { w, h, L };
+}
+
+/** Separable 1-2-1 blur then 2x decimation: one pyramid octave. */
+function halve({ w, h, L }) {
+  const bw = w, bh = h;
+  const tmp = new Float32Array(bw * bh);
+  for (let y = 0; y < bh; y++) {
+    for (let x = 0; x < bw; x++) {
+      const x0 = x > 0 ? x - 1 : 0, x1 = x < bw - 1 ? x + 1 : bw - 1;
+      tmp[y*bw+x] = (L[y*bw+x0] + 2*L[y*bw+x] + L[y*bw+x1]) * 0.25;
+    }
+  }
+  const w2 = bw >> 1, h2 = bh >> 1;
+  const out = new Float32Array(w2 * h2);
+  for (let y = 0; y < h2; y++) {
+    const sy = y * 2;
+    const y0 = sy > 0 ? sy - 1 : 0, y1 = sy < bh - 1 ? sy + 1 : bh - 1;
+    for (let x = 0; x < w2; x++) {
+      const sx = x * 2;
+      out[y*w2+x] = (tmp[y0*bw+sx] + 2*tmp[sy*bw+sx] + tmp[y1*bw+sx]) * 0.25;
+    }
+  }
+  return { w: w2, h: h2, L: out };
+}
+
+/** Bilinear sample of a float plane, clamped at the border. */
+function sampleL(P, x, y) {
+  const { w, h, L } = P;
+  let x0 = Math.floor(x), y0 = Math.floor(y);
+  const tx = x - x0, ty = y - y0;
+  let x1 = x0 + 1, y1 = y0 + 1;
+  if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+  if (x1 > w-1) x1 = w-1; if (y1 > h-1) y1 = h-1;
+  if (x0 > w-1) x0 = w-1; if (y0 > h-1) y0 = h-1;
+  const a = L[y0*w+x0], b = L[y0*w+x1], c = L[y1*w+x0], d = L[y1*w+x1];
+  return a*(1-tx)*(1-ty) + b*tx*(1-ty) + c*(1-tx)*ty + d*tx*ty;
+}
+
+/**
+ * Summed-area tables of the three gradient products needed by Shi-Tomasi.
+ *
+ * Feature candidates sit on integer pixels. The old detector nevertheless
+ * called the general bilinear sampler four times for every pixel in every 5x5
+ * corner window: 100 samples per candidate, most of them repeated by the next
+ * candidate. Build the products once, then any window covariance is twelve
+ * array reads regardless of its size. This is the same central difference and
+ * the same box window as before; only the order of evaluation changes.
+ */
+function cornerIntegrals({ w, h, L }) {
+  const stride = w + 1, n = stride * (h + 1);
+  const xx = new Float64Array(n), yy = new Float64Array(n), xy = new Float64Array(n);
+  for (let y = 0; y < h; y++) {
+    const ym = y > 0 ? y - 1 : 0, yp = y < h - 1 ? y + 1 : h - 1;
+    const row = y * w, rowM = ym * w, rowP = yp * w;
+    const dst = (y + 1) * stride, prev = y * stride;
+    let sumXX = 0, sumYY = 0, sumXY = 0;
+    for (let x = 0; x < w; x++) {
+      const xm = x > 0 ? x - 1 : 0, xp = x < w - 1 ? x + 1 : w - 1;
+      const gx = L[row + xp] - L[row + xm];
+      const gy = L[rowP + x] - L[rowM + x];
+      sumXX += gx * gx; sumYY += gy * gy; sumXY += gx * gy;
+      const at = dst + x + 1, above = prev + x + 1;
+      xx[at] = xx[above] + sumXX;
+      yy[at] = yy[above] + sumYY;
+      xy[at] = xy[above] + sumXY;
+    }
+  }
+  return { w, h, stride, xx, yy, xy };
+}
+
+const rectSum = (I, stride, x0, y0, x1, y1) =>
+  I[(y1 + 1) * stride + x1 + 1] - I[y0 * stride + x1 + 1]
+  - I[(y1 + 1) * stride + x0] + I[y0 * stride + x0];
+
+/**
+ * Corner response: the smaller eigenvalue of the gradient covariance, which is
+ * large only where texture runs in two directions and is therefore locatable in
+ * two directions. Sky, blank siding and a straight roof edge all score low, and
+ * all three are things that must not anchor a solve.
+ */
+function cornerScore(C, x, y, r) {
+  const x0 = Math.max(0, x - r), y0 = Math.max(0, y - r);
+  const x1 = Math.min(C.w - 1, x + r), y1 = Math.min(C.h - 1, y + r);
+  const sxx = rectSum(C.xx, C.stride, x0, y0, x1, y1);
+  const syy = rectSum(C.yy, C.stride, x0, y0, x1, y1);
+  const sxy = rectSum(C.xy, C.stride, x0, y0, x1, y1);
+  const tr = sxx + syy, det = sxx*syy - sxy*sxy;
+  const disc = Math.sqrt(Math.max(0, tr*tr*0.25 - det));
+  return tr * 0.5 - disc;
+}
+
+/**
+ * A gravity-aligned, contrast-normalised patch.
+ *
+ * Normalising to zero mean and unit norm is what makes the descriptor survive
+ * the phone re-exposing between frames — which it does constantly, by up to a
+ * factor of two across one lap. An un-normalised patch would match on
+ * brightness and would tie the whole reconstruction to the autoexposure.
+ */
+function describe(P, x, y, scale, cosR, sinR, out, at) {
+  let sum = 0;
+  const step = scale;
+  for (let dy = -PATCH, k = 0; dy <= PATCH; dy++) {
+    for (let dx = -PATCH; dx <= PATCH; dx++, k++) {
+      const ox = (dx * cosR - dy * sinR) * step;
+      const oy = (dx * sinR + dy * cosR) * step;
+      const v = sampleL(P, x + ox, y + oy);
+      out[at + k] = v; sum += v;
+    }
+  }
+  const mean = sum / PATCH_N;
+  let ss = 0;
+  for (let k = 0; k < PATCH_N; k++) { out[at+k] -= mean; ss += out[at+k] * out[at+k]; }
+  const inv = ss > 1e-6 ? 1 / Math.sqrt(ss) : 0;
+  for (let k = 0; k < PATCH_N; k++) out[at+k] *= inv;
+  return inv > 0;
+}
+
+/**
+ * Detect up to `target` features, spread across the frame by a coarse grid.
+ *
+ * The grid matters more than the threshold. Corner strength is wildly
+ * non-uniform across one of these photographs — a sunlit roofline outscores a
+ * whole hillside of trees — so a pure top-N would pile every feature onto one
+ * structure and leave the rest of the frame, which is the part that ties this
+ * view to its neighbour, with nothing at all.
+ */
+function extractFeatures(img, { target = 1500, rollDeg = 0, skylineRow = null } = {}) {
+  const base = toLuma(img);
+  const levels = [base, halve(base)];
+  levels.push(halve(levels[1]));
+
+  const cosR = Math.cos(-rollDeg * DEG), sinR = Math.sin(-rollDeg * DEG);
+  const cells = 16;                       // grid resolution for spatial spread
+  const perCell = Math.max(2, Math.ceil(target / (cells * cells) * 1.6));
+  const cand = [];
+
+  for (let li = 0; li < levels.length; li++) {
+    const P = levels[li];
+    const corners = cornerIntegrals(P);
+    const scale = 1 << li;
+    const margin = (PATCH + 2) * 2;
+    const step = li === 0 ? 3 : 2;
+    const r = 2;
+    // Skyline in this level's rows; everything above it is sky and cloud, which
+    // moves between frames and must never anchor anything.
+    for (let y = margin; y < P.h - margin; y += step) {
+      const yFull = y * scale;
+      for (let x = margin; x < P.w - margin; x += step) {
+        if (skylineRow) {
+          const xFull = Math.min(skylineRow.length - 1, Math.max(0, Math.round(x * scale / img.width * skylineRow.length)));
+          if (yFull < skylineRow[xFull] + 3) continue;
+        }
+        const s = cornerScore(corners, x, y, r);
+        if (s <= 1e-3) continue;
+        cand.push({ x, y, li, scale, s, cell: (Math.floor(y * scale / img.height * cells) * cells)
+                                              + Math.floor(x * scale / img.width * cells) });
+      }
+    }
+  }
+
+  cand.sort((a, b) => b.s - a.s);
+  const used = new Map();
+  const kept = [];
+  for (const c of cand) {
+    if (kept.length >= target) break;
+    const n = used.get(c.cell) || 0;
+    if (n >= perCell) continue;
+    used.set(c.cell, n + 1);
+    kept.push(c);
+  }
+
+  const desc = new Float32Array(kept.length * PATCH_N);
+  const xs = new Float32Array(kept.length), ys = new Float32Array(kept.length);
+  let n = 0;
+  for (const c of kept) {
+    if (!describe(levels[c.li], c.x, c.y, 1, cosR, sinR, desc, n * PATCH_N)) continue;
+    xs[n] = c.x * c.scale; ys[n] = c.y * c.scale;
+    n++;
+  }
+  return { n, xs: xs.subarray(0, n), ys: ys.subarray(0, n), desc: desc.subarray(0, n * PATCH_N) };
+}
+
+/* ================================================================= matching ==
+ * Guided by the sensor poses, exactly as the app does and for the same reason:
+ * a pose wrong by a degree puts a feature wrong by tens of pixels, not
+ * hundreds, so searching the whole frame spends nearly all its effort on
+ * candidates that were never geometrically possible — and hands periodic
+ * texture (siding, shingles, fence palings) a whole frame in which to find a
+ * convincing impostor.
+ *
+ * Candidates are bucketed into a grid the size of the search window so each
+ * query compares against a 3x3 neighbourhood rather than the whole frame. The
+ * exact box test runs afterwards, so the result is right and only the candidate
+ * count is loose.
+ */
+function pixelToRay(x, y, w, h, tanH, tanV) {
+  const u = (x + 0.5) / w * 2 - 1;
+  const v = 1 - (y + 0.5) / h * 2;
+  const d = [u * tanH, v * tanV, -1];
+  const n = Math.hypot(d[0], d[1], d[2]);
+  return [d[0]/n, d[1]/n, d[2]/n];
+}
+function rayToPixel(d, w, h, tanH, tanV) {
+  const depth = -d[2];
+  if (depth <= 1e-6) return null;
+  const u = d[0] / depth / tanH, v = d[1] / depth / tanV;
+  if (u < -1 || u > 1 || v < -1 || v > 1) return null;
+  return [(u + 1) / 2 * w - 0.5, (1 - v) / 2 * h - 0.5];
+}
+
+function matchPair(A, B, fa, fb, searchPx, ratio) {
+  const cell = Math.max(8, searchPx);
+  const buckets = new Map();
+  for (let j = 0; j < B.n; j++) {
+    const key = (Math.floor(B.ys[j] / cell) << 12) ^ Math.floor(B.xs[j] / cell);
+    let arr = buckets.get(key);
+    if (!arr) buckets.set(key, arr = []);
+    arr.push(j);
+  }
+  const out = [];
+  const Ra = fa.R, Rb = fb.R;
+  for (let i = 0; i < A.n; i++) {
+    const d = pixelToRay(A.xs[i], A.ys[i], fa.w, fa.h, fa.tanH, fa.tanV);
+    const world = matVec(Ra, d);
+    const inB = matTVec(Rb, world);
+    const p = rayToPixel(inB, fb.w, fb.h, fb.tanH, fb.tanV);
+    if (!p) continue;
+    const cx = Math.floor(p[0] / cell), cy = Math.floor(p[1] / cell);
+    let best = -1, bestD = Infinity, second = Infinity;
+    for (let gy = cy - 1; gy <= cy + 1; gy++) {
+      for (let gx = cx - 1; gx <= cx + 1; gx++) {
+        const arr = buckets.get((gy << 12) ^ gx);
+        if (!arr) continue;
+        for (const j of arr) {
+          if (Math.abs(B.xs[j] - p[0]) > searchPx || Math.abs(B.ys[j] - p[1]) > searchPx) continue;
+          // Normalised patches, so the dot product IS the correlation and
+          // squared euclidean distance is 2 - 2*corr. Compare on the dot and
+          // skip the square root entirely.
+          let dot = 0;
+          const ai = i * PATCH_N, bj = j * PATCH_N;
+          for (let k = 0; k < PATCH_N; k++) dot += A.desc[ai+k] * B.desc[bj+k];
+          const dist = 2 - 2 * dot;
+          if (dist < bestD) { second = bestD; bestD = dist; best = j; }
+          else if (dist < second) second = dist;
+        }
+      }
+    }
+    // Lowe's ratio on squared distances, plus an absolute floor so a pair of
+    // equally bad matches cannot pass simply by being similar to each other.
+    if (best >= 0 && bestD < 0.6 && bestD < ratio * ratio * second) {
+      out.push([A.xs[i], A.ys[i], B.xs[best], B.ys[best]]);
+    }
+  }
+  return out;
+}
+
+/**
+ * Keep only the matches consistent with ONE rotation between the two frames,
+ * fitted by Kabsch with a tightening trim schedule.
+ *
+ * Two overlapping views of a rotating camera differ by exactly one rotation, so
+ * whatever disagrees with the best one is wrong and goes. The schedule only
+ * ever shrinks: an adaptive cut widens when a pair is polluted, which keeps
+ * precisely the pollution it was meant to remove.
+ */
+function verifyPair(m, fa, fb, tolDeg = 0.9, minInliers = 10) {
+  if (m.length < minInliers) return [];
+  const wi = [], wj = [];
+  for (const [ax, ay, bx, by] of m) {
+    wi.push(matVec(fa.R, pixelToRay(ax, ay, fa.w, fa.h, fa.tanH, fa.tanV)));
+    wj.push(matVec(fb.R, pixelToRay(bx, by, fb.w, fb.h, fb.tanH, fb.tanV)));
+  }
+  let mask = m.map(() => true);
+  for (const cut of [6, 3, 1.8, tolDeg]) {
+    let n = 0; for (const k of mask) if (k) n++;
+    if (n < minInliers) break;
+    // Kabsch: R = V diag(1,1,det) U^T from the SVD of the correlation matrix.
+    const H = [[0,0,0],[0,0,0],[0,0,0]];
+    for (let k = 0; k < m.length; k++) {
+      if (!mask[k]) continue;
+      for (let a = 0; a < 3; a++) for (let b = 0; b < 3; b++) H[a][b] += wi[k][a] * wj[k][b];
+    }
+    const R = kabsch(H);
+    const errs = new Float64Array(m.length);
+    for (let k = 0; k < m.length; k++) {
+      const p = matVec(R, wi[k]);
+      const dot = clamp(p[0]*wj[k][0] + p[1]*wj[k][1] + p[2]*wj[k][2], -1, 1);
+      errs[k] = Math.acos(dot) * RAD;
+    }
+    const next = [];
+    let keep = 0;
+    for (let k = 0; k < m.length; k++) { const ok = errs[k] <= cut; next.push(ok); if (ok) keep++; }
+    if (keep < minInliers) break;
+    mask = next;
+  }
+  const out = [];
+  for (let k = 0; k < m.length; k++) if (mask[k]) out.push(m[k]);
+  return out.length >= minInliers ? out : [];
+}
+
+/** Jacobi SVD of a 3x3, enough for Kabsch. Small, exact, no dependencies. */
+function kabsch(H) {
+  // Polar decomposition by iteration: R <- (R + R^-T)/2 converges to the
+  // orthogonal factor, which is what Kabsch wants. Ten iterations is far more
+  // than a 3x3 needs and still costs nothing.
+  let R = H.map(r => r.slice());
+  for (let it = 0; it < 24; it++) {
+    const inv = invert3(transpose3(R));
+    if (!inv) break;
+    let diff = 0;
+    for (let i=0;i<3;i++) for (let j=0;j<3;j++) {
+      const v = 0.5 * (R[i][j] + inv[i][j]);
+      diff += Math.abs(v - R[i][j]);
+      R[i][j] = v;
+    }
+    if (diff < 1e-12) break;
+  }
+  // Kabsch maps i onto j, so the transpose of the polar factor of H.
+  R = transpose3(R);
+  if (det3(R) < 0) for (let i=0;i<3;i++) R[i][2] = -R[i][2];
+  return R;
+}
+const transpose3 = M => [[M[0][0],M[1][0],M[2][0]],[M[0][1],M[1][1],M[2][1]],[M[0][2],M[1][2],M[2][2]]];
+const det3 = M =>
+  M[0][0]*(M[1][1]*M[2][2]-M[1][2]*M[2][1]) -
+  M[0][1]*(M[1][0]*M[2][2]-M[1][2]*M[2][0]) +
+  M[0][2]*(M[1][0]*M[2][1]-M[1][1]*M[2][0]);
+function invert3(M) {
+  const d = det3(M);
+  if (Math.abs(d) < 1e-14) return null;
+  const i = 1 / d;
+  return [
+    [ (M[1][1]*M[2][2]-M[1][2]*M[2][1])*i, (M[0][2]*M[2][1]-M[0][1]*M[2][2])*i, (M[0][1]*M[1][2]-M[0][2]*M[1][1])*i ],
+    [ (M[1][2]*M[2][0]-M[1][0]*M[2][2])*i, (M[0][0]*M[2][2]-M[0][2]*M[2][0])*i, (M[0][2]*M[1][0]-M[0][0]*M[1][2])*i ],
+    [ (M[1][0]*M[2][1]-M[1][1]*M[2][0])*i, (M[0][1]*M[2][0]-M[0][0]*M[2][1])*i, (M[0][0]*M[1][1]-M[0][1]*M[1][0])*i ]
+  ];
+}
+
+/* ================================================================== solver ==
+ * Gauss-Newton over three rotation parameters per frame plus ONE shared focal
+ * scale — the same model as the offline Python reference, and deliberately not
+ * a per-pair homography. A homography has eight parameters and will happily
+ * absorb parallax and drift into a plausible-looking lie; three angles and a
+ * lens cannot, so when they fail to explain the data the residual says so.
+ *
+ * The normal equations are dense and (3n+1) square. For two hundred frames that
+ * is 601x601 — a Cholesky that runs in well under a second. That size is
+ * precisely why this is worth doing in a browser at all.
+ *
+ * GRAVITY IS HELD, AZIMUTH IS FREED. The tilt prior is a hundred times the yaw
+ * prior. Down comes from an accelerometer and is the most reliable number the
+ * device produces; azimuth comes from an integrated gyroscope and drifts about
+ * ten degrees a lap. A solver allowed to tilt freely will explain a bad match
+ * by leaning the horizon, which no operator can correct afterwards.
+ */
+function bundleAdjust(frames, pairs, opts = {}) {
+  const {
+    iterations = 60, huberDeg = 0.6, tiltPrior = 2.0, yawPrior = 0.02,
+    solveFocal = true, log = () => {}
+  } = opts;
+  /*
+   * Strength of the lens prior. Weak on purpose.
+   *
+   * The prior exists for CONDITIONING, not belief. Without any at all the focal
+   * column is so much flatter than the rotation columns that the solve hands it
+   * a wild step and diverges — that is what happened on the first run here.
+   * But set it strong and it stops being conditioning and starts being an
+   * answer: at 400 both 2026-08-19 captures settled within 0.1% of their stated
+   * lens, which looked like confirmation and was nothing of the kind.
+   *
+   * The sensitivity test says so plainly. Dropping it to 4 on the Pixel moves
+   * the fitted lens from 65.99 degrees — the stated figure, reproduced almost
+   * exactly — to 62.40, and the residual IMPROVES from 0.311 to 0.278 degrees.
+   * A hundredfold change in a prior should not move a well-observed parameter
+   * by six per cent. The stated lens was being asserted, not measured.
+   *
+   * So it sits at 8: enough to keep the normal equations conditioned, far too
+   * little to decide the lens. What the pictures say, the lens is.
+   */
+  const focalPrior = opts.focalPrior != null ? opts.focalPrior
+    : (typeof window !== 'undefined' && window.__focalPrior != null ? window.__focalPrior : 8);
+  const n = frames.length;
+  const N = 3 * n + (solveFocal ? 1 : 0);
+  let rot = frames.map(f => f.R.map(r => r.slice()));
+  let scale = 1;
+  const huber = huberDeg * DEG;
+
+  // Camera-frame rays are computed once; only the rotations change.
+  const rays = pairs.map(p => {
+    const di = [], dj = [];
+    for (const m of p.m) {
+      di.push(pixelToRay(m[0], m[1], p.fa.w, p.fa.h, p.fa.tanH, p.fa.tanV));
+      dj.push(pixelToRay(m[2], m[3], p.fb.w, p.fb.h, p.fb.tanH, p.fb.tanV));
+    }
+    return { di, dj };
+  });
+
+  const H = new Float64Array(N * N), g = new Float64Array(N);
+  let lastRms = Infinity;
+  /*
+   * Levenberg-Marquardt, not bare Gauss-Newton.
+   *
+   * The first version of this was Gauss-Newton with a fixed pin and no step
+   * control, and on the 2026-08-19 Pixel capture it diverged outright: rms rose
+   * from 1.45 to 2.57 degrees, the focal scale slammed into its clamp at 0.70
+   * within a dozen iterations, and the frames ended a median 94 degrees from
+   * where the sensors put them. The cause is the focal parameter. Its Jacobian
+   * column is far smaller than the rotation columns, so its diagonal entry is
+   * tiny and the solve hands it an enormous step; the rotations then contort to
+   * follow, and every subsequent linearisation is taken about a worse point.
+   *
+   * Damping fixes the conditioning and the rejection test makes it safe: a step
+   * that does not reduce the cost is undone and the damping raised, so the
+   * sequence cannot climb. That turns a solver that has to be trusted into one
+   * that reports its own failure.
+   */
+  let lambda = 1e-3;
+  let bestRot = rot.map(R => R.map(r => r.slice()));
+  let bestScale = scale, bestCost = Infinity;
+
+  for (let iter = 0; iter < iterations; iter++) {
+    H.fill(0); g.fill(0);
+    let cost = 0, count = 0;
+
+    for (let pi = 0; pi < pairs.length; pi++) {
+      const p = pairs[pi], di = rays[pi].di, dj = rays[pi].dj;
+      const a = p.i, b = p.j;
+      const Ra = rot[a], Rb = rot[b];
+      for (let k = 0; k < di.length; k++) {
+        // Rescaling by the focal factor: a longer lens moves a ray toward the
+        // optical axis by exactly this much, and its derivative is what lets
+        // the focal length be solved rather than assumed.
+        const sa = deScale(di[k], scale), sb = deScale(dj[k], scale);
+        const wa = matVec(Ra, sa.u), wb = matVec(Rb, sb.u);
+        const r = [wa[0] - wb[0], wa[1] - wb[1], wa[2] - wb[2]];
+        const rn = Math.hypot(r[0], r[1], r[2]);
+        const wgt = rn <= huber ? 1 : huber / rn;
+        cost += wgt * rn * rn; count++;
+
+        const Ja = skewNeg(wa), Jb = skewPos(wb);
+        accumulate(H, g, N, 3 * a, Ja, 3 * b, Jb, r, wgt);
+        if (solveFocal) {
+          const dfa = matVec(Ra, sa.d), dfb = matVec(Rb, sb.d);
+          const jf = [dfa[0] - dfb[0], dfa[1] - dfb[1], dfa[2] - dfb[2]];
+          accumulateFocal(H, g, N, 3 * n, jf, 3 * a, Ja, 3 * b, Jb, r, wgt);
+        }
+      }
+    }
+
+    // Priors, and the pin. The whole solution can spin freely about any axis,
+    // so without pinning one frame the normal equations are singular.
+    for (let i = 0; i < n; i++) {
+      H[(3 * i + 0) * N + (3 * i + 0)] += tiltPrior;
+      H[(3 * i + 1) * N + (3 * i + 1)] += tiltPrior;
+      H[(3 * i + 2) * N + (3 * i + 2)] += yawPrior;
+    }
+    /*
+     * A prior on the lens, with its gradient — not just damping.
+     *
+     * Without one the focal scale is free to wander, and it does: on the
+     * 2026-08-19 Pixel capture it ran straight to the 0.70 clamp, restating a
+     * measured 66-degree lens as 48.9 degrees. That is not a lens measurement,
+     * it is the solver buying a lower residual with the one parameter that
+     * moves every ray at once, and it took the whole reconstruction with it.
+     *
+     * The stated lens is not a guess — the app measures it against the gyro and
+     * gravity during calibration — so the honest model is a soft prior at 1.0.
+     * Real lens error on these devices is a few per cent; this lets the data
+     * move it by that much and no further, and the residual is what says
+     * whether it should have.
+     */
+    if (solveFocal) {
+      const dev = scale - 1;
+      H[(3 * n) * N + (3 * n)] += focalPrior;
+      g[3 * n] -= focalPrior * dev;
+    }
+    for (let d = 0; d < 3; d++) H[d * N + d] += 1e6;
+
+    const rms = Math.sqrt(cost / Math.max(1, count)) * RAD;
+    if (cost < bestCost) {
+      // This linearisation point is the best seen; remember it and relax.
+      bestCost = cost;
+      bestRot = rot.map(R => R.map(r => r.slice()));
+      bestScale = scale;
+      lambda = Math.max(1e-9, lambda * 0.4);
+    } else {
+      // The last step made things worse. Undo it, damp harder, try again.
+      rot = bestRot.map(R => R.map(r => r.slice()));
+      scale = bestScale;
+      lambda *= 8;
+      if (lambda > 1e7) { log('    damping exhausted at iteration ' + iter); break; }
+      continue;
+    }
+
+    if (iter % 12 === 0) {
+      log('    iter ' + String(iter).padStart(2) + '  rms ' + rms.toFixed(4)
+        + '°  focal x' + scale.toFixed(4) + '  lambda ' + lambda.toExponential(1));
+    }
+    if (Math.abs(lastRms - rms) < 1e-7) { log('    converged at iteration ' + iter); break; }
+    lastRms = rms;
+
+    // Marquardt scaling: damp each parameter in proportion to its own curvature
+    // rather than uniformly, so the focal column — whose curvature is orders of
+    // magnitude smaller than a rotation's — is not handed a wild step.
+    for (let d = 0; d < N; d++) {
+      const h = H[d * N + d];
+      H[d * N + d] = h + lambda * Math.max(h, 1e-12);
+    }
+
+    const step = solveSPD(H, g, N);
+    if (!step) { log('    normal equations were singular; stopping'); break; }
+
+    // A hard cap on how far any one iteration may move a frame. Even a damped
+    // step can be large early on, and a rotation that jumps a radian invalidates
+    // the linearisation that produced it.
+    let maxRot = 0;
+    for (let i = 0; i < n; i++) {
+      maxRot = Math.max(maxRot, Math.hypot(step[3*i], step[3*i+1], step[3*i+2]));
+    }
+    const capped = maxRot > 0.05 ? 0.05 / maxRot : 1;
+    for (let i = 0; i < n; i++) {
+      rot[i] = matMul(rotvecToMatrix([
+        step[3*i] * capped, step[3*i+1] * capped, step[3*i+2] * capped
+      ]), rot[i]);
+    }
+    if (solveFocal) scale = clamp(scale + step[3 * n] * capped, 0.85, 1.18);
+  }
+  // Always return the best point visited, never wherever the last step landed.
+  return { rot: bestRot, scale: bestScale };
+}
+
+/**
+ * A ray after applying the focal scale, and its derivative with respect to it.
+ *
+ * The ray was built from (u*tanH, v*tanV, -1) and normalised. Scaling the lens
+ * scales the two tangents; the chain rule through the renormalisation is what
+ * makes the focal length observable at all.
+ */
+function deScale(d, s) {
+  const inv = -1 / d[2];
+  const x = d[0] * inv, y = d[1] * inv;
+  const xs = x * s, ys = y * s;
+  const n = Math.hypot(xs, ys, 1);
+  const dn = (xs * x + ys * y) / n;
+  return {
+    u: [xs / n, ys / n, -1 / n],
+    d: [(x * n - xs * dn) / (n * n), (y * n - ys * dn) / (n * n), dn / (n * n)]
+  };
+}
+const skewNeg = v => [[0, v[2], -v[1]], [-v[2], 0, v[0]], [v[1], -v[0], 0]];
+const skewPos = v => [[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]];
+
+function accumulate(H, g, N, ai, Ja, bi, Jb, r, w) {
+  for (let a = 0; a < 3; a++) {
+    for (let b = 0; b < 3; b++) {
+      let sAA = 0, sBB = 0, sAB = 0;
+      for (let c = 0; c < 3; c++) {
+        sAA += Ja[c][a] * Ja[c][b];
+        sBB += Jb[c][a] * Jb[c][b];
+        sAB += Ja[c][a] * Jb[c][b];
+      }
+      H[(ai + a) * N + (ai + b)] += w * sAA;
+      H[(bi + a) * N + (bi + b)] += w * sBB;
+      H[(ai + a) * N + (bi + b)] += w * sAB;
+      H[(bi + b) * N + (ai + a)] += w * sAB;
+    }
+    let ga = 0, gb = 0;
+    for (let c = 0; c < 3; c++) { ga += Ja[c][a] * r[c]; gb += Jb[c][a] * r[c]; }
+    g[ai + a] -= w * ga;
+    g[bi + a] -= w * gb;
+  }
+}
+
+function accumulateFocal(H, g, N, fi, jf, ai, Ja, bi, Jb, r, w) {
+  let ff = 0, gf = 0;
+  for (let c = 0; c < 3; c++) { ff += jf[c] * jf[c]; gf += jf[c] * r[c]; }
+  H[fi * N + fi] += w * ff;
+  g[fi] -= w * gf;
+  for (let a = 0; a < 3; a++) {
+    let fa = 0, fb = 0;
+    for (let c = 0; c < 3; c++) { fa += jf[c] * Ja[c][a]; fb += jf[c] * Jb[c][a]; }
+    H[fi * N + (ai + a)] += w * fa; H[(ai + a) * N + fi] += w * fa;
+    H[fi * N + (bi + a)] += w * fb; H[(bi + a) * N + fi] += w * fb;
+  }
+}
+
+/** Cholesky solve of a symmetric positive-definite system. */
+function solveSPD(A, b, N) {
+  const L = new Float64Array(N * N);
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j <= i; j++) {
+      let s = A[i * N + j];
+      for (let k = 0; k < j; k++) s -= L[i * N + k] * L[j * N + k];
+      if (i === j) {
+        if (s <= 1e-14) return null;
+        L[i * N + i] = Math.sqrt(s);
+      } else {
+        L[i * N + j] = s / L[j * N + j];
+      }
+    }
+  }
+  const y = new Float64Array(N);
+  for (let i = 0; i < N; i++) {
+    let s = b[i];
+    for (let k = 0; k < i; k++) s -= L[i * N + k] * y[k];
+    y[i] = s / L[i * N + i];
+  }
+  const x = new Float64Array(N);
+  for (let i = N - 1; i >= 0; i--) {
+    let s = y[i];
+    for (let k = i + 1; k < N; k++) s -= L[k * N + i] * x[k];
+    x[i] = s / L[i * N + i];
+  }
+  return x;
+}
+
+/** Angle between where each pair's two views put the same feature. */
+function residuals(pairs, rot, scale) {
+  const out = [];
+  for (const p of pairs) {
+    for (const m of p.m) {
+      const a = deScale(pixelToRay(m[0], m[1], p.fa.w, p.fa.h, p.fa.tanH, p.fa.tanV), scale).u;
+      const b = deScale(pixelToRay(m[2], m[3], p.fb.w, p.fb.h, p.fb.tanH, p.fb.tanV), scale).u;
+      const wa = matVec(rot[p.i], a), wb = matVec(rot[p.j], b);
+      out.push(Math.acos(clamp(wa[0] * wb[0] + wa[1] * wb[1] + wa[2] * wb[2], -1, 1)) * RAD);
+    }
+  }
+  out.sort((x, y) => x - y);
+  return out;
+}
+const pctile = (sorted, f) =>
+  sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(f * (sorted.length - 1)))] : NaN;
+
+/**
+ * Drop every match the converged solution disagrees with, then solve again.
+ *
+ * A robust loss stops bad matches steering the answer but leaves them in, and
+ * they carry into the render where nothing protects anything. The converged
+ * global solution is a far better judge of a match than the pair it came from,
+ * because it has seen the whole sphere agree.
+ */
+function prune(pairs, rot, scale, keepDeg, minMatches = 10) {
+  const kept = [];
+  let dropped = 0;
+  for (const p of pairs) {
+    const m = p.m.filter(q => {
+      const a = deScale(pixelToRay(q[0], q[1], p.fa.w, p.fa.h, p.fa.tanH, p.fa.tanV), scale).u;
+      const b = deScale(pixelToRay(q[2], q[3], p.fb.w, p.fb.h, p.fb.tanH, p.fb.tanV), scale).u;
+      const wa = matVec(rot[p.i], a), wb = matVec(rot[p.j], b);
+      return Math.acos(clamp(wa[0] * wb[0] + wa[1] * wb[1] + wa[2] * wb[2], -1, 1)) * RAD <= keepDeg;
+    });
+    dropped += p.m.length - m.length;
+    if (m.length >= minMatches) kept.push({ ...p, m });
+  }
+  return { pairs: kept, dropped };
+}
+
+/* ================================================================ rendering ==
+ * Equirectangular, feathered, with exposure matched between frames.
+ *
+ * Each frame contributes with weight ((1-|u|)(1-|v|))^2 — one on the optical
+ * axis, zero at the frame border, squared so the centre of a frame decisively
+ * outvotes the corner of its neighbour. Contributions cross-fade across the
+ * whole overlap rather than stopping dead at a boundary.
+ *
+ * Exposure matters more here than it does in the app's own build. The app
+ * feathers and stops, and feathering alone hides a step well enough that the
+ * measured seam is already indistinguishable from ordinary image noise. But it
+ * hides it by AVERAGING, so a frame two stops brighter than its neighbour drags
+ * a broad smear of its own brightness across the join. The phone re-exposes
+ * constantly — fitted gains on these captures span 0.65 to 1.51 — and at this
+ * resolution that smear is the most visible remaining defect.
+ *
+ * The gains are fitted against the consensus rather than pairwise: each frame
+ * is compared with the blend it is already part of, over its own footprint,
+ * weighted the way it contributed. That makes the fit a handful of sums instead
+ * of a linear system, and two rounds converge because the consensus barely
+ * moves. Clamped hard, because a frame that genuinely saw something brighter
+ * must not have that scrubbed out.
+ */
+function renderPanorama(frames, rot, scale, opts) {
+  const { pxPerDeg, altMin, altMax, exposure = true, onProgress = null } = opts;
+  const width = Math.round(360 * pxPerDeg);
+  const height = Math.round((altMax - altMin) * pxPerDeg);
+  const n = frames.length;
+
+  const accR = new Float32Array(width * height);
+  const accG = new Float32Array(width * height);
+  const accB = new Float32Array(width * height);
+  const accW = new Float32Array(width * height);
+  const owner = new Int32Array(width * height).fill(-1);
+  const bestW = new Float32Array(width * height);
+
+  // World ray per output column/row, computed once.
+  const azFor = new Float64Array(width);
+  for (let x = 0; x < width; x++) azFor[x] = wrap360((x + 0.5) / pxPerDeg);
+  const altFor = new Float64Array(height);
+  for (let y = 0; y < height; y++) altFor[y] = altMax - (y + 0.5) / pxPerDeg;
+
+  // Precompute the unit world vector for every output pixel's azimuth and
+  // altitude. sin/cos per pixel would otherwise dominate the inner loop.
+  const cosAlt = new Float64Array(height), sinAlt = new Float64Array(height);
+  for (let y = 0; y < height; y++) { cosAlt[y] = Math.cos(altFor[y] * DEG); sinAlt[y] = Math.sin(altFor[y] * DEG); }
+  const sinAz = new Float64Array(width), cosAz = new Float64Array(width);
+  for (let x = 0; x < width; x++) { sinAz[x] = Math.sin(azFor[x] * DEG); cosAz[x] = Math.cos(azFor[x] * DEG); }
+
+  const gains = new Float32Array(n).fill(1);
+
+  /** One geometry pass. `visit(k, i, u, v, src)` per pixel a frame can see. */
+  const sweep = visit => {
+    for (let k = 0; k < n; k++) {
+      const f = frames[k];
+      if (!f.img) continue;
+      const R = rot[k];
+      const tanH = f.tanH * scale, tanV = f.tanV * scale;
+
+      // Bound the scan to the frame's own diagonal half-angle from its axis.
+      const axis = matVec(R, [0, 0, -1]);
+      const axisAlt = Math.atan2(axis[2], Math.hypot(axis[0], axis[1])) * RAD;
+      const axisAz = wrap360(Math.atan2(axis[0], axis[1]) * RAD);
+      const halfDiag = Math.atan(Math.hypot(tanH, tanV)) * RAD + 1;
+      const azPad = Math.min(180, halfDiag / Math.max(0.15, Math.cos(clamp(axisAlt, -80, 80) * DEG)));
+      const yLo = Math.max(0, Math.floor((altMax - (axisAlt + halfDiag)) * pxPerDeg));
+      const yHi = Math.min(height - 1, Math.ceil((altMax - (axisAlt - halfDiag)) * pxPerDeg));
+      const xSpan = Math.ceil(azPad * pxPerDeg);
+      const xMid = Math.round(wrap360(axisAz) * pxPerDeg);
+
+      for (let y = yLo; y <= yHi; y++) {
+        const ca = cosAlt[y], sa = sinAlt[y];
+        for (let dx = -xSpan; dx <= xSpan; dx++) {
+          const x = ((xMid + dx) % width + width) % width;
+          // World direction, then into the camera by R transpose.
+          const wx = sinAz[x] * ca, wy = cosAz[x] * ca, wz = sa;
+          const cx = R[0][0]*wx + R[1][0]*wy + R[2][0]*wz;
+          const cy = R[0][1]*wx + R[1][1]*wy + R[2][1]*wz;
+          const cz = R[0][2]*wx + R[1][2]*wy + R[2][2]*wz;
+          const depth = -cz;
+          if (depth <= 1e-6) continue;
+          const u = cx / depth / tanH, v = cy / depth / tanV;
+          if (u < -1 || u > 1 || v < -1 || v > 1) continue;
+          visit(k, y * width + x, u, v, f);
+        }
+      }
+      if (onProgress) onProgress(k + 1, n);
+    }
+  };
+
+  const px = [0, 0, 0];
+  const blendPass = () => {
+    accR.fill(0); accG.fill(0); accB.fill(0); accW.fill(0);
+    sweep((k, i, u, v, f) => {
+      const fu = 1 - Math.abs(u), fv = 1 - Math.abs(v);
+      if (fu <= 0 || fv <= 0) return;
+      const w = (fu * fv) * (fu * fv);
+      sampleImage(f.img, (u + 1) / 2 * f.img.width - 0.5, (1 - v) / 2 * f.img.height - 0.5, px);
+      const gg = gains[k];
+      accR[i] += px[0] * gg * w; accG[i] += px[1] * gg * w; accB[i] += px[2] * gg * w;
+      accW[i] += w;
+      if (w > bestW[i]) { bestW[i] = w; owner[i] = k; }
+    });
+  };
+
+  blendPass();
+
+  if (exposure) {
+    for (let round = 0; round < 2; round++) {
+      const own = new Float64Array(n), ref = new Float64Array(n);
+      sweep((k, i, u, v, f) => {
+        if (accW[i] <= 0) return;
+        const fu = 1 - Math.abs(u), fv = 1 - Math.abs(v);
+        if (fu <= 0 || fv <= 0) return;
+        const w = (fu * fv) * (fu * fv);
+        sampleImage(f.img, (u + 1) / 2 * f.img.width - 0.5, (1 - v) / 2 * f.img.height - 0.5, px);
+        const mine = (px[0] + px[1] + px[2]) / 3 * gains[k];
+        const cons = (accR[i] + accG[i] + accB[i]) / (3 * accW[i]);
+        // Mid-tones only. Blown highlights carry no ratio information and deep
+        // shadow is dominated by sensor noise; both would bias the fit.
+        if (mine < 14 || mine > 241 || cons < 14 || cons > 241) return;
+        own[k] += mine * w; ref[k] += cons * w;
+      });
+      let sum = 0, cnt = 0;
+      for (let k = 0; k < n; k++) {
+        if (own[k] <= 0) continue;
+        gains[k] *= clamp(ref[k] / own[k], 0.75, 1.33);
+        sum += gains[k]; cnt++;
+      }
+      if (cnt) { const mean = sum / cnt; for (let k = 0; k < n; k++) gains[k] /= mean; }
+      bestW.fill(0); owner.fill(-1);
+      blendPass();
+    }
+  }
+
+  const rgba = new Uint8ClampedArray(width * height * 4);
+  let painted = 0;
+  for (let i = 0; i < width * height; i++) {
+    const w = accW[i];
+    if (!(w > 0)) continue;
+    const p = i * 4;
+    rgba[p] = accR[i] / w; rgba[p+1] = accG[i] / w; rgba[p+2] = accB[i] / w; rgba[p+3] = 255;
+    painted++;
+  }
+  return { rgba, width, height, painted, owner, gains: Array.from(gains) };
+}
+
+/** Bilinear RGB sample from an ImageData, clamped at the edges. */
+function sampleImage(img, fx, fy, out) {
+  const w = img.width, h = img.height, d = img.data;
+  let x0 = Math.floor(fx), y0 = Math.floor(fy);
+  const tx = fx - x0, ty = fy - y0;
+  let x1 = x0 + 1, y1 = y0 + 1;
+  if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+  if (x1 > w-1) x1 = w-1; if (y1 > h-1) y1 = h-1;
+  if (x0 > w-1) x0 = w-1; if (y0 > h-1) y0 = h-1;
+  const i00 = (y0*w+x0)*4, i10 = (y0*w+x1)*4, i01 = (y1*w+x0)*4, i11 = (y1*w+x1)*4;
+  const w00 = (1-tx)*(1-ty), w10 = tx*(1-ty), w01 = (1-tx)*ty, w11 = tx*ty;
+  for (let k = 0; k < 3; k++) {
+    out[k] = d[i00+k]*w00 + d[i10+k]*w10 + d[i01+k]*w01 + d[i11+k]*w11;
+  }
+}
+
+/* ==================================================================== axes ==
+ * The panorama is a measurement, so it is drawn on a ruled panel rather than
+ * cropped to the imagery. Azimuth runs along the top with the cardinal points
+ * marked; altitude runs down the left with a heavier line on the horizon,
+ * because zero degrees is the one altitude a reader checks by eye.
+ */
+function drawWithAxes(mosaic, altMin, altMax, pxPerDeg) {
+  const PAD_L = 54, PAD_T = 26, PAD_B = 22, PAD_R = 12;
+  const cv = document.createElement('canvas');
+  cv.width = mosaic.width + PAD_L + PAD_R;
+  cv.height = mosaic.height + PAD_T + PAD_B;
+  const g = cv.getContext('2d');
+
+  g.fillStyle = '#04090c';
+  g.fillRect(0, 0, cv.width, cv.height);
+
+  const tmp = document.createElement('canvas');
+  tmp.width = mosaic.width; tmp.height = mosaic.height;
+  tmp.getContext('2d').putImageData(new ImageData(mosaic.rgba, mosaic.width, mosaic.height), 0, 0);
+  g.drawImage(tmp, PAD_L, PAD_T);
+
+  g.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+  g.textBaseline = 'middle';
+
+  // Altitude: a line every 10 degrees, the horizon heavier.
+  for (let a = Math.ceil(altMin / 10) * 10; a <= altMax; a += 10) {
+    const y = PAD_T + (altMax - a) * pxPerDeg;
+    const horizon = a === 0;
+    g.strokeStyle = horizon ? 'rgba(232,244,248,0.5)' : 'rgba(120,150,165,0.22)';
+    g.lineWidth = horizon ? 1.4 : 1;
+    g.beginPath(); g.moveTo(PAD_L, y + 0.5); g.lineTo(cv.width - PAD_R, y + 0.5); g.stroke();
+    g.fillStyle = horizon ? '#e8f4f8' : '#7d949e';
+    g.textAlign = 'right';
+    g.fillText(a + '°', PAD_L - 8, y);
+  }
+
+  // Azimuth: every 30 degrees, cardinals named.
+  const NAME = { 0: 'N', 90: 'E', 180: 'S', 270: 'W' };
+  for (let az = 0; az < 360; az += 10) {
+    const x = PAD_L + az * pxPerDeg;
+    const major = az % 30 === 0;
+    g.strokeStyle = major ? 'rgba(120,150,165,0.30)' : 'rgba(120,150,165,0.12)';
+    g.lineWidth = 1;
+    g.beginPath(); g.moveTo(x + 0.5, PAD_T); g.lineTo(x + 0.5, cv.height - PAD_B); g.stroke();
+    if (!major) continue;
+    const label = NAME[az] || (az + '°');
+    g.fillStyle = NAME[az] ? '#2ec7e6' : '#7d949e';
+    g.textAlign = 'center';
+    g.fillText(label, x, PAD_T / 2);
+    g.fillText(label, x, cv.height - PAD_B / 2);
+  }
+
+  g.strokeStyle = 'rgba(120,150,165,0.4)';
+  g.lineWidth = 1;
+  g.strokeRect(PAD_L + 0.5, PAD_T + 0.5, mosaic.width - 1, mosaic.height - 1);
+  return cv;
+}
+
+/* =================================================================== driver ==
+ * Load, detect, match, verify, solve, prune, solve again, render. Every stage
+ * prints the number that says whether it helped, because the recurring failure
+ * mode on this project has been a change that sounded principled, made things
+ * worse, and went unnoticed until the next field trip.
+ */
+const $ = id => document.getElementById(id);
+const logEl = $('log'), phaseEl = $('phase'), progEl = $('prog');
+let logLines = [];
+const say = (s, cls) => {
+  logLines.push(cls ? `<${cls}>${s}</${cls}>` : s);
+  logEl.innerHTML = logLines.join('\n');
+  logEl.scrollTop = logEl.scrollHeight;
+};
+const phase = (s, frac) => {
+  phaseEl.textContent = s;
+  if (frac != null) progEl.style.width = (clamp(frac, 0, 1) * 100).toFixed(1) + '%';
+};
+const yield_ = () => new Promise(r => setTimeout(r, 0));
+
+let currentCanvas = null;
+
+/**
+ * The PLACED pose: the sensor quaternion with the survey's own yaw corrections
+ * applied. This is what the app draws with, so a reconstruction that started
+ * anywhere else could not be compared against it.
+ */
+function placedRotation(rec) {
+  const o = rec.orientation;
+  let q = o.quaternion;
+  const total = (o.yawBaseCorrectionDeg || 0) + (o.stitchYawCorrectionDeg || 0);
+  if (Math.abs(total) > 1e-9) q = quatMul(yawQuat(total), q);
+  return quatToMatrix(q);
+}
+
+async function run(buffer, name) {
+  logLines = []; logEl.innerHTML = '';
+  $('go').disabled = true; $('save').disabled = true;
+  const t0 = performance.now();
+
+  const pxPerDeg = Number($('ppd').value);
+  const workW = Number($('work').value);
+  const target = Number($('feat').value);
+  const solveFocal = $('solveFocal').checked;
+  const doExposure = $('doExposure').checked;
+
+  phase('reading the archive', 0.01);
+  const zip = await readZip(buffer);
+  say(`<b>${name}</b>`);
+  const meta = JSON.parse(new TextDecoder().decode(await zip.bytesOf('metadata/keyframes.json')));
+  let session = {};
+  try { session = JSON.parse(new TextDecoder().decode(await zip.bytesOf('metadata/session.json'))); } catch (_) {}
+  const recs = meta.filter(r => r.photo && zip.names.includes(r.photo.path));
+  const hfov = 2 * Math.atan(recs[0].camera.tanHalfHorizontal) * RAD;
+  const vfov = 2 * Math.atan(recs[0].camera.tanHalfVertical) * RAD;
+  say(`  ${recs.length} photographs, app ${session.appVersion || 'unknown'}`);
+  say(`  stated lens ${hfov.toFixed(2)}° x ${vfov.toFixed(2)}°`);
+
+  /* ---- load ------------------------------------------------------------- */
+  phase('decoding photographs', 0.03);
+  const frames = [];
+  for (let i = 0; i < recs.length; i++) {
+    const r = recs[i];
+    const bytes = await zip.bytesOf(r.photo.path);
+    const bmp = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+    const aspect = bmp.height / bmp.width;
+    const w = Math.min(workW, bmp.width), h = Math.round(w * aspect);
+    const c = new OffscreenCanvas(w, h);
+    const cx = c.getContext('2d', { willReadFrequently: true });
+    cx.drawImage(bmp, 0, 0, w, h);
+    bmp.close?.();
+    const img = cx.getImageData(0, 0, w, h);
+    // The saved skyline is in the capture-time analysis raster; scale its rows
+    // into this one. Everything above it is sky and cloud, which moves between
+    // frames and must never anchor a solve.
+    const b = r.analysis && r.analysis.boundary;
+    const skyline = b ? Float32Array.from(b, v => v / 288 * h) : null;
+    const hfovThis = 2 * Math.atan(r.camera.tanHalfHorizontal) * RAD;
+    frames.push({
+      index: r.index, img, w, h,
+      // Pixels per degree across this frame, which is what makes every
+      // pixel-denominated tolerance below device-independent.
+      pxPerDeg: w / hfovThis,
+      tanH: r.camera.tanHalfHorizontal, tanV: r.camera.tanHalfVertical,
+      R: placedRotation(r), roll: r.pointing.rollDeg || 0,
+      az: r.pointing.stitchedAzimuthDeg, alt: r.pointing.centerAltitudeDeg,
+      skyline
+    });
+    if (i % 6 === 5) { phase(`decoding photographs ${i + 1}/${recs.length}`, 0.03 + 0.12 * i / recs.length); await yield_(); }
+  }
+  const alts = frames.map(f => f.alt);
+  say(`  elevation ${Math.min(...alts).toFixed(1)}° to ${Math.max(...alts).toFixed(1)}°, decoded at ${frames[0].w}x${frames[0].h}`);
+
+  /* ---- features --------------------------------------------------------- */
+  phase('finding features', 0.16);
+  let totalFeat = 0;
+  for (let i = 0; i < frames.length; i++) {
+    const f = frames[i];
+    f.feat = extractFeatures(f.img, { target, rollDeg: f.roll, skylineRow: f.skyline });
+    totalFeat += f.feat.n;
+    if (i % 4 === 3) { phase(`finding features ${i + 1}/${frames.length}`, 0.16 + 0.26 * i / frames.length); await yield_(); }
+  }
+  const counts = frames.map(f => f.feat.n).sort((a, b) => a - b);
+  say(`<b>features</b>  ${totalFeat.toLocaleString()} over ${frames.length} frames, median ${counts[counts.length >> 1]} per frame`);
+
+  /* ---- match graph ------------------------------------------------------ */
+  phase('matching overlaps', 0.43);
+  const halfDiag = frames.map(f => Math.atan(Math.hypot(f.tanH, f.tanV)) * RAD);
+  /*
+   * How far, in degrees, a feature may sit from where the sensor poses predict.
+   *
+   * Sized from the data rather than chosen: the sensor-pose residual on these
+   * captures runs to a median of 3.6 degrees with a p90 near 5.4, so a window
+   * that comfortably contains the p90 is what keeps the honest matches while
+   * still refusing the whole frame to periodic texture.
+   */
+  const SEARCH_DEG = 7;
+  const cands = [];
+  for (let i = 0; i < frames.length; i++) {
+    for (let j = i + 1; j < frames.length; j++) {
+      const ai = matVec(frames[i].R, [0, 0, -1]), aj = matVec(frames[j].R, [0, 0, -1]);
+      const sep = Math.acos(clamp(ai[0]*aj[0] + ai[1]*aj[1] + ai[2]*aj[2], -1, 1)) * RAD;
+      if (sep > 1.0 && sep < (halfDiag[i] + halfDiag[j]) * 0.85) cands.push([sep, i, j]);
+    }
+  }
+  cands.sort((a, b) => a[0] - b[0]);
+  const degree = new Int32Array(frames.length);
+  const MAX_DEG = 14;
+  let pairs = [];
+  let considered = 0;
+  const why = { degreeFull: 0, tooFewRaw: 0, tooFewVerified: 0, kept: 0 };
+  for (let c = 0; c < cands.length; c++) {
+    const [sep, i, j] = cands[c];
+    if (degree[i] >= MAX_DEG && degree[j] >= MAX_DEG) { why.degreeFull++; continue; }
+    considered++;
+    // The search window is ANGULAR, converted to pixels per frame.
+    //
+    // It was a flat 48 pixels, and that is a device-dependent bug: the same 48
+    // pixels is 5 degrees on the Pixel's 66-degree lens and 3 on the iPad's
+    // 40-degree one, while the thing the window exists to absorb — sensor pose
+    // disagreement — is measured in degrees and runs to 7 on these captures.
+    // On the Pixel the window was smaller than the error, and 1398 of 1940
+    // overlapping pairs produced too few matches to use.
+    const px = Math.max(24, Math.round(SEARCH_DEG * frames[j].pxPerDeg));
+    const raw = matchPair(frames[i].feat, frames[j].feat, frames[i], frames[j], px, 0.82);
+    if (raw.length < 12) { why.tooFewRaw++; continue; }
+    const m = verifyPair(raw, frames[i], frames[j]);
+    if (m.length < 12) { why.tooFewVerified++; continue; }
+    why.kept++;
+    pairs.push({ i, j, m, fa: frames[i], fb: frames[j], sep });
+    degree[i]++; degree[j]++;
+    if (considered % 8 === 0) { phase(`matching ${considered}/${cands.length} pairs, ${pairs.length} verified`, 0.43 + 0.30 * c / cands.length); await yield_(); }
+  }
+  const degs = Array.from(degree).sort((a, b) => a - b);
+  say(`  candidate fate: ${why.kept} kept, ${why.tooFewRaw} too few raw matches, `
+    + `${why.tooFewVerified} failed verification, ${why.degreeFull} skipped (both frames full)`);
+  say(`  connectivity: median ${degs[degs.length >> 1]} partners per frame, `
+    + `${degs.filter(d => d === 0).length} frames with none`);
+  const matchCount = pairs.reduce((s, p) => s + p.m.length, 0);
+  say(`<b>matching</b>  ${pairs.length} pairs verified from ${considered} tried (${cands.length} predicted by the sensors)`);
+  say(`             ${matchCount.toLocaleString()} correspondences`);
+  if (pairs.length < 2) { say('<u>too few pairs to solve — stopping</u>', ''); phase('failed'); $('go').disabled = false; return; }
+
+  /* ---- solve ------------------------------------------------------------ */
+  const before = residuals(pairs, frames.map(f => f.R), 1);
+  say(`  sensor poses     median ${pctile(before, 0.5).toFixed(3)}°  p90 ${pctile(before, 0.9).toFixed(3)}°  max ${before[before.length-1].toFixed(2)}°`);
+
+  phase('solving rotations and focal length', 0.74);
+  await yield_();
+  let { rot, scale } = bundleAdjust(frames, pairs, { solveFocal, log: say });
+  let after = residuals(pairs, rot, scale);
+  say(`  after solve      median ${pctile(after, 0.5).toFixed(3)}°  p90 ${pctile(after, 0.9).toFixed(3)}°  max ${after[after.length-1].toFixed(2)}°`);
+
+  /* ---- prune and re-solve ----------------------------------------------- */
+  phase('pruning and re-solving', 0.80);
+  await yield_();
+  const pr = prune(pairs, rot, scale, 0.8);
+  say(`  pruned ${pr.dropped.toLocaleString()} matches, ${pairs.length - pr.pairs.length} pairs dropped`);
+  if (pr.pairs.length >= 2) {
+    pairs = pr.pairs;
+    const again = bundleAdjust(frames, pairs, { solveFocal, log: say });
+    rot = again.rot; scale = again.scale;
+    after = residuals(pairs, rot, scale);
+    say(`<b>after prune</b>      median ${pctile(after, 0.5).toFixed(3)}°  p90 ${pctile(after, 0.9).toFixed(3)}°  max ${after[after.length-1].toFixed(2)}°`);
+  }
+  const hf = 2 * Math.atan(frames[0].tanH * scale) * RAD;
+  const vf = 2 * Math.atan(frames[0].tanV * scale) * RAD;
+  say(`  focal scale x${scale.toFixed(4)}  ->  lens ${hf.toFixed(2)}° x ${vf.toFixed(2)}°`);
+
+  const moved = frames.map((f, i) => {
+    const M = matMul(rot[i], transpose3(f.R));
+    return Math.acos(clamp((M[0][0] + M[1][1] + M[2][2] - 1) / 2, -1, 1)) * RAD;
+  }).sort((a, b) => a - b);
+  say(`  frames moved from the sensors: median ${pctile(moved, 0.5).toFixed(2)}°  max ${moved[moved.length-1].toFixed(2)}°`);
+
+  /* ---- render ----------------------------------------------------------- */
+  phase('painting the panorama', 0.86);
+  await yield_();
+  const solvedAlts = frames.map((f, i) => {
+    const a = matVec(rot[i], [0, 0, -1]);
+    return Math.atan2(a[2], Math.hypot(a[0], a[1])) * RAD;
+  });
+  const halfV = Math.atan(frames[0].tanV * scale) * RAD;
+  const altMin = Math.floor((Math.min(...solvedAlts) - halfV - 2) / 5) * 5;
+  const altMax = Math.ceil((Math.max(...solvedAlts) + halfV + 2) / 5) * 5;
+
+  /*
+   * The control: the same renderer, the same frames, the untouched sensor
+   * poses.
+   *
+   * This exists because a residual can be excellent and the picture terrible at
+   * the same time, and on the 2026-08-19 captures it was. The residual is
+   * computed over the matches that SURVIVED pruning — if the graph fragments,
+   * each piece can be internally consistent to a tenth of a degree while
+   * sitting somewhere quite wrong relative to the others, and the number will
+   * happily report the average of the pieces. Rendering the sensor poses
+   * through the identical path is the only cheap way to tell "the solve
+   * improved this" from "the solve wrecked this and the metric cannot see it".
+   */
+  const control = renderPanorama(frames, frames.map(f => f.R), 1, {
+    pxPerDeg, altMin, altMax, exposure: doExposure
+  });
+  const controlSeam = seamStep(control);
+  const controlPainted = control.painted / (control.width * control.height) * 100;
+
+  const mosaic = renderPanorama(frames, rot, scale, {
+    pxPerDeg, altMin, altMax, exposure: doExposure
+  });
+  const pctPainted = mosaic.painted / (mosaic.width * mosaic.height) * 100;
+  say(`<b>rendered</b>  ${mosaic.width}x${mosaic.height}, ${pctPainted.toFixed(1)}% of the panel painted`);
+  if (doExposure) {
+    const g = mosaic.gains;
+    say(`  exposure gains ${Math.min(...g).toFixed(2)}–${Math.max(...g).toFixed(2)} across ${g.length} frames`);
+  }
+
+  // Seam quality, measured rather than asserted: the luma step ACROSS a frame
+  // boundary minus the step between ordinary neighbours. Scene detail cancels,
+  // so what is left is the seam.
+  const solvedSeam = seamStep(mosaic);
+  say(`  seam step ${solvedSeam.toFixed(3)} luma levels (0 means invisible)`);
+  say(`  <i>control — sensor poses through the same renderer: seam ${controlSeam.toFixed(3)}, painted ${controlPainted.toFixed(1)}%</i>`);
+  // Sharpness: a correctly aligned mosaic is SHARPER than a misaligned one,
+  // because misalignment smears detail across the overlap. Gradient energy over
+  // painted pixels catches exactly the smearing that a residual cannot see.
+  const solvedSharpness = sharpness(mosaic), controlSharpness = sharpness(control);
+  say(`  detail retained ${solvedSharpness.toFixed(1)} vs ${controlSharpness.toFixed(1)} from the sensors `
+    + `(higher is sharper)`);
+  if (solvedSharpness < controlSharpness) {
+    say('<u>THE SOLVE MADE THIS WORSE. The residual above is measured only over '
+      + 'matches that survived pruning and does not describe the picture.</u>');
+  } else if (solvedSeam > controlSeam + 0.05 || pctPainted < controlPainted - 1) {
+    say('<i>  render tradeoff: detail improved, but seam or painted coverage regressed versus the control</i>');
+  }
+  window.__lastControl = control;
+
+  const cv = drawWithAxes(mosaic, altMin, altMax, pxPerDeg);
+  const out = $('out');
+  out.width = cv.width; out.height = cv.height;
+  out.getContext('2d').drawImage(cv, 0, 0);
+  currentCanvas = cv;
+
+  const secs = (performance.now() - t0) / 1000;
+  say(`\n<b>done in ${secs.toFixed(1)} s</b>`);
+  phase(`complete — ${mosaic.width}x${mosaic.height}`, 1);
+
+  $('stats').innerHTML = [
+    ['frames', frames.length],
+    ['correspondences', matchCount.toLocaleString()],
+    ['median residual', pctile(after, 0.5).toFixed(3) + '°'],
+    ['focal scale', 'x' + scale.toFixed(4)],
+    ['lens', hf.toFixed(1) + '° x ' + vf.toFixed(1) + '°'],
+    ['panel painted', pctPainted.toFixed(1) + '%']
+  ].map(([k, v]) => `<div class="stat">${k}<br><b>${v}</b></div>`).join('');
+
+  $('go').disabled = false; $('save').disabled = false;
+}
+
+/**
+ * Mean gradient magnitude over painted pixels.
+ *
+ * The measurement the residual could not make. Misregistration does not show up
+ * as a step at a boundary once the frames are feathered — it shows up as the
+ * same edge appearing twice, a few pixels apart, which averages into a smear.
+ * Smearing destroys gradient energy, so a sharper mosaic is a better-aligned
+ * one, and this is directly comparable between two renders of the same data.
+ */
+function sharpness(m) {
+  const { rgba: d, width: W, height: H } = m;
+  let sum = 0, n = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      if (d[i*4+3] === 0) continue;
+      const l = (d[i*4] + d[i*4+1] + d[i*4+2]) / 3;
+      const lx = (d[(i+1)*4] + d[(i+1)*4+1] + d[(i+1)*4+2]) / 3;
+      const ly = (d[(i+W)*4] + d[(i+W)*4+1] + d[(i+W)*4+2]) / 3;
+      sum += Math.hypot(l - lx, l - ly); n++;
+    }
+  }
+  return n ? sum / n : 0;
+}
+
+function seamStep(m) {
+  const { rgba: d, owner: o, width: W, height: H } = m;
+  let s = 0, sn = 0, c = 0, cn = 0;
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W - 1; x++) {
+      const i = y * W + x, j = i + 1;
+      if (d[i*4+3] === 0 || d[j*4+3] === 0) continue;
+      const L1 = (d[i*4] + d[i*4+1] + d[i*4+2]) / 3;
+      const L2 = (d[j*4] + d[j*4+1] + d[j*4+2]) / 3;
+      const dv = Math.abs(L1 - L2);
+      if (o[i] !== o[j] && o[i] >= 0 && o[j] >= 0) { s += dv; sn++; } else { c += dv; cn++; }
+    }
+  }
+  return (s / Math.max(1, sn)) - (c / Math.max(1, cn));
+}
+
+/* ---- wiring -------------------------------------------------------------- */
+let pending = null;
+const accept = async file => {
+  if (!file) return;
+  pending = { buffer: await file.arrayBuffer(), name: file.name };
+  $('go').disabled = false;
+  phase(`${file.name} — ${(file.size / 1048576).toFixed(1)} MB ready`, 0);
+};
+
+$('file').addEventListener('change', e => accept(e.target.files[0]));
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(t => drop.addEventListener(t, e => {
+  e.preventDefault(); drop.classList.add('hot');
+}));
+['dragleave', 'drop'].forEach(t => drop.addEventListener(t, e => {
+  e.preventDefault(); drop.classList.remove('hot');
+}));
+drop.addEventListener('drop', e => accept(e.dataTransfer.files[0]));
+
+$('go').addEventListener('click', async () => {
+  if (!pending) return;
+  try {
+    await run(pending.buffer, pending.name);
+  } catch (err) {
+    say(`<u>failed: ${err && err.message || err}</u>`);
+    phase('failed');
+    $('go').disabled = false;
+    throw err;
+  }
+});
+
+$('save').addEventListener('click', () => {
+  if (!currentCanvas) return;
+  currentCanvas.toBlob(b => {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(b);
+    a.download = (pending?.name || 'panorama').replace(/\.zip$/i, '') + '-restitched.png';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10_000);
+  }, 'image/png');
+});
+
+// Exposed for automated checking; harmless otherwise.
+window.__restitch = { readZip, extractFeatures, bundleAdjust, renderPanorama, run };
+</script>
+</body>
+</html>

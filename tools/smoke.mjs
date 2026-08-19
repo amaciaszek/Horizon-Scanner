@@ -412,9 +412,7 @@ await check('aiming over an obstruction does not mark it measured', () => {
     skylineTopDeg: null, skylineMeasuredFraction: 0,
     skylineConfidence: 0.8, visualQuality: 0.6, dtSec: 0.1, atMs: 1
   });
-  if (map.satisfiedElevation[i] > 0) {
-    throw new Error(`empty sky satisfied the bin at ${map.satisfiedElevation[i]}°`);
-  }
+  if (map.topSeen[i]) throw new Error('empty sky marked the top as seen');
   return 'not satisfied';
 });
 
@@ -429,10 +427,34 @@ await check('tracing the top with headroom satisfies the bin', () => {
     skylineConfidence: 0.8, visualQuality: 0.6, dtSec: 0.1, atMs: 1
   });
   if (!(map.measuredTop[i] >= 44)) throw new Error(`measuredTop ${map.measuredTop[i]}`);
-  if (!(map.satisfiedElevation[i] >= 44)) {
-    throw new Error(`traced top did not satisfy: ${map.satisfiedElevation[i]}`);
+  if (!map.topSeen[i]) throw new Error('traced top did not mark the bin as seen');
+  return `measuredTop ${map.measuredTop[i]}°, topSeen`;
+});
+
+// 2b. A tall obstruction that has never been framed must REQUEST a lift. This
+//     is the assertion that would have caught the units mix-up: comparing a
+//     top elevation against a camera elevation made needsLift false on all 180
+//     bins of both 2026-08-19 captures.
+await check('an unframed tall obstruction asks for lift', () => {
+  const map = new coverage.CoverageMap();
+  map.reset();
+  const az = 90, i = map.indexOf(az);
+  // Frames that keep clipping: the top is above every frame edge so far.
+  for (let n = 0; n < 6; n++) {
+    map.observe({
+      headingDeg: az, elevationDeg: 20, vfovDeg: 33, clippedFraction: 0.5,
+      skylineTopDeg: null, skylineMeasuredFraction: 0,
+      skylineConfidence: 0.8, visualQuality: 0.6, dtSec: 0.1, atMs: n
+    });
   }
-  return `measuredTop ${map.measuredTop[i]}°`;
+  if (!(map.requiredElevation[i] > 0)) throw new Error('no lift requested at all');
+  if (!map.needsLift(i)) throw new Error('a never-framed roofline did not need lift');
+  const c = map.completeness();
+  if (!(c.highestRequestedElevationDeg > 0)) {
+    throw new Error('completeness reported no request while one was outstanding');
+  }
+  if (map.isComplete(i)) throw new Error('a bin needing lift counted as complete');
+  return `requires ${map.requiredElevation[i].toFixed(1)}°, needsLift`;
 });
 
 // 3. The height model must survive the pass boundary. This is the regression
@@ -452,6 +474,45 @@ await check('the height model survives a new lap', () => {
   // ...but coverage confidence must NOT survive, or pass 2 verifies nothing.
   if (map.score[i] !== 0) throw new Error('coverage score survived, so pass 2 verifies nothing');
   return 'heights kept, confidence cleared';
+});
+
+/*
+ * The stuck dot. The operator's workaround was to walk away, which covered
+ * something else, ticked the coverage generation and released the target. The
+ * dot must release itself.
+ */
+await check('the dot gives up on a sector that cannot be filled', () => {
+  const map = new coverage.CoverageMap();
+  map.reset();
+  const g = new guidance.ScanGuidance();
+  // Stand still, pointing at something the frame gates refuse: no skyline, so
+  // nothing is ever credited anywhere and the map never changes.
+  const bad = { headingDeg: 100, elevationDeg: 0, vfovDeg: 33, hfovDeg: 45,
+    clippedFraction: 0, skylineTopDeg: null, skylineMeasuredFraction: 0,
+    skylineConfidence: 0, visualQuality: 0, frameStatus: 'allSky' };
+  let now = 0, first = null;
+  for (let i = 0; i < 400; i++) {
+    now += 100;
+    map.observe({ ...bad, dtSec: 0.1, atMs: now });
+    const snap = g.update({ coverage: map, headingDeg: 100, dtSec: 0.1, nowMs: now, hfovDeg: 45 });
+    if (first === null && snap.rawBearingDeg !== null) first = snap.rawBearingDeg;
+  }
+  const end = g.update({ coverage: map, headingDeg: 100, dtSec: 0.1, nowMs: now, hfovDeg: 45 });
+  if (!(g.abandonedCount > 0)) {
+    throw new Error('sat on an unfillable sector for 40s without giving up');
+  }
+  return `gave up ${g.abandonedCount}x, ${end.deferredCount} sector(s) deferred`;
+});
+
+await check('a deferred sector is not immediately re-offered', () => {
+  const map = new coverage.CoverageMap();
+  map.reset();
+  const g = new guidance.ScanGuidance();
+  const i = map.indexOf(100);
+  g.deferred.set(i, 10_000);
+  if (!g.isDeferred(map, 100, 5_000)) throw new Error('deferral not honoured');
+  if (g.isDeferred(map, 100, 20_000)) throw new Error('deferral never expires');
+  return 'honoured, and expires';
 });
 
 await check('PHASE values', () => Object.values(guide.PHASE).join(','));

@@ -60,6 +60,26 @@ export const GUIDANCE_TUNING = {
   /** Exponential smoothing constant, in seconds, applied after the slew limit. */
   smoothingSec: 0.22,
 
+  /**
+   * How long the dot will sit on a sector that is earning nothing before it
+   * gives up on it for a while and leads somewhere else.
+   *
+   * The dot used to re-pick only when ground somewhere became covered. Park the
+   * operator in front of something the segmenter refuses — clear sky with no
+   * skyline in frame, a dark corner, glare — and NOTHING changes: the target
+   * stays wanted, no bin gets credited, the generation never ticks, and the dot
+   * is frozen on a sector that cannot be satisfied from where they are. The
+   * operator's own workaround was to walk away, which covered something else,
+   * ticked the generation and released it. That is a bug wearing a workaround.
+   */
+  abandonAfterSec: 6,
+
+  /** How long an abandoned sector is left alone before it may be offered again.
+   *  Long enough that the dot does not oscillate between two impossible
+   *  sectors, short enough that a genuinely fixable one comes back in the same
+   *  lap. */
+  deferCooldownSec: 45,
+
   /** Below this, a target that has been waiting is reported as `waiting` so the
    *  interface can say so. Degrees of operator movement while the dot did not
    *  advance. */
@@ -118,6 +138,10 @@ export class ScanGuidance {
     this.lastHereScore = null;
     this.lastHungryHere = false;
     this.lastGeneration = -1;
+    /** binIndex -> performance-clock ms at which it may be offered again. */
+    this.deferred = new Map();
+    this.abandonedCount = 0;
+    this._nowMs = 0;
     this.waitingSec = 0;
     this.complete = false;
     /** Where the dot sits vertically, smoothed. */
@@ -125,6 +149,16 @@ export class ScanGuidance {
     this.wantsLift = false;
     this.liftDeg = 0;
     this.beyondTilt = false;
+  }
+
+  /** Is this bearing currently being left alone? Expired entries are dropped as
+   *  they are met, so the map never needs sweeping. */
+  isDeferred(coverage, bearingDeg, nowMs = this._nowMs) {
+    const i = coverage.indexOf(bearingDeg);
+    const until = this.deferred.get(i);
+    if (until === undefined) return false;
+    if (nowMs >= until) { this.deferred.delete(i); return false; }
+    return true;
   }
 
   /**
@@ -159,6 +193,11 @@ export class ScanGuidance {
 
     if (coverage.completeness().complete) return null;
 
+    // A sector that has been given up on for now is not a candidate. Wrapping
+    // the map's own test is enough: every candidate search below goes through
+    // it, so deferral needs no other plumbing.
+    const wanted = bearing => !coverage.completeAt(bearing) && !this.isDeferred(coverage, bearing);
+
     // THE FRONTIER, looking back. Walk against the sweep while the ground is
     // uncovered BUT HAS BEEN VISITED, which is the signature of a sector the
     // operator swept through without capturing anything usable. The walk stops
@@ -173,7 +212,7 @@ export class ScanGuidance {
     const maxLookBack = skip + Math.round(t.maxLeadDeg / step);
     for (let k = skip; k <= maxLookBack; k++) {
       const bearing = wrap360(headingDeg - dir * k * step);
-      if (coverage.completeAt(bearing) || !coverage.visitedAt(bearing)) break;
+      if (!wanted(bearing) || !coverage.visitedAt(bearing)) break;
       behind = bearing;
       runDeg += step;
     }
@@ -184,7 +223,7 @@ export class ScanGuidance {
     let ahead = null;
     for (let k = 0; k < n; k++) {
       const bearing = wrap360(headingDeg + dir * k * step);
-      if (!coverage.completeAt(bearing)) { ahead = bearing; break; }
+      if (wanted(bearing)) { ahead = bearing; break; }
     }
 
     if (ahead === null && behind === null) return null;
@@ -231,6 +270,7 @@ export class ScanGuidance {
     coverage, headingDeg, dtSec = 1 / 30, nowMs = 0, hfovDeg = 45, elevationDeg = 0
   } = {}) {
     const t = this.tuning;
+    this._nowMs = nowMs;
     const summary = coverage.completeness();
     this.complete = summary.complete;
 
@@ -271,8 +311,28 @@ export class ScanGuidance {
      * the dot behind on purpose — that sector still needs them, and when they
      * finish where they are, the dot is still exactly where they must go next.
      */
+    /*
+     * Give up on a sector that is earning nothing, and come back to it later.
+     *
+     * `stillWanted` alone kept the dot on an impossible target forever. The
+     * escape is deliberately generous — six seconds of the operator standing
+     * there with the sector gaining no ground — because a sector that is merely
+     * slow to fill should NOT be abandoned; the whole design depends on the dot
+     * waiting rather than sliding along with the phone. What it must not do is
+     * wait for something that cannot happen from where the operator is.
+     */
+    if (this.rawBearingDeg !== null && this.waitingSec > t.abandonAfterSec
+        && !coverage.completeAt(this.rawBearingDeg)) {
+      this.deferred.set(coverage.indexOf(this.rawBearingDeg),
+        nowMs + t.deferCooldownSec * 1000);
+      this.rawBearingDeg = null;
+      this.waitingSec = 0;
+      this.abandonedCount = (this.abandonedCount || 0) + 1;
+    }
+
     const stillWanted = this.rawBearingDeg !== null
-      && !coverage.completeAt(this.rawBearingDeg);
+      && !coverage.completeAt(this.rawBearingDeg)
+      && !this.isDeferred(coverage, this.rawBearingDeg, nowMs);
     // The second half of the same rule: even a target that is still wanted may
     // be reconsidered, but ONLY when some ground actually became covered since
     // the last decision. Turning the phone changes nothing here; covering the
@@ -375,6 +435,11 @@ export class ScanGuidance {
       beyondTilt: !!this.beyondTilt,
       state: this.state,
       complete: this.complete,
+      /** Sectors currently being left alone, and how many have been given up on
+       *  this lap. A rising count is the signal that something in the scene or
+       *  the frame gates is refusing to cooperate. */
+      deferredCount: this.deferred.size,
+      abandonedCount: this.abandonedCount || 0,
       waitingSec: this.waitingSec,
       /** Confidence of the sector the camera is on now, for the "keep going
        *  here" feedback. */

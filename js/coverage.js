@@ -251,6 +251,7 @@ export class CoverageMap {
     const world = keepWorld && this.obstructionTop ? {
       obstructionTop: this.obstructionTop.slice(),
       measuredTop: this.measuredTop.slice(),
+      topSeen: this.topSeen.slice(),
       requiredElevation: this.requiredElevation.slice(),
       satisfiedElevation: this.satisfiedElevation.slice(),
       beyondTilt: this.beyondTilt.slice()
@@ -271,8 +272,22 @@ export class CoverageMap {
     this.satisfiedElevation.fill(-Infinity);
     /** The top of the obstruction as actually TRACED, where a frame has managed
      *  to contain it. Unlike `obstructionTop` this is a measurement, not a
-     *  bound, and it is what satisfaction is judged against. */
+     *  bound, and it is what the lift request is computed from. */
     this.measuredTop = new Float32Array(this.binCount);
+    /**
+     * Has the top here been CAPTURED — seen with clear space beneath the frame's
+     * top edge, not merely glimpsed at the boundary?
+     *
+     * This is a flag and not an elevation on purpose. The previous attempt
+     * compared `satisfiedElevation` (an obstruction-top elevation, once it was
+     * measured properly) against `requiredElevation` (a CAMERA-pointing
+     * elevation), which are different quantities in the same units. The top is
+     * always higher than the aim that frames it, so the test passed everywhere
+     * and `needsLift` was false on all 180 bins of both 2026-08-19 captures
+     * despite tops reaching 73 and 79 degrees. Framing is a yes-or-no fact;
+     * store it as one.
+     */
+    this.topSeen = new Uint8Array(this.binCount);
     /** Lower bound on how high the obstruction here actually reaches, from the
      *  top edge of any frame it overflowed. A fact about the world, so it only
      *  ever refines upward and never follows the camera. */
@@ -294,6 +309,7 @@ export class CoverageMap {
     if (world) {
       this.obstructionTop.set(world.obstructionTop);
       this.measuredTop.set(world.measuredTop);
+      this.topSeen.set(world.topSeen);
       this.requiredElevation.set(world.requiredElevation);
       this.satisfiedElevation.set(world.satisfiedElevation);
       this.beyondTilt.set(world.beyondTilt);
@@ -450,8 +466,11 @@ export class CoverageMap {
           // count. This is the test the old code should have been making.
           const headroom = vfovDeg * t.liftHeadroomFraction;
           if (measured <= frameTop - headroom * 0.5 && quality > 0) {
-            if (measured > this.satisfiedElevation[index]) {
-              this.satisfiedElevation[index] = measured;
+            this.topSeen[index] = 1;
+            // Kept as the camera elevation that achieved it, which is what the
+            // archive wants to show and what a later lap can aim to repeat.
+            if (elevationDeg > this.satisfiedElevation[index]) {
+              this.satisfiedElevation[index] = elevationDeg;
             }
           }
         }
@@ -577,7 +596,10 @@ export class CoverageMap {
     if (this.beyondTilt[i]) return false;
     const required = this.requiredElevation[i];
     if (!(required > 0)) return false;
-    return this.satisfiedElevation[i] < required - 1;
+    // One question: has the top been framed with room beneath the edge? Not
+    // "was the camera once pointed high enough", which is what this used to ask
+    // and which empty sky answered.
+    return !this.topSeen[i];
   }
 
   /** Too tall to bring into frame by tilting, even at the 50-degree ceiling.
@@ -624,10 +646,12 @@ export class CoverageMap {
     let lifts = 0, highestRequest = 0;
     let lowest = Infinity;
     for (let i = 0; i < this.binCount; i++) {
-      if (this.needsLift(i)) {
-        lifts++;
-        if (this.requiredElevation[i] > highestRequest) highestRequest = this.requiredElevation[i];
-      }
+      // Reported over every bin, not only outstanding ones. Gating it on
+      // needsLift made the archive say "highest requested elevation 0" for a
+      // capture that had asked for 55.7 degrees and got it, which reads as the
+      // feature never having run.
+      if (this.requiredElevation[i] > highestRequest) highestRequest = this.requiredElevation[i];
+      if (this.needsLift(i)) lifts++;
       if (this.isComplete(i)) covered++;
       sum += this.score[i];
       if (this.score[i] < lowest) { lowest = this.score[i]; weakestIndex = i; }
@@ -730,6 +754,7 @@ export class CoverageMap {
        */
       obstructionTop: Array.from(this.obstructionTop, v => Number(v.toFixed(2))),
       measuredTop: Array.from(this.measuredTop, v => Number(v.toFixed(2))),
+      topSeen: Array.from(this.topSeen),
       requiredElevation: Array.from(this.requiredElevation, v => Number(v.toFixed(2))),
       satisfiedElevation: Array.from(this.satisfiedElevation, v => Number(v.toFixed(2))),
       beyondTilt: Array.from(this.beyondTilt),

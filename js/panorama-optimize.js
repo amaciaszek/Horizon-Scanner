@@ -98,7 +98,10 @@ function unchanged(keyframes, yawDatum, reason, extra = {}) {
  * an explicit sanity gate rejects any result that moves tilt materially.
  */
 export async function optimisePanoramaRotations({
-  keyframes, sources, yawDatum = 0, searchPx = 40, maxPairDegree = 6,
+  // maxPairDegree 10 rather than 6, matching the offline reference. Each extra
+  // partner is another set of correspondences tying a frame to the sphere, and
+  // the cost is linear in a stage that is now allowed to take its time.
+  keyframes, sources, yawDatum = 0, searchPx = 40, maxPairDegree = 10,
   pruneDeg = 0.8, tiltClampDeg = 1, onProgress = null, yieldFn = nextFrame,
   checkFocal = true
 }) {
@@ -112,15 +115,25 @@ export async function optimisePanoramaRotations({
   const features = new Array(n).fill(null);
   for (let i = 0; i < n; i++) {
     if (sources[i]) {
-      // 220 rather than the extractFeatures default of 160. The rotation solve
-      // is content with 160, but the focal check matches frames a whole lap
-      // apart, where only the features common to two capped sets survive.
-      // Measured on the reference capture: at 160 the fitted field of view came
-      // out anywhere between 50.6 and 52.5 degrees depending on which
-      // thresholds were used; at 220 and above every combination of settings
-      // agrees within about a degree, at 49.3 to 50.4. The density is not a
-      // nicety — below it the answer is whatever the thresholds happen to be.
-      try { features[i] = extractFeatures(sources[i], keyframes[i], { target: 220 }); }
+      /*
+       * 1200, not 220.
+       *
+       * The old value was chosen when this ran live on the glass and every
+       * millisecond came out of the operator's patience. It no longer does: the
+       * build is an explicit offline stage that pauses the camera, says so, and
+       * shows how long it has left. Compute here is nearly free and it is the
+       * one input the whole reconstruction is starved of.
+       *
+       * The measured gap is stark. The offline Python reference solves the same
+       * kind of capture from ~161,000 correspondences; the 2026-08-18 20:06
+       * build had 1,366 after pruning, from 220 features a frame. The rotation
+       * solve, the focal estimate and every warp downstream are all fitted to
+       * that handful. A separate sweep established that accuracy is flat from
+       * about 400 features upward and that the DETECTOR barely matters — so the
+       * useful move is not a cleverer descriptor, it is simply not throwing
+       * most of the frame away.
+       */
+      try { features[i] = extractFeatures(sources[i], keyframes[i], { target: 1200 }); }
       catch (_) { features[i] = null; }
     }
     if (i % 4 === 3) {
@@ -180,7 +193,10 @@ export async function optimisePanoramaRotations({
   await yieldFn();
 
   const solverOpts = {
-    iterations: 24,
+    // 60 rather than 24: Gauss-Newton on a few hundred frames is a small dense
+    // solve, and stopping it early to save time was a false economy once the
+    // build stopped pretending to be interactive.
+    iterations: 60,
     tiltStiffness: 50,
     yawStiffness: 0.5,
     huber: 0.01

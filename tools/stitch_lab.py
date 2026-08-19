@@ -26,6 +26,7 @@ plausible-looking lie. Rotation-only is both fewer unknowns and the truth.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import sys
@@ -696,6 +697,58 @@ def prune_outliers(frames, pairs, R, scale, keep_deg=0.8, min_matches=10, log=pr
     return kept
 
 
+def pair_components(frame_count, pairs):
+    """Connected components of the frame-pair graph, largest first."""
+    adjacency = [set() for _ in range(frame_count)]
+    for p in pairs:
+        adjacency[p.i].add(p.j)
+        adjacency[p.j].add(p.i)
+    unseen = set(range(frame_count))
+    components = []
+    while unseen:
+        start = unseen.pop()
+        stack = [start]
+        component = [start]
+        while stack:
+            i = stack.pop()
+            for j in adjacency[i]:
+                if j in unseen:
+                    unseen.remove(j)
+                    stack.append(j)
+                    component.append(j)
+        components.append(component)
+    return sorted(components, key=len, reverse=True)
+
+
+def report_components(frames, pairs, log=print):
+    components = pair_components(len(frames), pairs)
+    isolated = sum(len(component) == 1 for component in components)
+    largest = len(components[0]) if components else 0
+    log(f'  graph: {len(components)} components, largest {largest}/{len(frames)} frames, '
+        f'{isolated} isolated')
+    return components
+
+
+def altitude_bounds(frames, rotations, scale, padding=1.0):
+    """Altitude extent of every projected frame, including tilted corners."""
+    lows, highs = [], []
+    uv = np.array([[-1, -1], [-1, 1], [1, -1], [1, 1],
+                   [0, -1], [0, 1]], dtype=float)
+    for frame, rotation in zip(frames, rotations):
+        rays = np.stack([
+            uv[:, 0] * frame.tan_h * scale,
+            uv[:, 1] * frame.tan_v * scale,
+            -np.ones(len(uv)),
+        ], axis=1)
+        rays /= np.linalg.norm(rays, axis=1, keepdims=True)
+        world = rays @ rotation.T
+        altitude = np.degrees(np.arcsin(np.clip(world[:, 2], -1.0, 1.0)))
+        lows.append(float(altitude.min()))
+        highs.append(float(altitude.max()))
+    return (max(-89.0, math.floor(min(lows) - padding)),
+            min(89.0, math.ceil(max(highs) + padding)))
+
+
 def report(name, errs, log=print):
     log(f'  {name:34s} mean {errs.mean():6.3f}°  median {np.median(errs):6.3f}°  '
         f'p90 {np.percentile(errs, 90):6.3f}°  max {errs.max():6.2f}°  n={len(errs)}')
@@ -710,6 +763,8 @@ def main():
     ap.add_argument('--max-features', type=int, default=3000)
     ap.add_argument('--search-px', type=int, default=64,
                     help='half-width of the guided match window, in pixels')
+    ap.add_argument('--max-degree', type=int, default=24,
+                    help='maximum candidate neighbours per frame before verification')
     ap.add_argument('--brute', action='store_true',
                     help='disable guided matching; the control, not the method')
     ap.add_argument('--ratio', type=float, default=None,
@@ -719,6 +774,12 @@ def main():
                          'against a JavaScript implementation')
     ap.add_argument('--no-render', action='store_true',
                     help='skip the panoramas; for sweeps where only numbers matter')
+    ap.add_argument('--blend', choices=('seam', 'best', 'feather'), default='seam',
+                    help='seam handles parallax; best and feather are diagnostic controls')
+    ap.add_argument('--feather-power', type=float, default=8.0,
+                    help='higher values narrow feathering to a smaller seam zone')
+    ap.add_argument('--render-disconnected', action='store_true',
+                    help='also paint frames outside the largest solved match component')
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     # Hamming distances on 256-bit codes spread differently from L2 on 128
@@ -740,8 +801,10 @@ def main():
 
     print('Matching')
     pairs = match_pairs(frames, ratio=ratio, search_px=args.search_px,
+                        max_degree=args.max_degree,
                         guided=not args.brute)
     pairs = verify_pairs(frames, pairs)
+    report_components(frames, pairs)
 
     print('Starting point (sensor poses):')
     before = residual_degrees(frames, pairs)
@@ -760,6 +823,7 @@ def main():
 
     print('Pruning and re-solving')
     pairs = prune_outliers(frames, pairs, R, scale)
+    components = report_components(frames, pairs)
     R, scale = bundle_adjust(frames, pairs)
     final = residual_degrees(frames, pairs, R, scale)
     report('after prune + re-solve', final)
@@ -770,16 +834,65 @@ def main():
              for i in range(len(frames))]
     print(f'  frames moved from the sensors: median {np.median(moved):.2f}°  max {max(moved):.2f}°')
 
+    main_component = components[0] if components else []
+    excluded = sorted(set(range(len(frames))) - set(main_component))
+    if excluded:
+        excluded_text = ', '.join(
+            f'{frames[i].index}@{frames[i].altitude:.1f}°' for i in excluded)
+        print(f'  outside largest solved component: {excluded_text}')
+
+    # A disconnected frame cannot improve pose geometry, but one that extends
+    # the surveyed altitude may still be useful coverage. Keep only such frames
+    # at their sensor pose; overlapping disconnected frames are excluded because
+    # they are exactly what creates false ghosts.
+    main_lo, main_hi = altitude_bounds(
+        [frames[i] for i in main_component], [R[i] for i in main_component], scale)
+    sensor_fallback = []
+    for i in excluded:
+        lo, hi = altitude_bounds([frames[i]], [R[i]], scale)
+        if lo < main_lo - 2.0 or hi > main_hi + 2.0:
+            sensor_fallback.append(i)
+    if sensor_fallback:
+        print('  sensor-only unique coverage: ' + ', '.join(
+            f'{frames[i].index}@{frames[i].altitude:.1f}°' for i in sensor_fallback))
+
+    pair_count = len(pairs)
+    match_count = int(sum(len(p.pts_i) for p in pairs))
+    if not args.dump_json:
+        # Rendering needs the decoded photos, not tens of thousands of Python
+        # KeyPoint objects and descriptors. Reclaim them before allocating seam
+        # previews; this matters on the WebAssembly heap and mobile Safari.
+        pairs = []
+        for frame in frames:
+            frame.kp = []
+            frame.desc = None
+        gc.collect()
+
     stats = sensor_stats = None
     if not args.no_render:
         print('Rendering')
-        solved, stats, _ = render_equirect(frames, R, scale, px_per_deg=args.px_per_deg)
+        render_indices = (list(range(len(frames))) if args.render_disconnected
+                          else sorted(main_component + sensor_fallback))
+        if len(render_indices) != len(frames):
+            print(f'  using largest solved component: {len(render_indices)}/{len(frames)} frames')
+        render_frames = [frames[i] for i in render_indices]
+        render_rotations = [R[i] for i in render_indices]
+        solved, stats, _ = render_equirect(
+            render_frames, render_rotations, scale,
+            px_per_deg=args.px_per_deg, blend=args.blend,
+            feather_power=args.feather_power)
+        stats['renderedFrames'] = len(render_indices)
         cv2.imwrite(str(args.out / 'panorama-solved.png'), solved)
 
         # The same renderer on the untouched sensor poses, so the difference the
         # solve actually made is visible rather than asserted.
         sensor, sensor_stats, _ = render_equirect(
-            frames, [f.R for f in frames], 1.0, px_per_deg=args.px_per_deg, log=lambda *_: None)
+            render_frames, [f.R for f in render_frames], 1.0,
+            px_per_deg=args.px_per_deg,
+            alt_min=stats['altitudeMin'], alt_max=stats['altitudeMax'],
+            blend=args.blend,
+            feather_power=args.feather_power, log=lambda *_: None)
+        sensor_stats['renderedFrames'] = len(render_indices)
         cv2.imwrite(str(args.out / 'panorama-sensor.png'), sensor)
 
     if args.dump_json:
@@ -818,11 +931,12 @@ def main():
         'detector': args.detector,
         'maxFeatures': args.max_features,
         'matching': 'brute' if args.brute else f'guided-{args.search_px}px',
+        'maxDegree': args.max_degree,
         'ratio': ratio,
         'featuresPerFrame': int(np.median([len(f.kp) for f in frames])),
         'frames': len(frames),
-        'pairs': len(pairs),
-        'matches': int(sum(len(p.pts_i) for p in pairs)),
+        'pairs': pair_count,
+        'matches': match_count,
         'residualDeg': {
             'sensorMedian': float(np.median(before)), 'sensorMean': float(before.mean()),
             'solvedMedian': float(np.median(final)), 'solvedMean': float(final.mean()),
@@ -831,6 +945,13 @@ def main():
         'focalScale': float(scale),
         'lensDeg': {'horizontal': hf, 'vertical': vf},
         'framesMovedDeg': {'median': float(np.median(moved)), 'max': float(max(moved))},
+        'graph': {
+            'components': len(components),
+            'largestComponentFrames': len(components[0]) if components else 0,
+            'isolatedFrames': sum(len(component) == 1 for component in components),
+            'excludedFrameIndices': [int(frames[i].index) for i in excluded],
+            'sensorFallbackFrameIndices': [int(frames[i].index) for i in sensor_fallback],
+        },
         'render': stats,
         'renderFromSensorPoses': sensor_stats,
     }, indent=2), encoding='utf-8')
@@ -846,8 +967,8 @@ def main():
 # Rendering
 # --------------------------------------------------------------------------
 
-def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=-12.0, alt_max=62.0,
-                    feather=True, log=print):
+def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None,
+                    blend='best', feather_power=8.0, log=print):
     """
     Paint the sphere.
 
@@ -870,12 +991,21 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=-12.0, alt_max=62.
     agree. This function reports the disagreement it blended over so that the
     need for seam-cutting is a measurement rather than an opinion.
     """
+    auto_min, auto_max = altitude_bounds(frames, R, scale)
+    alt_min = auto_min if alt_min is None else alt_min
+    alt_max = auto_max if alt_max is None else alt_max
+    log(f'  output altitude {alt_min:.1f}°..{alt_max:.1f}°')
     width = int(round(360.0 * px_per_deg))
     height = int(round((alt_max - alt_min) * px_per_deg))
     accum = np.zeros((height, width, 3), np.float64)
     weight = np.zeros((height, width), np.float64)
     disagreement = np.zeros((height, width), np.float64)
     painted_by = np.zeros((height, width), np.int16)
+
+    seam_masks = seam_gains = None
+    if blend == 'seam':
+        seam_masks, seam_gains = find_seam_masks(
+            frames, R, scale, alt_min=alt_min, alt_max=alt_max, log=log)
 
     az_axis = (np.arange(width) + 0.5) / px_per_deg
     alt_axis = alt_max - (np.arange(height) + 0.5) / px_per_deg
@@ -924,19 +1054,46 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=-12.0, alt_max=62.
         y = ((1 - v) / 2 * ih - 0.5).astype(np.float32)
         sampled = cv2.remap(img, x, y, cv2.INTER_LINEAR,
                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        sub = (slice(row0, row1), cols)
 
-        if feather:
+        if blend == 'seam':
+            sampled = np.clip(sampled.astype(np.float64) * seam_gains[n],
+                              0, 255).astype(np.uint8)
+            # The seam is solved cheaply on a low-resolution copy of the
+            # sphere, then enlarged with a narrow interpolation band. Almost
+            # every output pixel therefore comes from one photograph; only
+            # the immediate seam is blended to hide an exposure step.
+            seam = cv2.resize(seam_masks[n], (width, height),
+                              interpolation=cv2.INTER_LINEAR)
+            seam_w = seam[sub].astype(np.float64) / 255.0
+            feather_w = np.clip((1 - np.abs(u)) * (1 - np.abs(v)), 0, 1) ** 2
+
+            # Geometry below the recorded skyline gets a seam so a roof or
+            # window comes from one photograph. Sky gets broad feathering,
+            # which removes exposure tiles without smearing rigid structures.
+            if f.boundary is not None and len(f.boundary):
+                bx = ((x + 0.5) / iw * len(f.boundary) - 0.5).reshape(-1)
+                boundary = np.interp(
+                    bx, np.arange(len(f.boundary)), f.boundary).reshape(x.shape)
+                boundary_y = boundary * (ih / 288.0)
+                sky = np.clip((boundary_y - y + 4.0) / 8.0, 0.0, 1.0)
+                w = seam_w * (1.0 - sky) + feather_w * sky
+            else:
+                w = seam_w
+        elif blend == 'feather':
             # Zero at the frame edge, one on the axis. Squared so the centre
             # wins decisively rather than merely narrowly.
-            w = np.clip((1 - np.abs(u)) * (1 - np.abs(v)), 0, 1) ** 2
+            w = np.clip((1 - np.abs(u)) * (1 - np.abs(v)), 0, 1) ** feather_power
         else:
             w = np.ones_like(u)
         w = np.where(ok, w, 0.0)
 
-        sub = (slice(row0, row1), cols)
         prev_w = weight[sub]
-        prev = np.divide(accum[sub], np.maximum(prev_w, 1e-9)[..., None],
-                         out=np.zeros_like(accum[sub]), where=prev_w[..., None] > 1e-9)
+        if blend in ('seam', 'feather'):
+            prev = np.divide(accum[sub], np.maximum(prev_w, 1e-9)[..., None],
+                             out=np.zeros_like(accum[sub]), where=prev_w[..., None] > 1e-9)
+        else:
+            prev = accum[sub]
         overlap = (prev_w > 1e-6) & (w > 1e-6)
         if overlap.any():
             diff = np.abs(prev - sampled.astype(np.float64)).mean(axis=-1)
@@ -944,17 +1101,26 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=-12.0, alt_max=62.
                                          np.maximum(disagreement[sub], diff),
                                          disagreement[sub])
 
-        accum[sub] += sampled.astype(np.float64) * w[..., None]
-        weight[sub] += w
+        if blend in ('seam', 'feather'):
+            accum[sub] += sampled.astype(np.float64) * w[..., None]
+            weight[sub] += w
+        else:
+            take = w > prev_w
+            accum[sub] = np.where(take[..., None], sampled, accum[sub])
+            weight[sub] = np.maximum(prev_w, w)
         painted_by[sub] = np.where(w > 1e-6, painted_by[sub] + 1, painted_by[sub])
 
     out = np.zeros((height, width, 3), np.uint8)
     filled = weight > 1e-6
-    out[filled] = np.clip(accum[filled] / weight[filled][..., None], 0, 255).astype(np.uint8)
+    if blend in ('seam', 'feather'):
+        out[filled] = np.clip(accum[filled] / weight[filled][..., None], 0, 255).astype(np.uint8)
+    else:
+        out[filled] = np.clip(accum[filled], 0, 255).astype(np.uint8)
 
     overlapped = painted_by >= 2
     stats = {
         'width': width, 'height': height,
+        'altitudeMin': float(alt_min), 'altitudeMax': float(alt_max),
         'paintedFraction': float(filled.mean()),
         'overlapFraction': float(overlapped.mean()),
         'meanOverlapDisagreement': float(disagreement[overlapped].mean()) if overlapped.any() else 0.0,
@@ -965,6 +1131,63 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=-12.0, alt_max=62.
     log(f'  overlap disagreement: mean {stats["meanOverlapDisagreement"]:.1f} '
         f'p95 {stats["p95OverlapDisagreement"]:.1f} (0-255 per channel)')
     return out, stats, filled
+
+
+def find_seam_masks(frames, R, scale, alt_min=-12.0, alt_max=62.0,
+                    seam_px_per_deg=1.0, log=print):
+    """Choose low-disagreement ownership regions before the full render."""
+    width = int(round(360.0 * seam_px_per_deg))
+    height = int(round((alt_max - alt_min) * seam_px_per_deg))
+    az = np.radians((np.arange(width) + 0.5) / seam_px_per_deg)[None, :]
+    alt = np.radians(alt_max - (np.arange(height) + 0.5) / seam_px_per_deg)[:, None]
+    ca = np.cos(alt)
+    world = np.stack([
+        np.broadcast_to(np.sin(az) * ca, (height, width)),
+        np.broadcast_to(np.cos(az) * ca, (height, width)),
+        np.broadcast_to(np.sin(alt) * np.ones_like(az), (height, width)),
+    ], axis=-1)
+
+    images = []
+    masks = []
+    for n, frame in enumerate(frames):
+        ih, iw = frame.image.shape[:2]
+        cam = world @ R[n]
+        depth = -cam[..., 2]
+        ok = depth > 1e-6
+        safe = np.where(ok, depth, 1.0)
+        u = cam[..., 0] / safe / (frame.tan_h * scale)
+        v = cam[..., 1] / safe / (frame.tan_v * scale)
+        ok &= (np.abs(u) <= 1) & (np.abs(v) <= 1)
+        x = ((u + 1) / 2 * iw - 0.5).astype(np.float32)
+        y = ((1 - v) / 2 * ih - 0.5).astype(np.float32)
+        warped = cv2.remap(frame.image, x, y, cv2.INTER_LINEAR,
+                           borderMode=cv2.BORDER_CONSTANT)
+        mask = (ok.astype(np.uint8) * 255)
+        warped[~ok] = 0
+        images.append(warped)
+        masks.append(mask)
+
+    corners = [(0, 0)] * len(images)
+    compensator = cv2.detail_ExposureCompensator.createDefault(
+        cv2.detail.ExposureCompensator_GAIN)
+    compensator.feed(corners, images, masks)
+    gains = compensator.getMatGains()
+    scalar_gains = []
+    for n in range(len(images)):
+        gain = float(np.asarray(gains[n]).reshape(-1)[0])
+        scalar_gains.append(gain)
+        compensator.apply(n, corners[n], images[n], masks[n])
+
+    log(f'  finding seams at {width} x {height}; exposure gains '
+        f'{min(scalar_gains):.3f}..{max(scalar_gains):.3f}')
+    finder = cv2.detail_DpSeamFinder('COLOR_GRAD')
+    seam_images = [image.astype(np.float32) for image in images]
+    found = finder.find(seam_images, corners, masks)
+    if found is not None:
+        masks = list(found)
+    masks = [np.asarray(mask.get() if hasattr(mask, 'get') else mask, dtype=np.uint8)
+             for mask in masks]
+    return masks, scalar_gains
 
 
 if __name__ == '__main__':
