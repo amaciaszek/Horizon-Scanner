@@ -16,7 +16,32 @@ export const RULES = {
   maxSpreadDeg: 1.5,      // MAD of altitude observations within a bin
   minConfidence: 0.42,    // mean segmentation confidence
   maxLoopErrorDeg: 2.0,
-  maxSpikeDeg: 5.0        // departure from the local median that marks a bin as a spike
+  maxSpikeDeg: 5.0,       // departure from the local median that marks a bin as a spike
+
+  /* ------------------------------------------------ the single-lap route
+   *
+   * A second lap was required because two passes are the obvious way to get
+   * independent evidence for a bin. It is not the only way, and it is not free.
+   *
+   * Measured on the 2026-08-18 iPad capture: between two frames in the SAME lap
+   * the disagreement no rotation can explain is 0.084° median, 0.185° at the
+   * 90th percentile. Between two frames in DIFFERENT laps it is 0.203° and
+   * 1.215° — 2.4x and 6.6x worse, growing with the time between them. The cause
+   * is the operator's own position: a lap later they stand a few centimetres
+   * elsewhere, and against a house twelve metres away that is real parallax,
+   * which a camera model made of rotations cannot represent and a blender can
+   * only average. That average is a doubled window.
+   *
+   * So a second lap buys confirmation and sells geometry. This route lets a bin
+   * earn VERIFIED inside one lap instead, by holding it to a HARDER standard on
+   * the evidence that lap actually produced: twice the observations, a tighter
+   * spread, and a higher confidence floor. It is not a relaxation — a bin that
+   * takes this route has more independent looks at the horizon than a
+   * two-pass bin needs, just gathered without the operator moving.
+   */
+  singleLapObservations: 8,
+  singleLapSpreadScale: 0.7,   // of the usual per-bin spread allowance
+  singleLapConfidence: 0.55
 };
 
 export class Survey {
@@ -283,14 +308,39 @@ export class Survey {
     return RULES.maxSpreadDeg + 1.4 * (b.slope || 0);
   }
 
+  /**
+   * Can this bin stand on one lap alone?
+   *
+   * Recorded on the bin rather than recomputed by callers, because the coverage
+   * table, the report and the guidance all need to say WHICH route a bin took
+   * and an operator deciding whether to walk again deserves a straight answer.
+   */
+  _singleLapVerified(b) {
+    return b.obs.length >= RULES.singleLapObservations
+      && b.spread <= this.spreadLimit(b) * RULES.singleLapSpreadScale
+      && b.conf >= RULES.singleLapConfidence;
+  }
+
   _grade(b) {
+    b.route = null;
     if (!b.obs.length) return STATUS.EMPTY;
     if (b.obs.length < 2) return STATUS.THIN;
-    const ok = b.obs.length >= RULES.minObservations
+
+    const spreadOk = b.spread <= this.spreadLimit(b);
+    const twoPass = b.obs.length >= RULES.minObservations
       && b.passes.size >= RULES.minPasses
-      && b.spread <= this.spreadLimit(b)
+      && spreadOk
       && b.conf >= RULES.minConfidence;
-    return ok ? STATUS.VERIFIED : STATUS.WEAK;
+    if (twoPass) { b.route = 'two-pass'; return STATUS.VERIFIED; }
+
+    // Only offer the single-lap route to a bin that has genuinely only had one
+    // lap. A bin seen twice and still disagreeing has been contradicted, and
+    // dense sampling within one of those laps is not an answer to that.
+    if (b.passes.size <= 1 && this._singleLapVerified(b)) {
+      b.route = 'single-lap';
+      return STATUS.VERIFIED;
+    }
+    return STATUS.WEAK;
   }
 
   /**
@@ -391,7 +441,19 @@ export class Survey {
     const checks = [
       { name: 'Full 360° observed', pass: c.observedBins === BIN_COUNT, detail: `${c.coverageDeg.toFixed(1)}° of 360.0°` },
       { name: 'Every bin verified', pass: c.verifiedBins === BIN_COUNT, detail: `${c.verifiedBins} / ${BIN_COUNT}` },
-      { name: 'Two passes per bin', pass: this.bins.every(b => b.passes.size >= RULES.minPasses), detail: `min ${Math.min(...this.bins.map(b => b.passes.size))} passes` },
+      // Independent evidence, not a second physical lap. A bin that gathered
+      // enough tight, confident looks inside one lap satisfies this without the
+      // operator moving — which is the point, because moving is what introduces
+      // the parallax the stitcher then has to average away.
+      { name: 'Independent evidence per bin',
+        pass: this.bins.every(b => !b.obs.length
+          || b.passes.size >= RULES.minPasses || this._singleLapVerified(b)),
+        detail: (() => {
+          const single = this.bins.filter(b => b.route === 'single-lap').length;
+          const two = this.bins.filter(b => b.route === 'two-pass').length;
+          const short = this.bins.filter(b => b.obs.length && !b.route).length;
+          return `${two} bin(s) on two passes, ${single} on a single lap, ${short} still short`;
+        })() },
       // Judged on the ninetieth percentile rather than on the single worst bin.
       // Every bin still has to be within limit for a clean pass, but a survey
       // whose only offenders are a handful of bins at the vertical edge of a
@@ -408,11 +470,12 @@ export class Survey {
     const passed = checks.filter(c2 => c2.pass).length;
 
     // A finished single lap is a real result and must not be graded the same as
-    // a scan that fell apart. Two of these checks — every bin verified, and two
-    // passes per bin — cannot pass until a second pass has been walked, so
-    // grading a complete first lap INSUFFICIENT tells the operator their work
-    // was worthless when in fact it is usable and merely unconfirmed.
-    const singlePassChecks = ['Every bin verified', 'Two passes per bin'];
+    // a scan that fell apart. Both of these checks are now REACHABLE in one lap
+    // — a bin that gathered enough tight looks verifies without a second pass —
+    // but a lap that merely swept quickly will still miss them, and grading that
+    // INSUFFICIENT would tell the operator their work was worthless when it is
+    // usable and merely unconfirmed.
+    const singlePassChecks = ['Every bin verified', 'Independent evidence per bin'];
     const structural = checks.filter(c2 => !singlePassChecks.includes(c2.name));
     const structuralPassed = structural.filter(c2 => c2.pass).length;
     const fullCircle = c.observedBins === BIN_COUNT;
@@ -426,8 +489,17 @@ export class Survey {
     return {
       checks, grade, passed, total: checks.length, coverage: c, weak,
       singlePass: fullCircle && structuralPassed === structural.length,
+      routes: {
+        twoPass: this.bins.filter(b => b.route === 'two-pass').length,
+        singleLap: this.bins.filter(b => b.route === 'single-lap').length,
+        unverified: this.bins.filter(b => b.obs.length && !b.route).length,
+        empty: this.bins.filter(b => !b.obs.length).length
+      },
       note: grade === 'PROVISIONAL'
-        ? 'One complete lap, every structural check passed. Usable now; walk a second lap to confirm it and reach VERIFIED.'
+        ? 'One complete lap, every structural check passed. The bins that are still '
+          + 'short need more looks, not another lap — slow down over them and let the '
+          + 'observation count build. A second lap confirms from a different standing '
+          + 'position, which costs the panorama some sharpness against nearby objects.'
         : null
     };
   }

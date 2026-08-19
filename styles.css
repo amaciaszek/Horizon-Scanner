@@ -438,3 +438,68 @@ details[open] > *:not(summary) { margin-top: 14px; }
 .build-progress-label #buildEta { color: var(--signal); white-space: nowrap; }
 .build-progress .directive-bar { margin-top: 4px; }
 #buildNote { margin-top: 6px; }
+
+/* ------------------------------------------------------------- stitch verdict
+   The panorama's headline. Deliberately one grade word and one plain sentence:
+   the operator reads this standing outside and either walks again or does not.
+   The numbers under it are for the person who wants to argue with the grade. */
+.verdict {
+  margin: 12px 0 4px; padding: 12px 14px;
+  background: var(--panel-2); border: 1px solid var(--rule); border-radius: 10px;
+}
+.verdict-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.verdict-grade {
+  font: 700 0.82rem/1 var(--mono); letter-spacing: .12em;
+  padding: 5px 10px; border-radius: 7px;
+  background: var(--signal-dim); color: var(--signal);
+}
+.verdict-grade[data-grade="SOFT"]    { background: #3a2e11; color: var(--amber); }
+.verdict-grade[data-grade="GHOSTED"] { background: #3d1d16; color: var(--coral); }
+.verdict-plain { color: var(--ink-2); font-size: 0.86rem; }
+.verdict .stats { margin-top: 10px; }
+
+/* ------------------------------------------------------------ data tables
+   Horizontally scrollable on their own so a wide table never makes the whole
+   page scroll sideways — on a phone that reads as a broken layout. */
+.table-title {
+  margin: 18px 0 8px; font: 600 0.78rem/1 var(--mono);
+  letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3);
+}
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.data-table {
+  width: 100%; border-collapse: collapse;
+  font: 0.76rem/1.5 var(--mono); font-variant-numeric: tabular-nums;
+}
+.data-table th {
+  text-align: left; padding: 6px 9px; white-space: nowrap;
+  color: var(--ink-3); font-weight: 600; border-bottom: 1px solid var(--rule-2);
+  position: sticky; top: 0; background: var(--panel);
+}
+.data-table td {
+  padding: 5px 9px; white-space: nowrap;
+  border-bottom: 1px solid var(--rule); color: var(--ink-2);
+}
+.data-table tbody tr:hover td { background: var(--panel-2); }
+.data-table td.num { text-align: right; }
+.data-table td.wide { white-space: normal; min-width: 15ch; color: var(--ink-3); }
+.data-table .lm-empty td { text-align: center; color: var(--ink-3); font-family: var(--sans); }
+.data-table .ok    { color: var(--signal); }
+.data-table .warn  { color: var(--amber); }
+.data-table .bad   { color: var(--coral); }
+.data-table .muted { color: var(--ink-3); }
+.data-table tr.row-bad  td:first-child { box-shadow: inset 2px 0 0 var(--coral); }
+.data-table tr.row-warn td:first-child { box-shadow: inset 2px 0 0 var(--amber); }
+
+/* Route summary. How the survey earned what it earned, in one line of chips. */
+.route-summary { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0 4px; }
+.route-chip {
+  font: 0.72rem/1 var(--mono); padding: 6px 10px; border-radius: 7px;
+  background: var(--panel-2); border: 1px solid var(--rule); color: var(--ink-2);
+}
+.route-chip b { color: var(--ink); font-weight: 700; }
+.route-chip.good b { color: var(--signal); }
+.route-chip.warn b { color: var(--amber); }
+.route-chip.bad  b { color: var(--coral); }
+
+.stitch-log-wrap { margin-top: 12px; }
+.stitch-log-wrap #stitchLog { max-height: 320px; overflow: auto; }

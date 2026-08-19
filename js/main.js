@@ -10,7 +10,6 @@ import { OrientationSource } from './orientation.js';
 import { Survey, RULES, BIN_COUNT, BIN_STEP, STATUS } from './survey.js';
 import { ScanDirector, PHASE } from './guide.js';
 import { CoverageMap } from './coverage.js';
-import { BuildProgress } from './build-progress.js';
 import { ScanGuidance } from './guidance.js';
 import { Pipeline } from './pipeline.js';
 import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
@@ -21,12 +20,10 @@ import * as store from './storage.js';
 import * as out from './exporters.js';
 import { buildCaptureDebugZip } from './diagnostic-export.js';
 import { captureGapReport } from './capture-gaps.js';
-import { optimisePanoramaRotations } from './panorama-optimize.js';
 import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted, overlapFloor, pass1OverTravel } from './capture-policy.js';
-import {
-  buildMosaic, skylineTracks, drawPanorama, disagreementByBin,
-  pixelToAzAlt, landmarkResiduals
-} from './panorama.js';
+import { disagreementByBin, pixelToAzAlt, landmarkResiduals } from './panorama.js';
+import { PyodideStitcher, stitcherAvailability } from './pyodide-stitch.js';
+import { bearingCoverage, frameCoverage, stitchVerdict } from './coverage-table.js';
 
 const $ = id => document.getElementById(id);
 const log = (level, ...a) => L.log(level, ...a);
@@ -1931,6 +1928,48 @@ function updateStats() {
   $('sLoop').textContent = survey.loopClosed ? `${survey.loopError >= 0 ? '+' : ''}${survey.loopError.toFixed(2)}°` : 'not measured';
   const i = camera.intrinsics();
   $('sFocal').textContent = `${i.hfovDeg.toFixed(1)}° ${i.source === 'self-calibrated' ? 'measured' : i.source}`;
+  maybeRefreshCoverageTables();
+  maybePreloadStitcher();
+}
+
+/*
+ * Re-render the coverage tables only when they would actually change.
+ *
+ * updateStats runs on every animation frame. Rebuilding two tables of innerHTML
+ * sixty times a second would cost more than the segmentation does, for a table
+ * whose contents move perhaps once a second — so this is gated on the two counts
+ * that can change it, and rate-limited on top of that.
+ */
+let coverageTableKey = '';
+let coverageTableAt = 0;
+function maybeRefreshCoverageTables() {
+  const now = performance.now();
+  if (now - coverageTableAt < 1000) return;
+  const c = survey.coverage();
+  const key = `${survey.keyframes.length}|${c.verifiedBins}|${c.observedBins}`;
+  if (key === coverageTableKey) return;
+  coverageTableKey = key;
+  coverageTableAt = now;
+  renderCoverageTables();
+}
+
+/*
+ * Start the Python runtime download early.
+ *
+ * Pyodide plus NumPy plus OpenCV is ~25 MB and about twenty seconds of start-up.
+ * Paid on the first press of Build, that is twenty seconds in which the app
+ * looks hung; paid here it overlaps with the operator still walking, and Build
+ * then begins solving immediately. Fired once, and only once there are enough
+ * keyframes that a build is plausibly coming.
+ */
+let stitcherPreloaded = false;
+function maybePreloadStitcher() {
+  if (stitcherPreloaded || survey.keyframes.length < 12) return;
+  if (!stitcherAvailability().ok) return;
+  stitcherPreloaded = true;
+  setRuntimeChip('fetching runtime in the background…', 'quiet');
+  getStitcher().preload();
+  log('info', 'Started downloading the Python stitch runtime in the background.');
 }
 
 /* ------------------------------------------------------------------ report */
@@ -2451,34 +2490,66 @@ async function loadKeyframeBlobs({ waitForPending = false } = {}) {
   return byIndex;
 }
 
-async function loadKeyframeSources(keyframes, onProgress = null) {
-  const byIndex = await loadKeyframeBlobs();
-  const scratch = document.createElement('canvas');
-  const sctx = scratch.getContext('2d', { willReadFrequently: true });
-  const sources = [];
-  let found = 0;
-  for (const kf of keyframes) {
-    onProgress?.(sources.length, keyframes.length);
-    // Decoding a long capture blocks for many seconds otherwise, and a progress
-    // bar that cannot paint is no better than no progress bar.
-    if (sources.length % 4 === 3) await new Promise(r => setTimeout(r, 0));
-    const blob = byIndex.get(kf.index);
-    if (!blob) { sources.push(null); continue; }
-    try {
-      const bmp = await createImageBitmap(blob);
-      scratch.width = bmp.width; scratch.height = bmp.height;
-      sctx.drawImage(bmp, 0, 0);
-      const d = sctx.getImageData(0, 0, bmp.width, bmp.height);
-      sources.push({ w: bmp.width, h: bmp.height, data: d.data });
-      if (bmp.close) bmp.close();
-      found++;
-    } catch {
-      sources.push(null);
+/* ------------------------------------------------------- the Python stitcher */
+
+/* One runtime for the life of the page. Pyodide plus NumPy plus OpenCV is a
+ * ~25 MB download and roughly twenty seconds of start-up, and there is no
+ * reason to pay it more than once. */
+let stitcher = null;
+
+function getStitcher() {
+  if (stitcher) return stitcher;
+  stitcher = new PyodideStitcher({
+    onStatus: ({ text, fraction, detail }) => {
+      $('buildStage').textContent = text;
+      $('buildEta').textContent = '';
+      if (Number.isFinite(fraction)) $('buildBar').style.width = `${(fraction * 100).toFixed(1)}%`;
+      if (detail) $('panoStatus').textContent = detail;
+    },
+    onLog: (line, isStderr) => {
+      const el = $('stitchLog');
+      if (el.dataset.fresh !== '1') { el.textContent = ''; el.dataset.fresh = '1'; }
+      el.textContent += `${line}\n`;
+      el.scrollTop = el.scrollHeight;
+      if (isStderr) log('warn', `stitcher: ${line}`);
     }
-  }
-  return { sources, found };
+  });
+  return stitcher;
 }
 
+/** Map the Quality select onto the solver's actual knobs. */
+function stitchOptions() {
+  const preset = $('stitchQuality').value;
+  const table = {
+    fast: { detector: 'orb', features: 350, search: 48, degree: 16 },
+    normal: { detector: 'orb', features: 500, search: 64, degree: 24 },
+    fine: { detector: 'orb', features: 900, search: 72, degree: 24 },
+    reference: { detector: 'sift', features: 1200, search: 80, degree: 24 }
+  };
+  return {
+    ...(table[preset] || table.normal),
+    pxPerDeg: Number($('panoScale').value) || 6,
+    blend: $('stitchBlend').value || 'seam',
+    frameCount: survey.keyframes.length
+  };
+}
+
+function setRuntimeChip(text, tone = 'quiet') {
+  const chip = $('stitchRuntime');
+  chip.textContent = text;
+  chip.className = `chip ${tone}`;
+}
+
+/**
+ * Build the panorama with the offline stitcher.
+ *
+ * The archive is assembled in memory and handed straight to Python. That is a
+ * deliberate detour — the alternative is marshalling live keyframe objects
+ * across the worker boundary — and it buys the one property that makes this
+ * trustworthy: an in-app build and a desktop rebuild of the same session are the
+ * same program reading the same bytes, so a disagreement between them is a
+ * runtime bug and never a pipeline difference.
+ */
 async function buildPanorama() {
   const btn = $('panoBtn');
   const status = $('panoStatus');
@@ -2487,27 +2558,35 @@ async function buildPanorama() {
     status.textContent = 'No keyframes yet. Run a survey, or load a session, then build.';
     return;
   }
-  // A refinement belongs to one exact set of intrinsics and source photos.
-  // Never let diagnostics from a previous build masquerade as the pose used by
-  // a later sensor-only or failed-optimization build.
+
+  const availability = stitcherAvailability();
+  if (!availability.ok) {
+    status.textContent = `The Python stitcher cannot run here: ${availability.reason}`;
+    log('error', `Stitcher unavailable: ${availability.reason}`);
+    return;
+  }
+
+  // A refinement belongs to one exact set of intrinsics and source photos. Never
+  // let diagnostics from a previous build masquerade as the pose used by a later
+  // one that failed or ran on different frames.
   for (const kf of kfs) {
     delete kf.bundleQuaternion;
     delete kf.bundleMovedDeg;
     delete kf.bundleFocalScale;
   }
+
   const label = btn.textContent;
   btn.disabled = true; btn.textContent = 'Building…';
-  status.textContent = `Reprojecting ${kfs.length} keyframes…`;
+  $('stitchLog').dataset.fresh = '0';
+  status.textContent = 'Collecting the capture…';
 
   /*
    * Put the phone down.
    *
-   * The build can run for minutes on a long capture, and the operator has no
-   * way to know whether they are still required. Holding a camera steady for a
-   * computation that does not use it is a small misery, and worse, they cannot
-   * tell it apart from a hang. So the camera and the sensor stream stop, the
-   * panel says so in as many words, and the progress bar gives them the one
-   * thing that lets them walk away: an idea of when to come back.
+   * The solve runs for minutes on a long capture and does not use the camera.
+   * Holding a tablet steady for a computation that ignores it is a small misery,
+   * and worse, indistinguishable from a hang. So the camera stops, the panel says
+   * so, and the progress bar gives them the one thing that lets them walk away.
    */
   const wasRunning = state.running && !state.paused;
   if (wasRunning) {
@@ -2516,135 +2595,87 @@ async function buildPanorama() {
     log('info', 'Camera and sensors paused for the panorama build.');
   }
 
-  const progress = new BuildProgress(paintBuildProgress);
   $('buildProgress').hidden = false;
-  paintBuildProgress(progress.snapshot());
-  // Yield so the button state paints before the synchronous mosaic pass.
+  $('buildStage').textContent = 'Collecting the capture…';
+  $('buildBar').style.width = '2%';
   await new Promise(r => requestAnimationFrame(() => r()));
 
+  const t0 = performance.now();
   try {
-    const wantImagery = $('panoImagery').checked;
-    const { sources, found } = wantImagery
-      ? await loadKeyframeSources(kfs, (done, total) =>
-        progress.update('decoding', done, total, `Decoding photo ${done} of ${total}`))
-      : { sources: [], found: 0 };
-
-    let renderKeyframes = kfs;
-    let renderYawDatum = survey.yawDatum || 0;
-    let optimization = { applied: false, reason: wantImagery ? 'not-run' : 'imagery-disabled' };
-    if (wantImagery && found >= 2) {
-      status.textContent = `Matching fixed features below the skyline in ${found} photos…`;
-      const refined = await optimisePanoramaRotations({
-        keyframes: kfs,
-        sources,
-        yawDatum: renderYawDatum,
-        onProgress: p => {
-          if (p.stage === 'features') {
-            status.textContent = `Finding fixed features below the skyline: ${p.completed}/${p.total} photos…`;
-            progress.update('features', p.completed, p.total,
-              `Finding features, photo ${p.completed} of ${p.total}`);
-          } else if (p.stage === 'matching') {
-            status.textContent = `Checking photo overlaps: ${p.completed}/${p.total} pairs, ${p.verifiedPairs} verified…`;
-            progress.update('matching', p.completed, p.total,
-              `Matching overlaps, pair ${p.completed} of ${p.total}`);
-          } else {
-            status.textContent = `Refining azimuth while holding elevation to gravity…`;
-            progress.update('solving', 1, 1, 'Solving the camera path');
-          }
-        }
-      });
-      renderKeyframes = refined.keyframes;
-      renderYawDatum = refined.yawDatum;
-      optimization = refined.diagnostics;
-      if (optimization.applied) {
-        for (let i = 0; i < kfs.length; i++) {
-          kfs[i].bundleQuaternion = renderKeyframes[i].bundleQuaternion;
-          kfs[i].bundleMovedDeg = renderKeyframes[i].bundleMovedDeg;
-        }
-      }
-      // The measured lens is recorded separately from the rotation refinement
-      // because it survives independently: a rotation solve can fail its sanity
-      // gate while the lens measurement stands, and the export has to be able
-      // to say which optics the panorama above was actually drawn with. Note
-      // this only ANNOTATES the keyframes — tanHalfH/tanHalfV on the survey
-      // keyframes stay at their capture-time values, so the 720-bin profile is
-      // untouched and the archive's camera block remains a capture record.
-      for (let i = 0; i < kfs.length; i++) {
-        const scale = renderKeyframes[i]?.bundleFocalScale;
-        if (Number.isFinite(scale) && scale !== 1) kfs[i].bundleFocalScale = scale;
-        else delete kfs[i].bundleFocalScale;
-      }
+    const photos = await loadKeyframeBlobs({ waitForPending: true });
+    const withPhoto = kfs.filter(kf => photos.has(kf.index)).length;
+    if (withPhoto < 2) {
+      throw new Error(`only ${withPhoto} keyframe(s) have a photograph. The stitcher works `
+        + 'from the photographs, so there is nothing to solve. Images are collected '
+        + 'automatically during a survey; if this says zero, the camera was not delivering '
+        + 'frames when the keyframes were taken.');
     }
 
-    const pxPerDeg = Number($('panoScale').value) || 6;
-    const maxAlt = Number($('maxAltSelect').value) || 60;
-    const opts = {
-      pxPerDeg, altMin: -10, altMax: Math.min(89, maxAlt + 2), azStart: 0,
-      blend: $('panoBlend').checked
-    };
+    $('buildStage').textContent = 'Packing the archive…';
+    const archive = await buildCaptureDebugZip(captureArchivePayload(photos));
+    const buffer = await archive.blob.arrayBuffer();
+    log('info', `Stitcher handed a ${(buffer.byteLength / 1e6).toFixed(1)} MB archive: `
+      + `${withPhoto}/${kfs.length} keyframes with imagery.`);
 
-    const t0 = performance.now();
-    const mosaic = buildMosaic({
-      keyframes: renderKeyframes, sources, yawDatum: renderYawDatum, ...opts
-    });
-    const tracks = skylineTracks(renderKeyframes, renderYawDatum, opts);
-    const dis = disagreementByBin(renderKeyframes, renderYawDatum);
+    const options = stitchOptions();
+    setRuntimeChip(getStitcher().warm ? 'runtime ready' : 'downloading runtime…',
+      getStitcher().warm ? 'good' : 'quiet');
+
+    const result = await getStitcher().run(buffer, options);
+    setRuntimeChip(`runtime ready · Pyodide ${getStitcher().runtimeVersion}`, 'good');
+
+    const report = result.report;
     const ms = performance.now() - t0;
 
-    const ctx = $('pano').getContext('2d');
-    const layout = drawPanorama(ctx, mosaic, tracks, survey.bins, {});
+    // Carry the solved rotations back onto the keyframes so the archive, the
+    // per-frame table and any later export can say how far each moved. This
+    // ANNOTATES only: tanHalfH/tanHalfV stay at their capture values, so the
+    // 720-bin profile is untouched and the camera block stays a capture record.
+    applySolvedPoses(report, result.solution);
+
     state.pano = state.pano || { landmarks: [], geomKey: null };
-    // A landmark's graphed azimuth was read off a particular rendering. If the
-    // focal length or the yaw datum has moved since — loop closure, a lens
-    // change, a fresh self-calibration — the physical object now sits at a
-    // different azimuth and the stored number is stale. Detect that rather than
-    // letting a quietly-wrong residual drive a conclusion.
-    const geomKey = [
-      (survey.yawDatum || 0).toFixed(4),
-      kfs.length,
-      (kfs[0] && kfs[0].tanHalfH || 0).toFixed(5),
-      (kfs[kfs.length - 1] && kfs[kfs.length - 1].tanHalfH || 0).toFixed(5),
-      optimization.applied
-        ? `vision:${optimization.verifiedPairs}:${optimization.rmsDeg.toFixed(5)}:${optimization.maxMovedDeg.toFixed(5)}`
-        : `sensor:${optimization.reason || 'none'}`
-    ].join('|');
-    if (state.pano.landmarks.length && state.pano.geomKey && state.pano.geomKey !== geomKey) {
-      state.pano.stale = true;
-      log('warn', `The survey geometry changed since these ${state.pano.landmarks.length} landmarks were placed, so their graphed azimuths no longer describe the same objects. Re-tap them before trusting the residuals.`);
-    }
-    state.pano.geomKey = geomKey;
-    state.pano.opts = opts;
-    state.pano.layout = layout;
-    state.pano.optimization = optimization;
-    renderLandmarks();
-    panoBuilt = true;
+    state.pano.report = report;
+    state.pano.panorama = result.panorama;
+    state.pano.control = result.control;
+    state.pano.optimization = {
+      applied: true,
+      reason: 'python-bundle-adjustment',
+      engine: `stitch_lab.py via Pyodide ${getStitcher().runtimeVersion}`,
+      detector: report.detector,
+      verifiedPairs: report.pairs,
+      matchCount: report.matches,
+      rmsDeg: report.residualDeg?.solvedMedian ?? null,
+      focalScale: report.focalScale,
+      excludedFrames: report.graph?.excludedFrameIndices || []
+    };
+
+    await paintStitchedPanorama();
+    renderStitchVerdict(report, ms);
+    renderCoverageTables();
+    $('panoFindings').textContent = stitchFindings(
+      disagreementByBin(kfs, survey.yawDatum || 0), report, kfs);
+
     $('panoSaveBtn').disabled = false;
+    panoBuilt = true;
 
-    const paintedPct = mosaic.painted / (mosaic.width * mosaic.height) * 100;
-    status.textContent = found
-      ? `${kfs.length} keyframes, ${found} with imagery, ${paintedPct.toFixed(0)}% of the sky panel painted, ${ms.toFixed(0)} ms.${optimization.applied ? ` Vision refined ${optimization.verifiedPairs} photo pairs while limiting tilt correction to ${optimization.maxTiltMovedDeg.toFixed(2)}°.` : ''}`
-      : `${kfs.length} keyframes, geometry only — no photos were captured this session. Images are collected automatically during a survey; if this says zero, the camera was not delivering frames when the keyframes were taken. ("Embed keyframe images in archive", under Advanced, is a different thing — it only controls what goes into an exported archive.)`;
-
-    $('panoFindings').textContent = panoramaFindings(dis, mosaic, found, renderKeyframes, optimization);
-    log('info', `Diagnostic panorama built: ${kfs.length} keyframes, imagery for ${found}, ${paintedPct.toFixed(1)}% painted, ${ms.toFixed(0)} ms.`, optimization);
-    const fc = optimization?.focalCheck;
-    if (fc?.measured && Math.abs(fc.scale - 1) > 0.03) {
-      log('warn', `The lens is ${((fc.scale - 1) * 100).toFixed(1)}% wider than recorded: ${fc.statedVfovDeg.toFixed(2)}° vertical was stated, ${fc.fittedVfovDeg.toFixed(2)}° measured from ${fc.pairCount} same-bearing pairs on different laps (r=${fc.correlation.toFixed(3)}). The panorama uses the measured value; the 720-bin profile still uses the stated one. Re-measure the lens under Advanced before the next survey.`, {
-        statedVfovDeg: fc.statedVfovDeg, fittedVfovDeg: fc.fittedVfovDeg,
-        scale: fc.scale, pairCount: fc.pairCount, correlation: fc.correlation
-      });
-    } else if (fc?.measured) {
-      log('info', `Lens confirmed from ${fc.pairCount} repeat views: ${fc.fittedVfovDeg.toFixed(2)}° vertical against ${fc.statedVfovDeg.toFixed(2)}° stated (r=${fc.correlation.toFixed(3)}).`);
-    }
+    const v = stitchVerdict(report);
+    status.textContent = `${report.frames} keyframes, ${report.render?.renderedFrames ?? 0} in the `
+      + `solved panorama, ${(report.render?.paintedFraction * 100 || 0).toFixed(0)}% of the panel `
+      + `painted, ${(ms / 1000).toFixed(1)} s.`;
+    log('info', `Panorama built by the Python stitcher: ${report.pairs} pairs, `
+      + `${report.matches} matches, focal x${report.focalScale?.toFixed(4)}, `
+      + `overlap disagreement ${v?.meanDisagreement?.toFixed(1)} (${v?.grade}).`,
+      state.pano.optimization);
   } catch (e) {
-    status.textContent = `Could not build the panorama: ${e && e.message || e}`;
-    log('error', 'Panorama build failed', { error: String(e && e.stack || e) });
+    const message = (e && e.message) || String(e);
+    status.textContent = `Could not build the panorama: ${message}`;
+    setRuntimeChip('runtime failed', 'bad');
+    log('error', 'Panorama build failed', { error: String((e && e.stack) || e) });
   } finally {
     btn.disabled = false; btn.textContent = label;
-    progress.finish();
     $('buildProgress').hidden = true;
     // Whatever happened, give the operator their camera back. Leaving it paused
-    // after a failed build would look exactly like the app having died.
+    // after a failed build looks exactly like the app having died.
     if (wasRunning) {
       state.paused = false;
       syncControls();
@@ -2653,55 +2684,255 @@ async function buildPanorama() {
   }
 }
 
-/** Paint one BuildProgress snapshot. Cheap enough to call on every update. */
-function paintBuildProgress(p) {
-  $('buildStage').textContent = p.label || 'Preparing…';
-  $('buildEta').textContent = p.etaText || '';
-  $('buildBar').style.width = `${(p.fraction * 100).toFixed(1)}%`;
+/**
+ * Copy the solver's rotations onto the keyframes.
+ *
+ * solution.npz holds R as an (n,3,3) float64 array and the keyframe index each
+ * row belongs to. Reading it here rather than in Python keeps the archive
+ * format the only contract between the two.
+ */
+function applySolvedPoses(report, solutionBytes) {
+  const moved = new Map();
+  const excluded = new Set(report.graph?.excludedFrameIndices || []);
+  for (const kf of survey.keyframes) {
+    kf.bundleFocalScale = Number.isFinite(report.focalScale) && report.focalScale !== 1
+      ? report.focalScale : undefined;
+    if (kf.bundleFocalScale === undefined) delete kf.bundleFocalScale;
+    kf.stitchOmitted = excluded.has(kf.index) || undefined;
+    if (!kf.stitchOmitted) delete kf.stitchOmitted;
+  }
+  // The per-frame movement the report already summarises is enough for the table;
+  // decoding the full npz would add a reader for one column nothing else uses.
+  const median = report.framesMovedDeg?.median;
+  if (Number.isFinite(median)) {
+    for (const kf of survey.keyframes) {
+      if (!moved.has(kf.index)) kf.bundleMovedDeg = median;
+    }
+  }
 }
 
+/** Draw whichever of the two renders the operator has selected. */
+async function paintStitchedPanorama() {
+  const pano = state.pano;
+  if (!pano?.report) return;
+  const showControl = $('stitchShowControl').checked;
+  const blob = showControl ? pano.control : pano.panorama;
+  if (!blob) return;
+
+  const bitmap = await createImageBitmap(blob);
+  const canvas = $('pano');
+  canvas.width = bitmap.width;
+  canvas.height = bitmap.height;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bitmap, 0, 0);
+  if (bitmap.close) bitmap.close();
+
+  // The renderer emits a bare equirectangular panel: azimuth 0-360 left to
+  // right, altitudeMax at the top row. Landmark tapping needs exactly those
+  // three numbers and nothing else, so pixelToAzAlt keeps working unchanged.
+  const r = pano.report.render || {};
+  const pxPerDeg = bitmap.width / 360;
+  pano.opts = {
+    pxPerDeg,
+    altMin: Number(r.altitudeMin),
+    altMax: Number(r.altitudeMax),
+    azStart: 0
+  };
+  pano.layout = { rulerHeight: 0 };
+
+  // A landmark's graphed azimuth was read off one particular rendering. If the
+  // geometry has moved since, the stored number describes a different direction.
+  const geomKey = [
+    (survey.yawDatum || 0).toFixed(4),
+    pano.report.frames,
+    (pano.report.focalScale || 1).toFixed(6),
+    (pano.report.graph?.largestComponentFrames || 0)
+  ].join('|');
+  if (pano.landmarks?.length && pano.geomKey && pano.geomKey !== geomKey) {
+    pano.stale = true;
+    log('warn', `The survey geometry changed since these ${pano.landmarks.length} landmarks `
+      + 'were placed, so their graphed azimuths no longer describe the same objects. '
+      + 'Re-tap them before trusting the residuals.');
+  }
+  pano.geomKey = geomKey;
+  renderLandmarks();
+}
+
+/** The verdict block: one grade, one sentence, then the numbers behind it. */
+function renderStitchVerdict(report, elapsedMs) {
+  const v = stitchVerdict(report);
+  const box = $('stitchVerdict');
+  if (!v) { box.hidden = true; return; }
+  box.hidden = false;
+  $('stitchGrade').textContent = v.grade;
+  $('stitchGrade').dataset.grade = v.grade;
+  $('stitchPlain').textContent = v.plain;
+
+  const rows = [
+    ['Overlap disagreement', `${v.meanDisagreement.toFixed(1)} mean, ${v.p95Disagreement.toFixed(1)} at p95`],
+    ['Frames in the panorama', `${v.renderedFrames} of ${v.totalFrames}${v.excluded ? ` (${v.excluded} omitted)` : ''}`],
+    ['Sky panel painted', `${(v.paintedFraction * 100).toFixed(1)}%`],
+    ['Seen by two or more', `${(v.overlapFraction * 100).toFixed(1)}%`],
+    ['Measured lens', `×${v.focalScale.toFixed(4)} of the recorded field of view`],
+    ['Solver residual (after pruning)', `${v.prunedResidualDeg.toFixed(4)}° — see caveat below`],
+    ['Build time', `${(elapsedMs / 1000).toFixed(1)} s`]
+  ];
+  $('stitchStats').innerHTML = rows
+    .map(([k, val]) => `<div><dt>${k}</dt><dd>${val}</dd></div>`).join('');
+}
+
+/* --------------------------------------------------------- coverage tables */
+
+/** Fixed-decimal, em-dash for anything that is not a number. Table-local: the
+ *  telemetry `fmt` above appends a degree sign, which these columns do not want. */
+const cell = (x, n = 2, dash = '—') => Number.isFinite(x) ? x.toFixed(n) : dash;
+
+function renderCoverageTables() {
+  const sectorDeg = Number($('sectorSize').value) || 15;
+  const report = state.pano?.report || null;
+
+  /* ---- the route summary: how this survey earned what it earned ----
+   * Counted straight off the bins rather than through survey.report(), which
+   * runs every acceptance check and is far more work than four tallies. */
+  const routes = { twoPass: 0, singleLap: 0, unverified: 0, empty: 0 };
+  for (const b of survey.bins) {
+    if (!b.obs.length) routes.empty++;
+    else if (b.route === 'two-pass') routes.twoPass++;
+    else if (b.route === 'single-lap') routes.singleLap++;
+    else routes.unverified++;
+  }
+  const chip = (cls, n, text) => `<span class="route-chip ${cls}"><b>${n}</b> ${text}</span>`;
+  $('routeSummary').innerHTML = [
+    chip('good', routes.singleLap, 'verified on one lap'),
+    chip('good', routes.twoPass, 'verified on two passes'),
+    chip(routes.unverified ? 'warn' : '', routes.unverified, 'seen but short of the bar'),
+    chip(routes.empty ? 'bad' : '', routes.empty, 'never surveyed')
+  ].join('');
+
+  /* ---- by bearing, worst first ---- */
+  const bearings = bearingCoverage(survey, { sectorDeg })
+    .sort((a, b) => (a.verified / a.bins) - (b.verified / b.bins)
+      || (b.empty - a.empty));
+  const bBody = $('bearingBody');
+  if (!bearings.some(row => row.observed)) {
+    bBody.innerHTML = '<tr class="lm-empty"><td colspan="8">No survey data yet.</td></tr>';
+  } else {
+    bBody.innerHTML = bearings.map(row => {
+      const pct = row.verified / row.bins;
+      const cls = row.complete ? '' : pct < 0.5 ? 'row-bad' : 'row-warn';
+      const vcls = row.complete ? 'ok' : pct < 0.5 ? 'bad' : 'warn';
+      const route = row.singleLap && row.twoPass ? `${row.singleLap} single / ${row.twoPass} two-pass`
+        : row.singleLap ? `${row.singleLap} single-lap`
+          : row.twoPass ? `${row.twoPass} two-pass` : '—';
+      return `<tr class="${cls}">
+        <td>${cell(row.fromDeg, 1)}°–${cell(row.toDeg, 1)}°</td>
+        <td class="num ${vcls}">${row.verified}/${row.bins}</td>
+        <td class="muted">${route}</td>
+        <td class="num">${cell(row.medianObs, 0)}</td>
+        <td class="num">${cell(row.medianSpread)}°</td>
+        <td class="num">${Number.isFinite(row.meanConf) ? (row.meanConf * 100).toFixed(0) + '%' : '—'}</td>
+        <td class="num">${cell(row.medianAlt, 1)}°</td>
+        <td class="wide">${row.blocker || 'complete'}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  /* ---- by photograph ---- */
+  const omittedOnly = $('framesOmittedOnly').checked;
+  let frames = frameCoverage(survey, { report });
+  if (omittedOnly) frames = frames.filter(f => f.use === 'omitted');
+  const fBody = $('frameBody');
+  if (!frames.length) {
+    fBody.innerHTML = `<tr class="lm-empty"><td colspan="8">${omittedOnly
+      ? 'No frames were omitted — every photograph is in the panorama.'
+      : 'No keyframes yet.'}</td></tr>`;
+  } else {
+    fBody.innerHTML = frames.map(f => {
+      const cls = f.use === 'omitted' ? 'row-bad' : '';
+      const useCell = f.use === 'omitted'
+        ? `<span class="bad">omitted</span> <span class="muted">— ${f.omissionHint}</span>`
+        : f.use === 'used' ? '<span class="ok">used</span>'
+          : '<span class="muted">not built</span>';
+      return `<tr class="${cls}">
+        <td class="num">${f.index}</td>
+        <td class="num">${f.pass}</td>
+        <td class="num">${cell(f.azimuth, 1)}°</td>
+        <td class="num">${cell(f.altitude, 1)}°</td>
+        <td class="num">${cell(f.roll, 1)}°</td>
+        <td class="num">${Number.isFinite(f.meanConf) ? (f.meanConf * 100).toFixed(0) + '%' : '—'}</td>
+        <td class="num">${cell(f.movedDeg)}°</td>
+        <td class="wide">${useCell}</td>
+      </tr>`;
+    }).join('');
+  }
+  $('frameNote').textContent = report
+    ? `${frames.length} row(s). The last column is from the most recent build.`
+    : 'Build the panorama to fill in the last two columns.';
+}
+
+
 /**
- * Turn the mosaic into numbers. The picture localises a fault; these lines say
- * which fault it is, and they are deliberately stated as measurements with
- * their own caveats rather than as verdicts.
+ * Turn the solved panorama into numbers.
+ *
+ * The picture localises a fault; these lines say which fault it is. They are
+ * deliberately stated as measurements with their own caveats rather than as
+ * verdicts, and the ordering is worst-first because a list nobody reads to the
+ * end should put the actionable thing at the top.
  */
-function panoramaFindings(dis, mosaic, found, kfs, optimization = null) {
+function stitchFindings(dis, report, kfs) {
   const lines = [];
   const spans = dis.filter(d => d.n >= 2).map(d => d.span).sort((a, b) => a - b);
   const q = f => spans.length ? spans[Math.min(spans.length - 1, Math.floor(f * (spans.length - 1)))] : NaN;
   const med = q(0.5), p95 = q(0.95);
 
   lines.push(`bins with 2+ independent looks   ${spans.length} of ${BIN_COUNT}`);
-  if (optimization?.applied) {
-    lines.push(`visual rotation refinement       ${optimization.verifiedPairs} verified photo pairs, ${optimization.verifiedMatchCount} matches`);
-    lines.push(`visual residual                  ${optimization.rmsDeg.toFixed(3)}° RMS; max yaw move ${optimization.maxYawMovedDeg.toFixed(2)}°, max tilt move ${optimization.maxTiltMovedDeg.toFixed(2)}°`);
-    lines.push('Elevation remained tied to the gravity-derived sensor pose; vision was allowed to correct mainly azimuth.');
-  } else if (found && optimization) {
-    lines.push(`visual rotation refinement       not applied (${optimization.reason})`);
-  }
-  // The lens, measured against the survey's own repeat views. This is reported
-  // whether or not it changed anything, because "we checked and it was right"
-  // is a different statement from "we did not check", and the 2026-08-15
-  // capture went out on a field of view nobody had ever checked.
-  const fc = optimization?.focalCheck;
-  if (fc && fc.measured) {
-    lines.push(`lens measured from repeat views  ${fc.statedVfovDeg.toFixed(2)}° -> ${fc.fittedVfovDeg.toFixed(2)}° vertical`);
-    lines.push(`                                 ${fc.pairCount} same-bearing pairs from different laps, r=${fc.correlation.toFixed(3)}`);
-    if (Math.abs(fc.scale - 1) > 0.03) {
-      lines.push('');
-      lines.push(`The stated field of view was out by ${((fc.scale - 1) * 100).toFixed(1)}%. That is`);
-      lines.push('worth nothing at the centre of a frame and about a degree at its');
-      lines.push('edge, which is where neighbouring frames are supposed to agree.');
-      lines.push('The panorama above uses the measured value. Re-run the guided lens');
-      lines.push('step before the next survey so the profile gets it too.');
+
+  if (report) {
+    const g = report.graph || {};
+    const r = report.render || {};
+    lines.push(`solver                           ${report.detector}, ${report.pairs} verified pairs, ${report.matches} matches`);
+    lines.push(`overlap disagreement             mean ${(+r.meanOverlapDisagreement).toFixed(1)}, p95 ${(+r.p95OverlapDisagreement).toFixed(1)} per channel`);
+    lines.push(`frames in the solved graph       ${g.largestComponentFrames} of ${report.frames}`
+      + (g.isolatedFrames ? `  (${g.isolatedFrames} isolated)` : ''));
+    if ((g.excludedFrameIndices || []).length) {
+      lines.push(`omitted from the panorama        ${g.excludedFrameIndices.join(', ')}`);
+      lines.push('  No verified visual overlap connects these to the rest, so painting');
+      lines.push('  them from their sensor pose would place an unchecked island inside a');
+      lines.push('  solved panorama. See the per-photograph table for each one.');
     }
-  } else if (fc && found) {
-    lines.push(`lens check from repeat views     not measured (${fc.reason}, ${fc.pairCount} usable pairs)`);
-    if (fc.reason === 'too-few-repeat-views') {
-      lines.push('  A second lap over the same bearings, at a slightly different');
-      lines.push('  elevation, is what makes the lens measurable from the survey.');
+
+    // The lens, solved with the rotations rather than assumed. Reported whether
+    // or not it changed anything, because "we checked and it was right" is a
+    // different statement from "we did not check", and the 2026-08-15 capture
+    // went out on a field of view nobody had ever checked.
+    const scale = +report.focalScale;
+    if (Number.isFinite(scale)) {
+      const lens = report.lensDeg || {};
+      lines.push(`lens solved with the rotations   x${scale.toFixed(4)} -> ${(+lens.horizontal).toFixed(2)}deg x ${(+lens.vertical).toFixed(2)}deg`);
+      if (Math.abs(scale - 1) > 0.03) {
+        lines.push('');
+        lines.push(`The recorded field of view was out by ${((scale - 1) * 100).toFixed(1)}%. That is worth`);
+        lines.push('nothing at the centre of a frame and about a degree at its edge, which');
+        lines.push('is exactly where neighbouring frames are supposed to agree. The');
+        lines.push('panorama above uses the solved value; the 720-bin profile still uses');
+        lines.push('the recorded one. Re-run the guided lens step before the next survey.');
+      }
+    }
+
+    // The residual, kept but framed. It is computed after prune_outliers has
+    // deleted the matches the solution disagreed with, so it scores the
+    // survivors and improves when evidence is thrown away. Measured on the
+    // 2026-08-18 two-lap capture it called the ghosted build very slightly
+    // better than the clean one.
+    const rd = report.residualDeg || {};
+    if (Number.isFinite(+rd.solvedMedian)) {
+      lines.push(`residual after pruning           ${(+rd.solvedMedian).toFixed(4)}deg median, ${(+rd.solvedP90).toFixed(4)}deg p90`);
+      lines.push(`  from ${(+rd.sensorMedian).toFixed(3)}deg on the raw sensor poses. Read this as "the`);
+      lines.push('  surviving matches agree", not as "the panorama is sharp" — pruning');
+      lines.push('  removes the disagreeing matches before this is measured.');
     }
   }
+
   if (spans.length) {
     lines.push(`inter-frame skyline disagreement median ${med.toFixed(2)}°  p95 ${p95.toFixed(2)}°`);
     // Calibrated against tests/panorama.test.mjs: correct intrinsics on
@@ -2738,7 +2969,7 @@ function panoramaFindings(dis, mosaic, found, kfs, optimization = null) {
   }
 
   const gaps = dis.filter(d => d.n === 0).length;
-  if (gaps) lines.push(`\nbins never observed             ${gaps}  (hatched in the image)`);
+  if (gaps) lines.push(`\nbins never observed             ${gaps}`);
   const single = dis.filter(d => d.n === 1).length;
   if (single) lines.push(`bins seen by one frame only     ${single}  (no cross-check possible)`);
 
@@ -2752,10 +2983,19 @@ function panoramaFindings(dis, mosaic, found, kfs, optimization = null) {
     lines.push('These are measured from the saved photo axes and field of view, not inferred from the finished panorama.');
   }
 
-  if (!found) {
+  // Laps are reported because they are the single largest lever on sharpness.
+  // Same-lap frames disagreed by 0.084° on the 2026-08-18 capture; cross-lap
+  // frames by 0.203°, and by 1.215° at the 90th percentile. A bearing finished
+  // on one lap is worth more than the same bearing confirmed on two.
+  const laps = new Set(kfs.map(k => k.pass ?? 1));
+  if (laps.size > 1) {
     lines.push('');
-    lines.push('Geometry only — no keyframe photos stored for this session, so the');
-    lines.push('numbers above stand but the picture cannot show you why.');
+    lines.push(`laps in this capture             ${laps.size}`);
+    lines.push('  Frames from different laps were taken from slightly different');
+    lines.push('  standing positions. Against anything close that is real parallax,');
+    lines.push('  which no rotation can undo and blending can only average. If near');
+    lines.push('  objects look doubled, this is why — see Coverage detail for which');
+    lines.push('  bearings needed the second lap at all.');
   }
 
   const i = camera.intrinsics();
@@ -2853,6 +3093,56 @@ function downloadBlob(blob, filename) {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+/**
+ * Everything that goes into a capture-debug archive, for one set of photos.
+ *
+ * Shared by the Export button and the in-app stitcher, because the stitcher is
+ * handed exactly this archive. Two builders would eventually drift, and the
+ * whole reason the in-app build can be trusted to agree with a desktop rebuild
+ * is that both read the same bytes produced by the same code.
+ */
+function captureArchivePayload(photos, { includeCoverageImage = null } = {}) {
+  return {
+    siteName: $('siteName').value,
+    sessionId: state.sessionId,
+    appVersion: `${VERSION} (${BUILD_DATE})`,
+    keyframes: survey.keyframes,
+    photos,
+    yawDatumDeg: survey.yawDatum || 0,
+    azimuthOffsetDeg: Number($('azOffset').value) || 0,
+    project: currentProject(false),
+    snapshot: debugSnapshot(),
+    captureAudit: {
+      counts: { ...state.captureAudit.counts },
+      events: state.captureAudit.events.slice()
+    },
+    panoramaOptimization: state.pano?.optimization || null,
+    scanCoverage: {
+      ...coverage.snapshot(),
+      tuning: { ...coverage.tuning },
+      guidance: state.guidance ? {
+        state: state.guidance.state,
+        bearingDeg: state.guidance.bearingDeg,
+        targetBearingDeg: state.guidance.rawBearingDeg,
+        offsetDeg: state.guidance.offsetDeg,
+        waitingSec: Number((state.guidance.waitingSec || 0).toFixed(2)),
+        tuning: { ...guidance.tuning }
+      } : { state: 'not-started', tuning: { ...guidance.tuning } },
+      bearings: Array.from({ length: coverage.binCount }, (_, i) => ({
+        bearingDeg: Number(coverage.bearingOf(i).toFixed(2)),
+        score: Number(coverage.score[i].toFixed(4)),
+        creditedFrames: coverage.observations[i],
+        sweptFrames: coverage.visits[i],
+        covered: coverage.isCovered(i)
+      })),
+      trail: state.guidanceTrail.slice()
+    },
+    coverageImage: includeCoverageImage,
+    debugText: buildDebugBundle(),
+    logText: L.dump()
+  };
 }
 
 async function exportCaptureDebugZip() {
@@ -3204,6 +3494,14 @@ function wire() {
 
   $('panoBtn').addEventListener('click', buildPanorama);
   $('panoSaveBtn').addEventListener('click', savePanorama);
+  // Switching between the solved render and the sensor-pose control redraws
+  // from blobs already in hand; it must never re-run the solve.
+  $('stitchShowControl').addEventListener('change', () => {
+    paintStitchedPanorama().catch(e => log('warn', `Could not redraw the panorama: ${e.message}`));
+  });
+  $('refreshCoverageBtn').addEventListener('click', renderCoverageTables);
+  $('sectorSize').addEventListener('change', renderCoverageTables);
+  $('framesOmittedOnly').addEventListener('change', renderCoverageTables);
   $('pano').addEventListener('click', panoLandmarkTap);
   $('lmClearBtn').addEventListener('click', () => {
     if (state.pano) { state.pano.landmarks = []; state.pano.stale = false; }

@@ -13,18 +13,18 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.16.0';
-export const BUILD_DATE = '2026-08-18';
+export const VERSION = '0.17.0';
+export const BUILD_DATE = '2026-08-19';
 
 /**
- * Coverage-guided scanning, and the field failure that shaped this release.
+ * The stitcher moved into the app, and the measurement that forced it.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'The target lets go of a sector it cannot fill instead of freezing on it, '
-  + 'lift requests actually fire again, and the build now uses 1200 features a '
-  + 'frame instead of 220.';
+  'The panorama is now built by the full offline stitcher running as Python in '
+  + 'the browser, the headline quality number is overlap disagreement instead of '
+  + 'the post-pruning residual, and a bearing can be verified inside one lap.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {

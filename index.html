@@ -10,7 +10,7 @@
      Bump it with VERSION in js/version.js; iPad Safari holds CSS aggressively
      and the resulting half-styled page looks like a broken build, not a stale
      one, which is a bad thing to be debugging in a field. -->
-<link rel="stylesheet" href="styles.css?v=0.16.0" />
+<link rel="stylesheet" href="styles.css?v=0.17.0" />
 </head>
 <body>
 
@@ -137,15 +137,29 @@
 <section class="card">
   <div class="card-head">
     <div>
-      <p class="kicker">DIAGNOSTIC</p>
+      <p class="kicker">PANORAMA</p>
       <h2>Stitched view</h2>
     </div>
     <button id="panoBtn" class="btn small">Build</button>
   </div>
 
+  <p class="hint" id="stitchEngineNote">This runs the full offline stitcher — multi-scale
+  features, guided matching, a bundle adjustment over every camera angle and the shared
+  focal length, outlier pruning, a second solve, and seam-cut compositing — as Python
+  under WebAssembly. It is the same <code>tools/stitch_lab.py</code> a desktop rebuild runs,
+  over the same archive, so the two produce the same panorama. The runtime is about 25 MB
+  the first time and is then cached; no capture data is uploaded.</p>
+
   <div class="row">
-    <label class="toggle"><input type="checkbox" id="panoImagery" checked /> <span>Use keyframe photos</span></label>
-    <label class="toggle"><input type="checkbox" id="panoBlend" checked /> <span>Blend seams</span></label>
+    <span id="stitchRuntime" class="chip quiet">runtime not loaded</span>
+    <label class="zoom">Quality
+      <select id="stitchQuality">
+        <option value="fast">Fast — 350 features</option>
+        <option value="normal" selected>Normal — 500 features</option>
+        <option value="fine">Fine — 900 features</option>
+        <option value="reference">Reference — SIFT, 1200</option>
+      </select>
+    </label>
     <label class="zoom">Detail
       <select id="panoScale">
         <option value="4">4 px/°</option>
@@ -153,7 +167,35 @@
         <option value="9">9 px/°</option>
       </select>
     </label>
+    <label class="zoom">Compositing
+      <select id="stitchBlend">
+        <option value="seam" selected>Seam cut — for a finished picture</option>
+        <option value="best">Nearest axis — hard cuts, for diagnosis</option>
+        <option value="feather">Feather — smooth, hides geometry error</option>
+      </select>
+    </label>
     <button id="panoSaveBtn" class="btn small" disabled>Save PNG</button>
+  </div>
+
+  <div class="row">
+    <label class="toggle"><input type="checkbox" id="stitchShowControl" /> <span>Show the sensor-pose control instead</span></label>
+    <span class="hint" id="stitchControlNote">The same frames painted from the raw sensor
+    attitudes, with no solve at all. The difference between the two is what the solve
+    contributed — visible rather than asserted.</span>
+  </div>
+
+  <div class="verdict" id="stitchVerdict" hidden>
+    <div class="verdict-head">
+      <span class="verdict-grade" id="stitchGrade">—</span>
+      <span class="verdict-plain" id="stitchPlain"></span>
+    </div>
+    <dl class="stats" id="stitchStats"></dl>
+    <p class="hint">The headline number is <b>overlap disagreement</b> — how far two
+    photographs differ about the same direction, per colour channel. It is used instead of
+    the solver's own residual because the residual is computed after the disagreeing
+    matches have been pruned away, so it improves when evidence is discarded. On a measured
+    two-lap capture the residual called the build very slightly better while the picture
+    was 36% worse.</p>
   </div>
 
   <div class="build-progress" id="buildProgress" hidden>
@@ -179,7 +221,81 @@
     <pre class="report" id="lmSummary">Add two or more landmarks spread around the circle to separate a datum offset from drift.</pre>
   </div>
   <pre class="report" id="panoFindings">No panorama built yet.</pre>
-  <p class="hint">Each pixel comes from the one keyframe that saw it closest to its optical axis, not from a blend of several. Blending averages a geometry error into a smooth surface that looks correct; leaving the frames unblended turns the same error into a visible step whose size you can read off the azimuth scale. A thin skyline means the frames agree. A fanned band means they do not.</p>
+  <p class="hint">Compositing decides what a geometry error looks like. <b>Seam cut</b> gives
+  each region to one photograph and cuts where they already agree, which is right for a
+  finished picture. <b>Nearest axis</b> takes every pixel from the single frame that saw it
+  closest to its optical axis, so a misregistration becomes a hard step whose size you can
+  read off the azimuth scale — uglier, and the honest choice when you are diagnosing rather
+  than presenting. <b>Feather</b> averages the overlap, which turns the same error into a
+  smooth blur that looks correct and is not.</p>
+
+  <details class="stitch-log-wrap">
+    <summary><span class="kicker">STITCHER OUTPUT</span> Every number the solve printed</summary>
+    <pre class="report" id="stitchLog">Not run yet.</pre>
+  </details>
+</section>
+
+<!-- ------------------------------------------------------- coverage tables -->
+<section class="card">
+  <div class="card-head">
+    <div>
+      <p class="kicker">EVIDENCE</p>
+      <h2>Coverage detail</h2>
+    </div>
+    <div class="row">
+      <label class="zoom">Sector
+        <select id="sectorSize">
+          <option value="10">10°</option>
+          <option value="15" selected>15°</option>
+          <option value="30">30°</option>
+        </select>
+      </label>
+      <button id="refreshCoverageBtn" class="btn small">Refresh</button>
+    </div>
+  </div>
+
+  <p class="hint">A bin is verified when it has independent evidence — either two passes,
+  or enough tight, confident looks gathered inside a single lap. The single-lap route exists
+  because a second lap is walked from a slightly different standing position, and against
+  anything close that is real parallax the stitcher cannot undo. Measured on a two-lap
+  capture, frames from different laps disagreed 2.4× more than frames from the same lap,
+  and 6.6× more at the 90th percentile. Getting a bearing finished on the first lap is
+  worth more than confirming it on a second.</p>
+
+  <div class="route-summary" id="routeSummary"></div>
+
+  <h3 class="table-title">By bearing</h3>
+  <div class="table-scroll">
+    <table class="data-table" id="bearingTable">
+      <thead><tr>
+        <th>Bearing</th><th>Verified</th><th>Route</th><th>Looks</th>
+        <th>Spread</th><th>Confidence</th><th>Horizon</th><th>Holding it back</th>
+      </tr></thead>
+      <tbody id="bearingBody"><tr class="lm-empty"><td colspan="8">No survey data yet.</td></tr></tbody>
+    </table>
+  </div>
+  <p class="hint" id="bearingNote">Worst sectors first. “Looks” is the median number of
+  independent observations per half-degree bin in that sector.</p>
+
+  <h3 class="table-title">By photograph</h3>
+  <div class="row">
+    <label class="toggle"><input type="checkbox" id="framesOmittedOnly" /> <span>Only frames the stitcher omitted</span></label>
+    <span class="hint" id="frameNote">Build the panorama to fill in the last two columns.</span>
+  </div>
+  <div class="table-scroll">
+    <table class="data-table" id="frameTable">
+      <thead><tr>
+        <th>#</th><th>Lap</th><th>Azimuth</th><th>Elevation</th><th>Roll</th>
+        <th>Confidence</th><th>Moved</th><th>In panorama</th>
+      </tr></thead>
+      <tbody id="frameBody"><tr class="lm-empty"><td colspan="8">No keyframes yet.</td></tr></tbody>
+    </table>
+  </div>
+  <p class="hint">A frame is omitted when no verified visual overlap connects it to the rest
+  of the solution. Painting it anyway from its sensor pose would place an unchecked island
+  in the middle of a solved panorama, which is worse than a gap, so the stitcher leaves it
+  out and says so here. “Moved” is how far the solve rotated that frame away from where the
+  sensors put it.</p>
 </section>
 
 <!-- --------------------------------------------------------------- report -->
@@ -332,6 +448,10 @@
 
 </main>
 
-<script type="module" src="js/main.js"></script>
+<!-- Version query for the same reason styles.css carries one: iPad Safari holds
+     modules aggressively, and a device pairing new markup with a cached script
+     fails in ways that look like a broken build rather than a stale one. Bump
+     with VERSION in js/version.js. -->
+<script type="module" src="js/main.js?v=0.17.0"></script>
 </body>
 </html>
