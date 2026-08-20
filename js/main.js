@@ -11,6 +11,7 @@ import { Survey, RULES, BIN_COUNT, BIN_STEP, STATUS } from './survey.js';
 import { ScanDirector, PHASE } from './guide.js';
 import { CoverageMap } from './coverage.js';
 import { ScanGuidance } from './guidance.js';
+import { ColumnPlan, overlapAudit } from './column-plan.js';
 import { Pipeline } from './pipeline.js';
 import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
 import { drawRing, drawProfile, drawOverlay, renderCoverageCard } from './render.js';
@@ -62,6 +63,11 @@ const director = new ScanDirector(survey);
  * derived from it. Two objects on purpose — see js/coverage.js. */
 const coverage = new CoverageMap();
 const guidance = new ScanGuidance();
+/* The vertical half of the plan. Constructed with a placeholder field of view
+ * and re-geometried the moment the camera reports a real one, because the band
+ * step IS the vertical field of view times the overlap fraction and getting it
+ * from a default would reintroduce the exact bug it exists to prevent. */
+const columns = new ColumnPlan({ vfovDeg: 30, binCount: coverage.binCount });
 const orientation = new OrientationSource(log);
 const camera = new CameraSource($('video'), log);
 const pipeline = new Pipeline(log);
@@ -629,6 +635,22 @@ async function processFrame() {
         dtSec,
         atMs: t
       });
+      // The vertical plan sees the same instant, gated on the same quality, so
+      // a frame too fast or too rolled to earn horizon credit cannot fill a
+      // band either. syncRequirements is cheap and picks up obstruction tops
+      // the coverage map refined on this very frame.
+      columns.setFieldOfView(camera.intrinsics().vfovDeg);
+      columns.syncRequirements(coverage);
+      // The guidance dot climbs in the same increments the column plan is built
+      // from, so following the dot produces a chain of overlapping frames
+      // rather than two isolated ones with a hole between them.
+      guidance.bandStepDeg = columns.bandStepDeg;
+      columns.observe({
+        headingDeg: currentHeading(),
+        elevationDeg: att.elevation,
+        quality,
+        hfovDeg: camera.hfovDeg
+      });
       state.guidance = guidance.update({
         coverage,
         headingDeg: currentHeading(),
@@ -818,6 +840,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
 
   survey._projectKeyframe(kf, camera.intrinsics());
   survey.recompute();
+  auditOverlap();
 
   // Thumbnails are captured for EVERY keyframe, regardless of the archive
   // setting. They used to be gated on "Embed keyframe images in archive",
@@ -2490,6 +2513,57 @@ async function loadKeyframeBlobs({ waitForPending = false } = {}) {
   return byIndex;
 }
 
+/* ------------------------------------------------ will this survive a stitch?
+ *
+ * Run after every keyframe, while the operator is still standing there.
+ *
+ * The 2026-08-19 23:48 capture finished looking perfect by every measure the
+ * app had — 360.7° travelled, no overlap gaps, best-ever disagreement — and the
+ * stitcher then discarded 13 of its 80 photographs, every one of them a high
+ * frame over the house. Nothing in the app knew, because nothing in the app was
+ * asking the question the solver asks: does the overlap graph hold together.
+ *
+ * It does now, on geometry alone, which costs a few thousand comparisons and no
+ * pixels at all. A stranded group is worth interrupting for, because it is the
+ * one class of problem that is free to fix now and impossible to fix later.
+ */
+let lastOverlapAuditAt = 0;
+let lastStrandedCount = 0;
+function auditOverlap() {
+  const now = performance.now();
+  if (now - lastOverlapAuditAt < 900) return;
+  lastOverlapAuditAt = now;
+  const kfs = survey.keyframes;
+  if (kfs.length < 6) return;
+
+  const intr = camera.intrinsics();
+  const yawDatum = survey.yawDatum || 0;
+  const frames = kfs.map(kf => ({
+    index: kf.index,
+    azimuthDeg: wrap360((Number.isFinite(kf.yawFused) ? kf.yawFused : (kf.yawRaw || 0) + (kf.yawBase || 0))
+      + yawDatum + (kf.yawCorrection || 0)),
+    elevationDeg: Number(kf.elevation) || 0
+  }));
+  const audit = overlapAudit(frames, { hfovDeg: intr.hfovDeg, vfovDeg: intr.vfovDeg });
+  state.overlapAudit = audit;
+
+  // Only speak when the situation gets worse. A warning repeated every second
+  // is a warning nobody reads, and the operator is being asked to change what
+  // they are doing, which is only reasonable to ask once per new problem.
+  const stranded = audit.atRisk.filter(r => r.stranded).length;
+  if (stranded > lastStrandedCount && stranded >= 3) {
+    const worst = audit.riskiestElevationDeg;
+    log('warn', `${stranded} photographs are not connected to the rest of the survey and will `
+      + `be left out of the panorama. They are around ${worst?.toFixed(0)}° elevation. Tilt back `
+      + 'down through the middle of that range and keep shooting, so there is something between '
+      + 'them and the horizon row.', {
+      stranded, components: audit.components, largestComponent: audit.largestComponent,
+      riskiestElevationDeg: worst
+    });
+  }
+  lastStrandedCount = stranded;
+}
+
 /* ------------------------------------------------------- the Python stitcher */
 
 /* One runtime for the life of the page. Pyodide plus NumPy plus OpenCV is a
@@ -2635,6 +2709,8 @@ async function buildPanorama() {
 
     state.pano = state.pano || { landmarks: [], geomKey: null };
     state.pano.report = report;
+    state.pano.log = result.log.join('\n');
+    state.pano.options = options;
     state.pano.panorama = result.panorama;
     state.pano.control = result.control;
     state.pano.optimization = {
@@ -3140,6 +3216,17 @@ function captureArchivePayload(photos, { includeCoverageImage = null } = {}) {
       trail: state.guidanceTrail.slice()
     },
     coverageImage: includeCoverageImage,
+    // What the stitcher did with these photographs, when one has been built.
+    // Carried into the archive so a capture can be argued about after the fact
+    // without the panorama in front of you.
+    // The vertical plan and the live connectivity audit. Both describe the
+    // capture rather than the stitch, so they are written whether or not a
+    // panorama was ever built.
+    columnPlan: columns.snapshot(),
+    overlapAudit: state.overlapAudit || null,
+    stitchReport: state.pano?.report || null,
+    stitchLog: state.pano?.log || null,
+    stitchOptions: state.pano?.options || null,
     debugText: buildDebugBundle(),
     logText: L.dump()
   };

@@ -212,6 +212,11 @@ function readme(photoCount, keyframeCount, missing, appVersion) {
     'metadata/capture-gaps.json measures photo-to-photo overlap and gives the bearings that should be revisited.',
     'metadata/capture-audit.json counts and samples accepted and rejected capture candidates, including why a photo was not taken.',
     'metadata/panorama-optimization.json records visual matches, residuals, and any gravity-constrained rotation refinements applied in the browser.',
+    'metadata/column-plan.json is the vertical half of the scan plan: the elevation band step derived from the vertical field of view, how many bands each bearing needs given the height of what stands there, and which of those bands were actually filled. A bearing with an unfilled middle band is a bearing whose high frames have nothing to attach to.',
+    'metadata/overlap-audit.json is the connectivity check as it stood at export: the overlap graph built on geometry alone, its connected components, and every frame outside the largest one. A frame listed here would be dropped by the stitcher. It is computed during capture, so a survey that ends with entries in this file was warned while the operator was still on site.',
+    'metadata/stitch-report.json is what the offline stitcher measured: the options it ran with, every solver number, which frames it kept, and the overlap disagreement that predicts ghosting. Read headline.meanOverlapDisagreement before residualDeg — the residual is computed after the disagreeing matches are pruned away, so it improves when evidence is thrown out.',
+    'metadata/stitch-frame-usage.json is one row per photograph saying whether the stitcher used or omitted it, at what azimuth and elevation, and how far the solve moved it. A cluster of omitted frames at one elevation means no tilt row overlapped them and no visual chain reached them.',
+    'logs/stitch-log.txt is the stitcher stdout, stage by stage.',
     'metadata/scan-coverage.json is the coverage-guided scanning record: per-bearing confidence, how many frames were credited, how many merely swept past, the tuning in force, and a sampled trail of where the guidance dot was and what the frame quality was at the time.',
     'coverage-map.png draws the same thing. Covered sectors are solid, partial ones fade with confidence, amber marks horizon the camera swept through without capturing, and dark marks horizon it never pointed at. The two markers are the camera and the guidance dot at export time.',
     'metadata/project.horizon-project is the normal recomputable project archive without duplicate embedded images.',
@@ -234,11 +239,37 @@ function readme(photoCount, keyframeCount, missing, appVersion) {
 }
 
 /** Build the single-download source-photo + metadata + log archive. */
+/**
+ * What the stitcher did, per photograph.
+ *
+ * The report says which frame indices it omitted; this turns that into a row
+ * per frame with the pose it was omitted AT, so the archive answers "why is
+ * there a hole over the house" without needing the panorama in front of you.
+ * Reconstructed here rather than in Python because the app already holds the
+ * poses and the report is deliberately a summary.
+ */
+function stitchUsageRows(frames, report) {
+  const excluded = new Set(report?.graph?.excludedFrameIndices || []);
+  return frames.map(frame => ({
+    index: frame.index,
+    path: frame.photo?.path || null,
+    used: !excluded.has(frame.index),
+    azimuthDeg: frame.pointing.stitchedAzimuthDeg,
+    altitudeDeg: frame.pointing.centerAltitudeDeg,
+    rollDeg: frame.pointing.rollDeg,
+    pass: frame.pass,
+    capturedAt: frame.capturedAt,
+    solvedMovedDeg: frame.orientation.visualRotationMovedDeg ?? null
+  }));
+}
+
 export async function buildCaptureDebugZip({
   siteName, sessionId, appVersion = null, keyframes, photos, yawDatumDeg = 0,
   azimuthOffsetDeg = 0, project, debugText, logText, snapshot,
   captureAudit = null, panoramaOptimization = null,
-  scanCoverage = null, coverageImage = null
+  scanCoverage = null, coverageImage = null,
+  stitchReport = null, stitchLog = null, stitchOptions = null,
+  columnPlan = null, overlapAudit = null
 }) {
   const exportedAt = new Date();
   const photoMap = photos instanceof Map ? photos : new Map();
@@ -339,10 +370,40 @@ export async function buildCaptureDebugZip({
     { name: 'metadata/capture-audit.json', data: json(audit), modifiedAt: exportedAt },
     { name: 'metadata/panorama-optimization.json', data: json(optimization), modifiedAt: exportedAt },
     { name: 'metadata/scan-coverage.json', data: json(scanCoverage), modifiedAt: exportedAt },
+    { name: 'metadata/column-plan.json', data: json(columnPlan), modifiedAt: exportedAt },
+    { name: 'metadata/overlap-audit.json', data: json(overlapAudit), modifiedAt: exportedAt },
     { name: 'metadata/project.horizon-project', data: json(project), modifiedAt: exportedAt },
     { name: 'logs/field-log.txt', data: `${logText || '(empty)'}\n`, modifiedAt: exportedAt },
     { name: 'logs/debug-bundle.txt', data: `${debugText || '(empty)'}\n`, modifiedAt: exportedAt }
   );
+
+  // The stitch, if one has been built. Written whether or not it succeeded,
+  // because "the solve dropped a third of the frames" is exactly the thing a
+  // capture archive should be able to prove after the fact.
+  if (stitchReport) {
+    entries.push(
+      { name: 'metadata/stitch-report.json', data: json({
+        options: stitchOptions || null,
+        report: stitchReport,
+        // Restated at the top level because it is the number that predicts
+        // ghosting, and the one buried deepest in the report.
+        headline: {
+          meanOverlapDisagreement: stitchReport.render?.meanOverlapDisagreement ?? null,
+          p95OverlapDisagreement: stitchReport.render?.p95OverlapDisagreement ?? null,
+          framesUsed: stitchReport.render?.renderedFrames ?? null,
+          framesTotal: stitchReport.frames ?? null,
+          prunedResidualMedianDeg: stitchReport.residualDeg?.solvedMedian ?? null,
+          caveat: 'prunedResidualMedianDeg is measured after the disagreeing '
+            + 'matches are deleted, so it improves when evidence is discarded. '
+            + 'meanOverlapDisagreement is the number that tracks visible ghosting.'
+        }
+      }), modifiedAt: exportedAt },
+      { name: 'metadata/stitch-frame-usage.json', data: json(stitchUsageRows(frames, stitchReport)), modifiedAt: exportedAt }
+    );
+  }
+  if (stitchLog) {
+    entries.push({ name: 'logs/stitch-log.txt', data: `${stitchLog}\n`, modifiedAt: exportedAt });
+  }
 
   if (coverageImage) {
     entries.push({ name: 'coverage-map.png', data: coverageImage, modifiedAt: exportedAt });

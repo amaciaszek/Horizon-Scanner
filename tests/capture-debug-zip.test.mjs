@@ -211,5 +211,66 @@ check('stitch manifest ties image, pose, intrinsics, and crop together',
   && manifest.images[0].tanHalfVertical === 0.375
   && manifest.images[0].coverFit.rotationDeg === 0);
 
+
+/* The stitcher's own record. Added because a capture archive that cannot say
+ * which photographs the stitcher used, and why it refused the others, cannot be
+ * used to argue about a panorama after the fact — which is the only time anyone
+ * ever wants to. */
+{
+  const stitchReport = {
+    frames: 3, detector: 'orb', pairs: 12, matches: 900,
+    focalScale: 0.9885,
+    residualDeg: { solvedMedian: 0.091, solvedP90: 0.235 },
+    graph: { excludedFrameIndices: [1], largestComponentFrames: 2 },
+    render: { meanOverlapDisagreement: 16.2, p95OverlapDisagreement: 47.4, renderedFrames: 2 }
+  };
+  const built = await buildCaptureDebugZip({
+    siteName: 'Stitch record', sessionId: 's2', keyframes, photos: new Map(),
+    project: {}, debugText: 'd', logText: 'l', snapshot: {},
+    stitchReport,
+    stitchLog: ['Loading capture.zip', '  80 photos', ''].join(String.fromCharCode(10)),
+    stitchOptions: { detector: 'orb', features: 900 },
+    columnPlan: { bandStepDeg: 17.0, vfovDeg: 30.9, cellsRequired: 190, cellsFilled: 170, gaps: [] },
+    overlapAudit: { frames: 80, components: 2, largestComponent: 61, atRisk: [{ index: 47, stranded: true, elevationDeg: 46.4 }] }
+  });
+  const { files } = readStoredZip(await built.blob.arrayBuffer());
+  const text = name => new TextDecoder().decode(files.get(name) || new Uint8Array());
+
+  check('the stitch report is in the archive', files.has('metadata/stitch-report.json'));
+  const report = JSON.parse(text('metadata/stitch-report.json'));
+  check('it restates the number that predicts ghosting at the top level',
+    report.headline.meanOverlapDisagreement === 16.2, `${report.headline.meanOverlapDisagreement}`);
+  check('and warns that the residual is measured after pruning',
+    /after the disagreeing\s+matches are deleted|improves when evidence is discarded/.test(report.headline.caveat));
+  check('the options it ran with travel with it', report.options.features === 900);
+
+  check('per-photograph usage is recorded', files.has('metadata/stitch-frame-usage.json'));
+  const usage = JSON.parse(text('metadata/stitch-frame-usage.json'));
+  check('every keyframe gets a row', usage.length === keyframes.length, `${usage.length} rows`);
+  check('an omitted frame is marked, with the pose it was omitted at',
+    usage[1].used === false && Number.isFinite(usage[1].altitudeDeg),
+    `frame 1 used=${usage[1].used} at ${usage[1].altitudeDeg}°`);
+  check('a used frame is marked used', usage[0].used === true);
+
+  check('the stitcher log is kept', files.has('logs/stitch-log.txt')
+    && text('logs/stitch-log.txt').includes('80 photos'));
+  check('the vertical plan is in the archive', files.has('metadata/column-plan.json')
+    && JSON.parse(text('metadata/column-plan.json')).bandStepDeg === 17.0);
+  check('the connectivity audit is in the archive', files.has('metadata/overlap-audit.json')
+    && JSON.parse(text('metadata/overlap-audit.json')).largestComponent === 61);
+  const readme = text('README.txt');
+  check('the README explains all three',
+    readme.includes('stitch-report.json') && readme.includes('column-plan.json')
+      && readme.includes('overlap-audit.json'));
+
+  const without = await buildCaptureDebugZip({
+    siteName: 'No stitch', sessionId: 's3', keyframes, photos: new Map(),
+    project: {}, debugText: 'd', logText: 'l', snapshot: {}
+  });
+  const bare = readStoredZip(await without.blob.arrayBuffer()).files;
+  check('a capture with no panorama built carries no stitch record',
+    !bare.has('metadata/stitch-report.json') && !bare.has('logs/stitch-log.txt'));
+}
+
 console.log(failures ? `\n${failures} FAILED` : '\nall capture ZIP checks passed');
 process.exitCode = failures ? 1 : 0;

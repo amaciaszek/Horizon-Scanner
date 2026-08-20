@@ -13,18 +13,19 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.17.0';
+export const VERSION = '0.18.0';
 export const BUILD_DATE = '2026-08-19';
 
 /**
- * The stitcher moved into the app, and the measurement that forced it.
+ * Serpentine column scanning, and the 13 photographs that went missing.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'The panorama is now built by the full offline stitcher running as Python in '
-  + 'the browser, the headline quality number is overlap disagreement instead of '
-  + 'the post-pruning residual, and a bearing can be verified inside one lap.';
+  'The survey now plans in two dimensions: a column of overlapping elevation '
+  + 'bands at each bearing, swept in one motion. It also checks, after every '
+  + 'photograph, whether the overlap graph still holds together — the failure '
+  + 'that silently cost the last capture 13 frames over the house.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {

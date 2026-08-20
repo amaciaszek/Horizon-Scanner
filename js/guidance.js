@@ -148,6 +148,12 @@ export class ScanGuidance {
     this.elevationDeg = null;
     this.wantsLift = false;
     this.liftDeg = 0;
+    this.liftRemainingDeg = 0;
+    this.dropRemainingDeg = 0;
+    /** One elevation band, set by the caller from the working frame's vertical
+     *  field of view. Infinity until told otherwise, which reproduces the old
+     *  single-jump behaviour rather than inventing a step from a guess. */
+    this.bandStepDeg = Infinity;
     this.beyondTilt = false;
   }
 
@@ -392,7 +398,33 @@ export class ScanGuidance {
      */
     const rest = coverage.restElevationAt(this.rawBearingDeg);
     const wantsDrop = !wantsLift && (elevationDeg - rest) > t.descentPromptDeg;
-    const desiredElevation = wantsLift ? required : (wantsDrop ? rest : elevationDeg);
+
+    /*
+     * CLIMB IN STEPS, NOT IN ONE JUMP.
+     *
+     * This used to put the dot straight at `required` — the elevation that
+     * frames the top of the obstruction — and the operator, quite reasonably,
+     * went straight there. On the 2026-08-19 23:48 capture that meant tilting
+     * from about 9 degrees to about 47 in one movement, taking a picture, and
+     * coming back down. The vertical field of view is 30.9 degrees, so those
+     * two elevations share no pixels at all, nothing visually connects the high
+     * frames to the horizon row, and the stitcher discarded 13 of the 80
+     * photographs — every one of them a view over the house the survey was
+     * mainly there to measure.
+     *
+     * So the dot never asks for more than one band at a time. `bandStepDeg` is
+     * a little over half the vertical field, which leaves about 45% of each
+     * frame overlapping the one below it. The climb takes three prompts instead
+     * of one and deposits a frame at every height on the way, which is the
+     * whole difference between a column that stitches and a column that does
+     * not. Reaching the top is not the goal; arriving there with a connected
+     * chain behind you is.
+     */
+    const step = Number.isFinite(this.bandStepDeg) && this.bandStepDeg > 0
+      ? this.bandStepDeg : Infinity;
+    const climbTo = Math.min(required, elevationDeg + step);
+    const descendTo = Math.max(rest, elevationDeg - step);
+    const desiredElevation = wantsLift ? climbTo : (wantsDrop ? descendTo : elevationDeg);
     if (this.elevationDeg === null) {
       this.elevationDeg = desiredElevation;
     } else {
@@ -401,9 +433,15 @@ export class ScanGuidance {
       this.elevationDeg += (desiredElevation - this.elevationDeg) * alpha;
     }
     this.wantsLift = wantsLift;
-    this.liftDeg = wantsLift ? Math.max(0, required - elevationDeg) : 0;
+    // What is being asked for NOW, not the whole remaining climb. The operator
+    // is told "tilt up 17°" three times rather than "tilt up 38°" once.
+    this.liftDeg = wantsLift ? Math.max(0, climbTo - elevationDeg) : 0;
+    /** How much climbing remains after this step, so the directive can say the
+     *  column is not finished without asking for it all at once. */
+    this.liftRemainingDeg = wantsLift ? Math.max(0, required - elevationDeg) : 0;
     this.wantsDrop = wantsDrop;
-    this.dropDeg = wantsDrop ? Math.max(0, elevationDeg - rest) : 0;
+    this.dropDeg = wantsDrop ? Math.max(0, elevationDeg - descendTo) : 0;
+    this.dropRemainingDeg = wantsDrop ? Math.max(0, elevationDeg - rest) : 0;
     // Taller than any tilt this will ask for, even at the 50-degree ceiling.
     // Recorded and reported rather than repeated at the operator, since there is
     // no instruction here that could succeed.
@@ -429,6 +467,9 @@ export class ScanGuidance {
       elevationDeg: this.elevationDeg,
       wantsLift: this.wantsLift,
       liftDeg: Number((this.liftDeg || 0).toFixed(1)),
+      liftRemainingDeg: Number((this.liftRemainingDeg || 0).toFixed(1)),
+      dropRemainingDeg: Number((this.dropRemainingDeg || 0).toFixed(1)),
+      bandStepDeg: Number.isFinite(this.bandStepDeg) ? Number(this.bandStepDeg.toFixed(2)) : null,
       /** ...and how far below, coming off an obstruction. */
       wantsDrop: this.wantsDrop,
       dropDeg: Number((this.dropDeg || 0).toFixed(1)),
