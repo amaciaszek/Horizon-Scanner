@@ -36,9 +36,18 @@ section('Band geometry always leaves frames overlapping');
 
 {
   const plan = new ColumnPlan({ vfovDeg: VFOV });
-  check('band step is a little over half the vertical field',
-    plan.bandStepDeg > VFOV * 0.5 && plan.bandStepDeg < VFOV * 0.6,
-    `${plan.bandStepDeg.toFixed(1)}° step for a ${VFOV}° field`);
+  // The binding constraint is the guidance dot, not the matcher. The dot is
+  // drawn one step above where the camera points, so a step at or past half the
+  // vertical field puts it off the top of the screen at the start of every
+  // climb — and an instruction the operator cannot see is not an instruction.
+  check('the dot stays inside the frame at every step',
+    plan.bandStepDeg < VFOV / 2,
+    `${plan.bandStepDeg.toFixed(1)}° step against a ${(VFOV / 2).toFixed(1)}° half-frame`);
+  check('and not so close to the edge that it is hard to see',
+    plan.bandStepDeg / (VFOV / 2) < 0.9,
+    `dot sits at ${(100 * plan.bandStepDeg / (VFOV / 2)).toFixed(0)}% of the half-frame`);
+  check('the step is still a real fraction of the frame, not a crawl',
+    plan.bandStepDeg > VFOV * 0.3, `${plan.bandStepDeg.toFixed(1)}°`);
   check('consecutive bands share a large fraction of the frame',
     (VFOV - plan.bandStepDeg) / VFOV > 0.4,
     `${(100 * (VFOV - plan.bandStepDeg) / VFOV).toFixed(0)}% overlap`);

@@ -449,11 +449,27 @@ export class ScanDirector {
         arrow: 0, tilt: null, phase: this.phase, progress: g.summary.fraction
       };
     }
+    /*
+     * THE DOT SAYS HOW FAR. THE WORDS SAY WHICH WAY.
+     *
+     * This used to read "Tilt up 17°", and a number of degrees is not something
+     * anyone can act on while holding a tablet up at a roofline — there is no
+     * protractor in the viewfinder. The dot already sits at exactly the right
+     * height, one band above where the camera is, so the instruction that
+     * actually works is to go and get it. Saying both is worse than saying one:
+     * an operator who tries to obey a number stops watching the thing that is
+     * leading them.
+     *
+     * `more` exists so that a climb still feels like it has an end. The dot only
+     * ever asks for one step at a time, and without a word about what is coming
+     * the operator has no way to tell a last step from a first one.
+     */
     if (g.wantsLift && away < 25) {
+      const more = (g.liftRemainingDeg || 0) - (g.liftDeg || 0) > 4;
       return {
         tone: 'work',
-        headline: `Tilt up ${Math.max(1, Math.round(g.liftDeg))}° — this is taller than the frame`,
-        detail: `The top of what stands here has never been inside a picture, so its height is unmeasured. Raise the camera until the target sits on it, keeping the same spot on the ground. ${pct}% of the horizon done.`,
+        headline: 'Follow the target up',
+        detail: `The top of what stands here has never been inside a picture, so its height is unmeasured. The target has moved up — raise the camera until it sits back in the middle, keeping your feet where they are.${more ? ' It will step up again once this height is covered.' : ''} ${pct}% of the horizon done.`,
         arrow: 0, tilt: +1, phase: this.phase, progress: g.summary.fraction
       };
     }
@@ -465,10 +481,11 @@ export class ScanDirector {
      * nothing fills until the camera comes down.
      */
     if (g.wantsDrop && away < 25) {
+      const more = (g.dropRemainingDeg || 0) - (g.dropDeg || 0) > 4;
       return {
         tone: 'work',
-        headline: `Tilt down ${Math.max(1, Math.round(g.dropDeg))}° — the skyline has dropped`,
-        detail: `You are past the tall part. The camera is still aimed above where the skyline sits here, so these frames are all sky and count for nothing. Follow the target down and keep turning. ${pct}% of the horizon done.`,
+        headline: 'Follow the target down',
+        detail: `You are past the tall part. The camera is still aimed above where the skyline sits here, so these frames are all sky and count for nothing. The target has dropped — bring the camera down onto it and keep turning.${more ? ' It has further to go once this height is covered.' : ''} ${pct}% of the horizon done.`,
         arrow: 0, tilt: -1, phase: this.phase, progress: g.summary.fraction
       };
     }
@@ -490,7 +507,7 @@ export class ScanDirector {
     }
     if (g.wantsLift) {
       return say('work', `Follow the target — ${g.offsetDeg > 0 ? 'right' : 'left'} and up`,
-        `${pct}% covered. The next section is taller than the frame, so the target sits above the horizon; raise the camera to meet it.`,
+        `${pct}% covered. The next section is taller than the frame, so the target sits above the horizon. Keep it in the middle of the picture and it will lead you up in stages.`,
         arrow, g.summary.fraction);
     }
     return say('good', 'Following the target',

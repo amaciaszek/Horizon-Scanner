@@ -40,14 +40,25 @@ export const COLUMN_TUNING = {
    * Vertical step between band centres, as a fraction of the vertical field of
    * view.
    *
-   * 0.55 leaves 45% of each frame overlapping the band above it. That is the
-   * same overlap the horizontal sweep already targets, and for the same reason:
-   * a feature matcher needs a shared region big enough to hold texture, not a
-   * touching edge. At the measured 30.9° vertical field this puts the step at
-   * 17.0°, so the 9°-to-47° jump that broke the 23:48 capture becomes three
-   * frames instead of a leap.
+   * TWO CONSTRAINTS, AND THE TIGHTER ONE IS THE DOT.
+   *
+   * The matcher needs the frames to overlap: any step below 1.0 achieves that,
+   * and smaller is better. But the operator is led by the guidance dot, and the
+   * dot is drawn at one step above where the camera is pointing — so a step of
+   * half the vertical field or more puts the dot off the top of the screen at
+   * the start of every climb. An instruction you cannot see is not an
+   * instruction, and the whole reason this is a dot rather than a number of
+   * degrees is that a person can act on a thing they can see.
+   *
+   * 0.40 puts the dot at 80% of the way to the top edge: unmistakably a request
+   * to tilt up, and unmistakably still on the screen. It also leaves 60% of each
+   * frame overlapping the one below, which is more than the horizontal sweep
+   * asks for. At the measured 30.9° vertical field the step is 12.4°, so the
+   * 9°-to-47° jump that cost the 2026-08-19 capture 13 photographs becomes
+   * three ordinary movements, each one ending with the dot back in the middle
+   * of the picture.
    */
-  overlapFraction: 0.55,
+  overlapFraction: 0.40,
 
   /** Never step less than this, whatever a very narrow lens claims. */
   minBandStepDeg: 6,
