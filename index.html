@@ -10,7 +10,7 @@
      Bump it with VERSION in js/version.js; iPad Safari holds CSS aggressively
      and the resulting half-styled page looks like a broken build, not a stale
      one, which is a bad thing to be debugging in a field. -->
-<link rel="stylesheet" href="styles.css?v=0.18.1" />
+<link rel="stylesheet" href="styles.css?v=0.19.0" />
 </head>
 <body>
 
@@ -154,10 +154,10 @@
     <span id="stitchRuntime" class="chip quiet">runtime not loaded</span>
     <label class="zoom">Quality
       <select id="stitchQuality">
-        <option value="fast">Fast — 350 features</option>
-        <option value="normal" selected>Normal — 500 features</option>
-        <option value="fine">Fine — 900 features</option>
-        <option value="reference">Reference — SIFT, 1200</option>
+        <option value="fast">Fast — ORB, for a quick look</option>
+        <option value="normal" selected>Normal — SIFT 2000</option>
+        <option value="fine">Fine — SIFT 3000</option>
+        <option value="reference">Reference — SIFT 5000, slowest</option>
       </select>
     </label>
     <label class="zoom">Detail
@@ -452,6 +452,6 @@
      modules aggressively, and a device pairing new markup with a cached script
      fails in ways that look like a broken build rather than a stale one. Bump
      with VERSION in js/version.js. -->
-<script type="module" src="js/main.js?v=0.18.1"></script>
+<script type="module" src="js/main.js?v=0.19.0"></script>
 </body>
 </html>

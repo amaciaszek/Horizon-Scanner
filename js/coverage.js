@@ -106,9 +106,39 @@ export const COVERAGE_TUNING = {
   minSkylineConfidence: 0.30,
   goodSkylineConfidence: 0.55,
 
-  /** Frame-to-frame registration quality, where the pipeline reports it. */
-  minVisualQuality: 0.20,
-  goodVisualQuality: 0.45,
+  /**
+   * Frame-to-frame registration quality, where the pipeline reports it.
+   *
+   * RECALIBRATED 2026-08-20 AGAINST WHAT THE SENSOR ACTUALLY REPORTS.
+   *
+   * These were 0.20 and 0.45, which assumed a well-registered frame scores
+   * around 0.45. It does not. `visualQuality` comes out of the NCC tracker as
+   * `((peak - 0.45) / 0.5) * clamp(sharpness * 12, 0.25, 1)`, and on the things
+   * this app photographs — foliage, clapboard, shingles, fence palings — the
+   * second-best correlation peak is nearly as good as the best, so the
+   * sharpness term holds even a perfectly tracked frame down near 0.25.
+   *
+   * Measured over 142 keyframes from two real captures (2026-08-19 and
+   * 2026-08-20), the distribution is: p05 0.111, p10 0.151, median 0.247,
+   * p90 0.530. Against the old ramp the MEDIAN frame earned 0.19 of its
+   * possible credit and one frame in five earned exactly nothing.
+   *
+   * The consequence was total. Coverage is a product of seven ramps, so a
+   * median factor of 0.19 multiplied through everything: the 2026-08-20 capture
+   * ran for 224 seconds, held every other ramp at 1.0, and finished with a mean
+   * bin score of 0.005 and ZERO of its 180 bins covered. The guidance dot had
+   * nothing to advance on, which is exactly the "dot lagged and would not move
+   * when I was on it" the operator reported. The map was blind, not slow.
+   *
+   * 0.08 and 0.28 put the median frame at 0.84 and zero only the worst 4%. The
+   * discrimination that matters is kept: the frames over the nearby house and
+   * umbrella score 0.036 and 0.043 and still earn nothing, which is correct,
+   * because near-field parallax is precisely what the tracker is failing on
+   * there. This ramp's job is to reject tracking failures, not to grade good
+   * frames against each other.
+   */
+  minVisualQuality: 0.08,
+  goodVisualQuality: 0.28,
 
   /** Blown-highlight fraction. Panning into a low sun collapses the exposure
    *  and the traced skyline with it. */

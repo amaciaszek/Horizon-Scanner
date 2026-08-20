@@ -27,8 +27,15 @@ const PYODIDE_BASE = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/full/
 
 /* Above this frame count the decoded images alone approach what a mobile
  * WebAssembly heap will give us, and the failure mode is an abort with no
- * useful message. Warn while the operator can still choose a cheaper build. */
-const MEMORY_WARN_FRAMES = 160;
+ * useful message. Warn while the operator can still choose a cheaper build.
+ *
+ * Raised from 160 on 2026-08-20 when the capture was made denser (86% overlap
+ * instead of 80%) and the detector moved to SIFT. A 640x480 frame is 0.9 MB
+ * decoded, so 240 frames is about 220 MB of imagery; SIFT descriptors at 3000
+ * features add roughly 1.5 MB a frame on top. That is comfortable on an M1 iPad
+ * and a modern Snapdragon, and it is the point past which a phone with a 32-bit
+ * WebAssembly heap starts to be at real risk. */
+const MEMORY_WARN_FRAMES = 240;
 
 let pyodide = null;
 let initialization = null;

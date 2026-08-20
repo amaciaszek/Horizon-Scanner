@@ -9,8 +9,13 @@ function check(name, ok, detail = '') {
   if (!ok) failures++;
 }
 
-check('iPad sweep targets about 80% horizontal overlap',
-  Math.abs(keyframeStepDeg(45.6) - 9.12) < 1e-9);
+// 86% overlap, raised from 80% on 2026-08-20. A frame is cheap on a survey that
+// is run once and relied on for years; a hole in the overlap graph is not, and
+// the 2026-08-20 capture lost 24 of its 63 photographs in the arc that had the
+// least redundancy in it.
+check('iPad sweep targets about 86% horizontal overlap',
+  Math.abs(keyframeStepDeg(45.6) - 45.6 * 0.14) < 1e-9,
+  `${keyframeStepDeg(45.6).toFixed(2)}° step on a 45.6° lens`);
 check('very narrow lenses retain a safe minimum spacing', keyframeStepDeg(10) === 3);
 check('handheld rate ceiling admits a deliberate 25 deg/s sweep',
   maxKeyframeYawRate({ mode: 'handheld' }) === 35

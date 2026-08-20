@@ -1,8 +1,27 @@
 'use strict';
 
-/** Horizontal keyframe spacing for dense visual overlap. */
+/**
+ * Horizontal keyframe spacing for dense visual overlap.
+ *
+ * 0.14 of the horizontal field, so consecutive photographs share 86% of their
+ * width. It was 0.20, and 0.20 is not wrong — it is what you choose when frames
+ * are expensive.
+ *
+ * They are not expensive here. This survey is run once for a fixed telescope
+ * and then relied on for years, the operator is standing still while it
+ * happens, and the whole capture takes minutes. Against that, the cost of a
+ * sparse frame is a hole that cannot be filled without going back to the site.
+ * The 2026-08-20 capture took 63 photographs in 224 seconds and the solver
+ * could place 39 of them; the arc it lost was the one with the least redundancy
+ * in it.
+ *
+ * At 0.14 a 38.7° lens steps 5.4° instead of 7.7°, so a lap costs about 66
+ * photographs per elevation band instead of 46. That is the cheap direction to
+ * be wrong in: extra frames cost seconds of walking and a little solver time,
+ * and missing ones cost a return trip.
+ */
 export function keyframeStepDeg(horizontalFovDeg) {
-  return Math.max(3, Number(horizontalFovDeg) * 0.20);
+  return Math.max(3, Number(horizontalFovDeg) * 0.14);
 }
 
 /** Instantaneous yaw-rate ceiling at the exposure, not a smoothed later rate. */

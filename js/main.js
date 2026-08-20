@@ -11,7 +11,7 @@ import { Survey, RULES, BIN_COUNT, BIN_STEP, STATUS } from './survey.js';
 import { ScanDirector, PHASE } from './guide.js';
 import { CoverageMap } from './coverage.js';
 import { ScanGuidance } from './guidance.js';
-import { ColumnPlan, overlapAudit } from './column-plan.js';
+import { ColumnPlan, overlapAudit, bridgeTargets } from './column-plan.js';
 import { Pipeline } from './pipeline.js';
 import { PreflightSweep, VERDICT, MIN_SWEEP_DEG } from './preflight.js';
 import { drawRing, drawProfile, drawOverlay, renderCoverageCard } from './render.js';
@@ -115,6 +115,7 @@ const state = {
   frameStatus: 'ok',
   overlap: null,
   visualQuality: null,
+  skylineConfidence: null,
   visualSign: null,
   signSamples: [],
   calibStart: 0,
@@ -190,6 +191,21 @@ function recordGuidanceSample(t, pose, att, quality) {
     scoreHere: Number.isFinite(g.hereScore) ? Number(g.hereScore.toFixed(3)) : null,
     // Why this frame counted for what it did.
     frameQuality: quality && Number.isFinite(quality.quality) ? Number(quality.quality.toFixed(3)) : 0,
+    /*
+     * The INPUTS to that quality, not just the product.
+     *
+     * Diagnosing the 2026-08-20 capture took cross-referencing the trail
+     * against keyframes.json to discover that visualQuality was the ramp
+     * crushing every score, because the trail recorded only the seven ramps
+     * multiplied together. A product of seven numbers tells you something is
+     * wrong and nothing about which. These two are the ramps that vary with the
+     * scene rather than with the operator's hands, so they are the two worth
+     * carrying.
+     */
+    visualQuality: Number.isFinite(state.visualQuality)
+      ? Number(state.visualQuality.toFixed(3)) : null,
+    skylineConfidence: Number.isFinite(state.skylineConfidence)
+      ? Number(state.skylineConfidence.toFixed(3)) : null,
     credited: !!(quality && quality.credited),
     elevationDeg: Number(att.elevation.toFixed(2)),
     rollDeg: Number(att.roll.toFixed(2)),
@@ -611,13 +627,14 @@ async function processFrame() {
     if (director.phase === PHASE.PASS1 || director.phase === PHASE.PASS2) {
       const dtSec = state.lastCoverageAt === null ? null : (t - state.lastCoverageAt) / 1000;
       state.lastCoverageAt = t;
+      state.skylineConfidence = seg && !seg.error ? meanConfidence(seg) : null;
       const quality = coverage.observe({
         headingDeg: currentHeading(),
         elevationDeg: att.elevation,
         rollDeg: att.roll,
         yawRateDegPerSec: pose.gyro.yawRateDegPerSec,
         jitterDeg: pose.jitterDeg,
-        skylineConfidence: seg && !seg.error ? meanConfidence(seg) : null,
+        skylineConfidence: state.skylineConfidence,
         visualQuality: state.visualQuality,
         glareFraction: state.glareFraction,
         frameStatus: state.frameStatus,
@@ -2546,19 +2563,30 @@ function auditOverlap() {
   }));
   const audit = overlapAudit(frames, { hfovDeg: intr.hfovDeg, vfovDeg: intr.vfovDeg });
   state.overlapAudit = audit;
+  /* A diagnosis handed to someone standing in a field is worth what the
+   * instruction after it is worth. These are the places a photograph would
+   * reconnect the stranded work; on the 2026-08-20 capture, 23 frames at six
+   * such points took the graph from 3 components with 39 usable frames to one
+   * component with all 86 and nothing stranded. */
+  state.bridgeTargets = bridgeTargets(frames, audit,
+    { hfovDeg: intr.hfovDeg, vfovDeg: intr.vfovDeg });
 
   // Only speak when the situation gets worse. A warning repeated every second
   // is a warning nobody reads, and the operator is being asked to change what
   // they are doing, which is only reasonable to ask once per new problem.
   const stranded = audit.atRisk.filter(r => r.stranded).length;
   if (stranded > lastStrandedCount && stranded >= 3) {
-    const worst = audit.riskiestElevationDeg;
+    const go = state.bridgeTargets[0];
     log('warn', `${stranded} photographs are not connected to the rest of the survey and will `
-      + `be left out of the panorama. They are around ${worst?.toFixed(0)}° elevation. Tilt back `
-      + 'down through the middle of that range and keep shooting, so there is something between '
-      + 'them and the horizon row.', {
+      + 'be left out of the panorama. '
+      + (go
+        ? `Point at ${go.bearingDeg.toFixed(0)}° and ${go.elevationDeg.toFixed(0)}° elevation and `
+          + `take about ${go.framesNeeded} frame${go.framesNeeded > 1 ? 's' : ''} — that is `
+          + 'half way between the stranded work and the part that is solid, so it joins them.'
+        : 'Tilt back down through the middle of that range and keep shooting.'), {
       stranded, components: audit.components, largestComponent: audit.largestComponent,
-      riskiestElevationDeg: worst
+      riskiestElevationDeg: audit.riskiestElevationDeg,
+      bridgeTargets: state.bridgeTargets
     });
   }
   lastStrandedCount = stranded;
@@ -2594,11 +2622,29 @@ function getStitcher() {
 /** Map the Quality select onto the solver's actual knobs. */
 function stitchOptions() {
   const preset = $('stitchQuality').value;
+  /*
+   * MEASURED 2026-08-20, on the 63-frame capture the operator described as
+   * "only tiny mismatches in the house". The detector, not the geometry, was
+   * deciding how much of that survey could be used at all:
+   *
+   *   ORB  1200, r72, d24 -> largest solved component 39 of 63 frames, 32.8 s
+   *   SIFT 3000, r96, d28 -> largest solved component 62 of 63 frames, 27.3 s
+   *
+   * Twenty-three photographs the operator had already taken, over the house and
+   * the umbrella, were being discarded for want of descriptors — and SIFT found
+   * them in LESS wall-clock time, because a stronger descriptor spends its
+   * effort on matches that survive verification instead of on candidates that
+   * do not. There is no case for ORB as the default here. It stays as the fast
+   * preset for a quick look on a phone with a small memory budget.
+   *
+   * This is a survey run once and relied on for years. Minutes are the cheapest
+   * thing it can spend.
+   */
   const table = {
-    fast: { detector: 'orb', features: 350, search: 48, degree: 16 },
-    normal: { detector: 'orb', features: 500, search: 64, degree: 24 },
-    fine: { detector: 'orb', features: 900, search: 72, degree: 24 },
-    reference: { detector: 'sift', features: 1200, search: 80, degree: 24 }
+    fast: { detector: 'orb', features: 900, search: 64, degree: 20 },
+    normal: { detector: 'sift', features: 2000, search: 88, degree: 24 },
+    fine: { detector: 'sift', features: 3000, search: 96, degree: 28 },
+    reference: { detector: 'sift', features: 5000, search: 112, degree: 32 }
   };
   return {
     ...(table[preset] || table.normal),
@@ -3223,7 +3269,8 @@ function captureArchivePayload(photos, { includeCoverageImage = null } = {}) {
     // capture rather than the stitch, so they are written whether or not a
     // panorama was ever built.
     columnPlan: columns.snapshot(),
-    overlapAudit: state.overlapAudit || null,
+    overlapAudit: state.overlapAudit
+      ? { ...state.overlapAudit, bridgeTargets: state.bridgeTargets || [] } : null,
     stitchReport: state.pano?.report || null,
     stitchLog: state.pano?.log || null,
     stitchOptions: state.pano?.options || null,
@@ -3240,52 +3287,16 @@ async function exportCaptureDebugZip() {
     const photos = await loadKeyframeBlobs({ waitForPending: true });
     const usedPhotos = survey.keyframes.filter(kf => photos.has(kf.index)).length;
     log('info', `CAPTURE_DEBUG_EXPORT collecting ${usedPhotos} photo(s) for ${survey.keyframes.length} keyframe(s).`);
-    const snapshot = debugSnapshot();
-    const project = currentProject(false);
-    const result = await buildCaptureDebugZip({
-      siteName: $('siteName').value,
-      sessionId: state.sessionId,
-      appVersion: `${VERSION} (${BUILD_DATE})`,
-      keyframes: survey.keyframes,
-      photos,
-      yawDatumDeg: survey.yawDatum || 0,
-      azimuthOffsetDeg: Number($('azOffset').value) || 0,
-      project,
-      snapshot,
-      captureAudit: {
-        counts: { ...state.captureAudit.counts },
-        events: state.captureAudit.events.slice()
-      },
-      panoramaOptimization: state.pano?.optimization || null,
-      // Coverage-guided scanning: the map, the tuning that produced it, and a
-      // sampled trail of where the dot was with the frame quality at the time.
-      // The picture is the same data, for when the question is "why did the
-      // target sit there" and nobody wants to read an array of 180 floats.
-      scanCoverage: {
-        ...coverage.snapshot(),
-        tuning: { ...coverage.tuning },
-        guidance: state.guidance ? {
-          state: state.guidance.state,
-          bearingDeg: state.guidance.bearingDeg,
-          targetBearingDeg: state.guidance.rawBearingDeg,
-          offsetDeg: state.guidance.offsetDeg,
-          waitingSec: Number((state.guidance.waitingSec || 0).toFixed(2)),
-          tuning: { ...guidance.tuning }
-        } : { state: 'not-started', tuning: { ...guidance.tuning } },
-        bearings: Array.from({ length: coverage.binCount }, (_, i) => ({
-          bearingDeg: Number(coverage.bearingOf(i).toFixed(2)),
-          score: Number(coverage.score[i].toFixed(4)),
-          creditedFrames: coverage.observations[i],
-          sweptFrames: coverage.visits[i],
-          covered: coverage.isCovered(i)
-        })),
-        trail: state.guidanceTrail.slice()
-      },
-      coverageImage: await renderCoverageCard(coverage, state.guidance
-        ? { ...state.guidance, headingDeg: currentHeading() } : null),
-      debugText: buildDebugBundle(),
-      logText: L.dump()
-    });
+    // One payload builder, shared with the in-app stitcher. They were separate
+    // literals until 2026-08-20, and the consequence was silent: the Export
+    // button kept writing an archive with column-plan.json and
+    // overlap-audit.json set to null, because only the stitcher's copy had been
+    // taught to include them. Two builders for one format will always drift;
+    // there is now one.
+    const result = await buildCaptureDebugZip(captureArchivePayload(photos, {
+      includeCoverageImage: await renderCoverageCard(coverage, state.guidance
+        ? { ...state.guidance, headingDeg: currentHeading() } : null)
+    }));
     downloadBlob(result.blob, result.filename);
     const missing = result.keyframeCount - result.photoCount;
     log(missing ? 'warn' : 'info', `Wrote ${result.filename}, ${(result.blob.size / 1e6).toFixed(1)} MB: ${result.photoCount}/${result.keyframeCount} source photos plus metadata and logs${missing ? ` (${missing} photo(s) unavailable)` : ''}.`);

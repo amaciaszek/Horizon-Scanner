@@ -381,6 +381,81 @@ export class ColumnPlan {
 }
 
 /**
+ * Where to point to join a stranded group back onto the survey.
+ *
+ * The audit says a group of frames cannot be placed. That is a diagnosis, and a
+ * diagnosis delivered to someone standing in a field is only worth as much as
+ * the instruction that follows it. This turns it into somewhere to point.
+ *
+ * For every stranded frame, find the nearest frame that IS in the main
+ * component and propose the midpoint between them. A frame taken there overlaps
+ * both by construction, so it is precisely the missing link — and because the
+ * bearing gap in these failures is usually small while the ELEVATION gap is
+ * large, the proposal is nearly always "same direction, half way down", which
+ * is the movement the operator never makes on their own.
+ *
+ * Measured on the 2026-08-20 capture: 24 of 63 frames stranded across 242°-340°,
+ * every one of them recoverable by a handful of frames at intermediate heights.
+ *
+ * Proposals are merged when they land close together, because six prompts for
+ * one hole is not guidance, and returned worst-first so the operator fixes the
+ * biggest disconnection with the first frame they take.
+ */
+export function bridgeTargets(frames, audit, {
+  hfovDeg = 40, vfovDeg = 31, mergeDeg = 10, limit = 6
+} = {}) {
+  if (!audit || !audit.atRisk?.length) return [];
+  const stranded = audit.atRisk.filter(r => r.stranded);
+  if (!stranded.length) return [];
+
+  const strandedIds = new Set(stranded.map(r => r.index));
+  const anchors = frames.filter(f => !strandedIds.has(f.index ?? -1));
+  if (!anchors.length) return [];
+
+  const proposals = [];
+  for (const lost of stranded) {
+    let best = null, bestGap = Infinity;
+    for (const anchor of anchors) {
+      const meanAlt = (lost.elevationDeg + anchor.elevationDeg) / 2;
+      const daz = Math.abs(angDiff(lost.azimuthDeg, anchor.azimuthDeg))
+        * Math.cos(clamp(meanAlt, -85, 85) * Math.PI / 180);
+      const dalt = Math.abs(lost.elevationDeg - anchor.elevationDeg);
+      const gap = Math.hypot(daz, dalt);
+      if (gap < bestGap) { bestGap = gap; best = anchor; }
+    }
+    if (!best) continue;
+    // The midpoint, in the sense that matters: half way in bearing the short
+    // way round, half way in elevation.
+    const half = angDiff(best.azimuthDeg, lost.azimuthDeg) / 2;
+    proposals.push({
+      bearingDeg: wrap360(lost.azimuthDeg + half),
+      elevationDeg: (lost.elevationDeg + best.elevationDeg) / 2,
+      gapDeg: bestGap,
+      joins: lost.index,
+      to: best.index ?? null
+    });
+  }
+
+  const merged = [];
+  for (const prop of proposals.sort((a, b) => b.gapDeg - a.gapDeg)) {
+    const near = merged.find(m =>
+      Math.abs(angDiff(m.bearingDeg, prop.bearingDeg)) < mergeDeg
+      && Math.abs(m.elevationDeg - prop.elevationDeg) < mergeDeg);
+    if (near) { near.frames.push(prop.joins); continue; }
+    merged.push({
+      bearingDeg: prop.bearingDeg,
+      elevationDeg: prop.elevationDeg,
+      gapDeg: prop.gapDeg,
+      frames: [prop.joins],
+      // A gap wider than a frame cannot be closed by one photograph, and
+      // saying so stops the operator taking one and believing it is fixed.
+      framesNeeded: Math.max(1, Math.ceil(prop.gapDeg / Math.min(hfovDeg, vfovDeg) * 2))
+    });
+  }
+  return merged.slice(0, limit);
+}
+
+/**
  * What fraction of a frame's area two frames share.
  *
  * NOT centre-to-centre distance. The first version of this used the diagonal

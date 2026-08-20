@@ -13,7 +13,7 @@
  * still standing there.
  */
 
-import { ColumnPlan, COLUMN_TUNING, overlapAudit } from '../js/column-plan.js';
+import { ColumnPlan, COLUMN_TUNING, overlapAudit, bridgeTargets } from '../js/column-plan.js';
 
 let failures = 0;
 function check(name, ok, detail = '') {
@@ -222,6 +222,65 @@ section('Gaps are reported as bearings a person can act on');
   // report that ignored it would send the operator back over covered ground.
   check('the run is narrowed by the width of a frame',
     gaps[0].widthDeg === 40, `${gaps[0].widthDeg}° of the 60° never aimed at`);
+}
+
+section('A stranded group is turned into somewhere to point');
+
+{
+  /* The 2026-08-20 failure, reproduced: a solid horizon row all the way round,
+   * and a tall arc of work between 242° and 340° that never reaches it. The
+   * solver kept 39 of 63 frames; the audit independently agreed. */
+  const frames = [];
+  for (let k = 0; k < 40; k++) {
+    frames.push({ index: k, azimuthDeg: (k * 9) % 360, elevationDeg: 5 });
+  }
+  let n = 40;
+  for (const az of [242, 252, 262, 272, 282, 292, 302, 312, 322, 332]) {
+    for (const alt of [48, 55]) frames.push({ index: n++, azimuthDeg: az, elevationDeg: alt });
+  }
+
+  const HF = 38.73, VF = 30.75;
+  const audit = overlapAudit(frames, { hfovDeg: HF, vfovDeg: VF });
+  check('the tall arc is stranded', audit.components > 1,
+    `${audit.components} components, largest ${audit.largestComponent}/${frames.length}`);
+
+  const bridges = bridgeTargets(frames, audit, { hfovDeg: HF, vfovDeg: VF });
+  check('somewhere to point is proposed', bridges.length > 0, `${bridges.length} target(s)`);
+  check('the proposals sit between the two heights, not at either',
+    bridges.every(b => b.elevationDeg > 8 && b.elevationDeg < 46),
+    bridges.map(b => `${b.elevationDeg.toFixed(0)}°`).join(', '));
+  check('and in the arc that is broken, not elsewhere',
+    bridges.every(b => b.bearingDeg >= 235 && b.bearingDeg <= 345),
+    bridges.map(b => `${b.bearingDeg.toFixed(0)}°`).join(', '));
+  check('a wide gap asks for more than one frame',
+    bridges.every(b => b.framesNeeded >= 1) && bridges.some(b => b.framesNeeded > 1));
+  check('the worst disconnection is proposed first',
+    bridges[0].gapDeg >= bridges[bridges.length - 1].gapDeg,
+    `${bridges[0].gapDeg.toFixed(0)}° first`);
+
+  // The property that matters: taking the suggested frames actually fixes it.
+  const added = [];
+  for (const b of bridges) {
+    for (let k = 0; k < b.framesNeeded; k++) {
+      added.push({ index: 900 + added.length, azimuthDeg: b.bearingDeg, elevationDeg: b.elevationDeg });
+    }
+  }
+  const after = overlapAudit([...frames, ...added], { hfovDeg: HF, vfovDeg: VF });
+  check('taking them reconnects the survey', after.components === 1,
+    `${after.components} component(s), largest ${after.largestComponent}/${frames.length + added.length}`);
+  check('and nothing originally captured is left stranded',
+    after.atRisk.filter(r => r.stranded && r.index < 900).length === 0);
+  check('the fix is cheap relative to the work it saves',
+    added.length < frames.length / 2, `${added.length} frames to rescue ${frames.length - audit.largestComponent}`);
+}
+
+{
+  // A healthy survey must not be told to go anywhere.
+  const frames = [];
+  for (let k = 0; k < 60; k++) frames.push({ index: k, azimuthDeg: (k * 6) % 360, elevationDeg: 5 });
+  const audit = overlapAudit(frames, { hfovDeg: 38.73, vfovDeg: 30.75 });
+  check('a connected survey proposes nothing',
+    bridgeTargets(frames, audit, {}).length === 0);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall column-plan checks passed');
