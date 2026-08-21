@@ -24,6 +24,48 @@ export function keyframeStepDeg(horizontalFovDeg) {
   return Math.max(3, Number(horizontalFovDeg) * 0.14);
 }
 
+/** Vertical keyframe spacing, on the same principle as the horizontal one. */
+export function keyframeTiltStepDeg(verticalFovDeg) {
+  return Math.max(2.5, Number(verticalFovDeg) * 0.14);
+}
+
+/**
+ * Has the camera moved far enough for the next photograph?
+ *
+ * MEASURED ON THE SPHERE, NOT IN YAW.
+ *
+ * This was `|angDiff(yaw, yawAtLastKeyframe)| >= stepDeg`, which is yaw and
+ * nothing else — and the consequence was that tilting the camera did not count
+ * as movement at all. An operator sweeping straight up a column at one bearing
+ * changes their yaw by nothing, so after the first frame of that column every
+ * single candidate was refused. The 2026-08-20 capture logged 1,734 rejections
+ * for "spacing-not-reached" against 63 accepted photographs: 92% of everything
+ * the operator did was thrown away, and the vertical work the guidance had just
+ * asked for was precisely the part that could never be recorded.
+ *
+ * That made the serpentine structurally impossible. The dot would ask for a
+ * band above the horizon, the operator would go there, and the app would
+ * decline to photograph it.
+ *
+ * Both axes now count, each against its own field of view, combined as an
+ * ellipse so that a diagonal move earns its share of both. Bearing is scaled by
+ * the cosine of the elevation because a degree of yaw is a smaller angle the
+ * higher the camera is pointed — at 55° it is worth barely half what it is
+ * worth on the horizon, and treating them as equal is what let high rows go
+ * sparse while the app believed they were dense.
+ */
+export function keyframeSpacingReached({
+  yawDeltaDeg = 0, tiltDeltaDeg = 0, elevationDeg = 0,
+  hfovDeg = 45, vfovDeg = 34
+} = {}) {
+  const across = Math.abs(Number(yawDeltaDeg) || 0)
+    * Math.cos(Math.min(85, Math.abs(Number(elevationDeg) || 0)) * Math.PI / 180);
+  const down = Math.abs(Number(tiltDeltaDeg) || 0);
+  const stepAcross = keyframeStepDeg(hfovDeg);
+  const stepDown = keyframeTiltStepDeg(vfovDeg);
+  return Math.hypot(across / stepAcross, down / stepDown) >= 1;
+}
+
 /** Instantaneous yaw-rate ceiling at the exposure, not a smoothed later rate. */
 export function maxKeyframeYawRate() {
   return 35;

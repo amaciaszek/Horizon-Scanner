@@ -13,16 +13,16 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.19.0';
-export const BUILD_DATE = '2026-08-20';
+export const VERSION = '0.20.0';
+export const BUILD_DATE = '2026-08-21';
 
 /**
- * The blind coverage map, and the 23 photographs the detector was throwing away.
+ * Columns that finish, a dot that lets go, and straight lines that stay straight.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'The coverage map was blind: one miscalibrated ramp scored a normal frame at a fifth of its worth, so the dot had nothing to advance on. Fixed, and the stitcher now uses SIFT with far more features — on the last capture that placed 62 of 63 photographs instead of 39.';
+  'The serpentine is enforced: the target holds a bearing until its column of heights is filled, and gives up rather than pinning when a column cannot be reached. Lens distortion is corrected, and the panorama can be looked around as a dome.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {

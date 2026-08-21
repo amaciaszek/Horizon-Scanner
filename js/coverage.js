@@ -346,6 +346,46 @@ export class CoverageMap {
     }
   }
 
+  /**
+   * Knock the confidence out of specific bearings, keeping the rest.
+   *
+   * The alternative — and what used to happen at the end of a lap — is to wipe
+   * the whole map so the next pass "earns its own" coverage. That is the right
+   * instinct for VERIFICATION and the wrong mechanism for GUIDANCE, and the two
+   * were sharing one array.
+   *
+   * Measured on the 2026-08-21 capture: pass 1 finished at 3m43s having covered
+   * the ring, the map was wiped, and the operator then worked for another six
+   * minutes against a guidance dot that believed nothing had ever been
+   * surveyed. The exported map shows 24 observations total, all of them in a
+   * 34-degree arc around where they happened to be standing when they gave up.
+   * The operator's report — "the dot got very stuck, and I had to cover places
+   * it wasn't telling me to" — is exactly what a blank map feels like.
+   *
+   * Verification lives in the survey's own 720 bins and always did. This map
+   * exists to tell someone where to point, so it keeps what it knows and forgets
+   * only the sectors that actually need re-walking.
+   */
+  demote(bearings = [], { to = 0.0 } = {}) {
+    let touched = 0;
+    for (const entry of bearings) {
+      const from = Number(entry?.fromDeg ?? entry);
+      const width = Number(entry?.widthDeg ?? this.binSizeDeg);
+      if (!Number.isFinite(from)) continue;
+      const steps = Math.max(1, Math.ceil(width / this.binSizeDeg));
+      for (let k = 0; k < steps; k++) {
+        const index = this.indexOf(from + k * this.binSizeDeg);
+        if (this.score[index] > to) {
+          this.score[index] = to;
+          this.observations[index] = 0;
+          touched++;
+        }
+      }
+    }
+    if (touched) this.generation++;
+    return touched;
+  }
+
   /** Bin index containing a bearing. */
   indexOf(headingDeg) {
     return Math.floor(wrap360(headingDeg) / this.binSizeDeg) % this.binCount;

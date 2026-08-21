@@ -21,10 +21,11 @@ import * as store from './storage.js';
 import * as out from './exporters.js';
 import { buildCaptureDebugZip } from './diagnostic-export.js';
 import { captureGapReport } from './capture-gaps.js';
-import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted, overlapFloor, pass1OverTravel } from './capture-policy.js';
+import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted, overlapFloor, pass1OverTravel, keyframeSpacingReached } from './capture-policy.js';
 import { disagreementByBin, pixelToAzAlt, landmarkResiduals } from './panorama.js';
 import { PyodideStitcher, stitcherAvailability } from './pyodide-stitch.js';
 import { bearingCoverage, frameCoverage, stitchVerdict } from './coverage-table.js';
+import { DomeView, domeAvailable } from './dome-view.js';
 
 const $ = id => document.getElementById(id);
 const log = (level, ...a) => L.log(level, ...a);
@@ -110,6 +111,7 @@ const state = {
   prevRawYaw: null,
   fusedYaw: 0,
   fusedYawAtKeyframe: null,
+  elevationAtKeyframe: null,
   lastKeyframeAt: 0,
   frame: null,            // latest segmentation result for the overlay
   frameStatus: 'ok',
@@ -662,6 +664,9 @@ async function processFrame() {
       // from, so following the dot produces a chain of overlapping frames
       // rather than two isolated ones with a hole between them.
       guidance.bandStepDeg = columns.bandStepDeg;
+      // Handing the plan to the guidance is what makes the serpentine binding:
+      // the dot may not move sideways while the column under it is unfinished.
+      guidance.columnPlan = columns;
       columns.observe({
         headingDeg: currentHeading(),
         elevationDeg: att.elevation,
@@ -740,9 +745,40 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     recordCaptureDecision('no-synchronized-frame', { pose, t, exposure });
     return;
   }
-  if (state.frameStatus !== 'ok') {
+  /*
+   * A frame with no skyline in it is still a photograph the stitcher needs.
+   *
+   * `clippedTop` means the traced skyline runs off the top edge and `allSky`
+   * means there is no skyline at all — and both are the NORMAL appearance of a
+   * frame aimed at the upper part of a tall obstruction, which is precisely
+   * what the vertical guidance has just asked for. Refusing them threw away 106
+   * candidates on the 2026-08-20 capture, every one of them over the house, and
+   * left the high bands with nothing in them but the frames that happened to
+   * catch a roof edge.
+   *
+   * These frames genuinely cannot contribute a horizon measurement, and they do
+   * not: the coverage map scores them on their own merits and the 720-bin
+   * profile only ever reads a traced boundary. What they can do is carry
+   * texture that connects the row above to the row below, which is the whole
+   * job of a column. So they are stored when the camera is deliberately raised,
+   * and refused when it is not — a frame full of sky taken while sweeping the
+   * horizon is still just a mistake.
+   */
+  const requiredHere = coverage.requiredElevationAt(currentHeading());
+  const deliberatelyHigh = state.guidance?.wantsLift
+    || (Number.isFinite(requiredHere) && requiredHere > 0
+      && pose.att.elevation > requiredHere * 0.4);
+  const skylessButWanted = deliberatelyHigh
+    && (state.frameStatus === 'clippedTop' || state.frameStatus === 'allSky');
+  if (state.frameStatus !== 'ok' && !skylessButWanted) {
     recordCaptureDecision(`frame-${state.frameStatus}`, { pose, t, exposure });
     return;
+  }
+  if (skylessButWanted) {
+    recordCaptureDecision('kept-for-stitch', {
+      pose, t, exposure,
+      detail: { frameStatus: state.frameStatus, elevationDeg: pose.att.elevation }
+    });
   }
   // Roll is deliberately NOT a reason to reject a keyframe. It is carried
   // through the projection quaternion like every other part of the attitude,
@@ -760,6 +796,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   // lap on the iPad instead of twenty-one. Every physical edge now appears
   // near the optical centre in several frames.
   const stepDeg = keyframeStepDeg(camera.hfovDeg);
+  const intrForStep = camera.intrinsics();
   const last = survey.keyframes[survey.keyframes.length - 1];
   let accept = false;
 
@@ -775,7 +812,17 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
       });
       return;
     }
-    accept = Math.abs(angDiff(state.fusedYaw, state.fusedYawAtKeyframe)) >= stepDeg;
+    // Both axes, each against its own field of view. Tilting up a column is
+    // movement; the old yaw-only test said it was not, and refused every frame
+    // the vertical guidance had just asked for.
+    accept = keyframeSpacingReached({
+      yawDeltaDeg: angDiff(state.fusedYaw, state.fusedYawAtKeyframe),
+      tiltDeltaDeg: state.elevationAtKeyframe === null
+        ? 0 : pose.att.elevation - state.elevationAtKeyframe,
+      elevationDeg: pose.att.elevation,
+      hfovDeg: intrForStep.hfovDeg,
+      vfovDeg: intrForStep.vfovDeg
+    });
   } else {
     // A normal pass 2 is a dense second lap. Targeted holds are reserved for
     // cleanup after at least part of the ring already has two-pass evidence.
@@ -783,7 +830,14 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
       Math.abs(angDiff(wrap360(director.target.fromDeg + director.target.widthDeg / 2), currentHeading())) < 3;
     accept = pass2CaptureAccepted({
       verificationSweep: director.verificationSweep,
-      angularTravelDeg: angDiff(state.fusedYaw, state.fusedYawAtKeyframe),
+      // Spherical travel, so a cleanup that is purely a tilt still counts.
+      angularTravelDeg: keyframeSpacingReached({
+        yawDeltaDeg: angDiff(state.fusedYaw, state.fusedYawAtKeyframe),
+        tiltDeltaDeg: state.elevationAtKeyframe === null
+          ? 0 : pose.att.elevation - state.elevationAtKeyframe,
+        elevationDeg: pose.att.elevation,
+        hfovDeg: intrForStep.hfovDeg, vfovDeg: intrForStep.vfovDeg
+      }) ? stepDeg : 0,
       stepDeg,
       onTarget,
       stillness: pose.gyro.stillness,
@@ -853,6 +907,7 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   });
 
   state.fusedYawAtKeyframe = state.fusedYaw;
+  state.elevationAtKeyframe = pose.att.elevation;
   state.lastKeyframeAt = t;
 
   survey._projectKeyframe(kf, camera.intrinsics());
@@ -1076,6 +1131,9 @@ function finishCalibration() {
   state.fusedYaw = orientation.rawYaw();
   state.prevRawYaw = orientation.rawYaw();
   state.fusedYawAtKeyframe = state.fusedYaw;
+  // Null, not the current elevation: the first photograph of a survey must not
+  // be gated on having tilted away from wherever the datum happened to be set.
+  state.elevationAtKeyframe = null;
   survey.yawDatum = orientation.yawDatum;
 
   const luma = camera.grabLuma();
@@ -1560,16 +1618,27 @@ async function runPass1Analysis() {
 
   setAnalysisStep(4);
   await new Promise(r => setTimeout(r, 0));
-  // Keep what the lap learned about how tall things are. Coverage confidence
-  // still resets — the second lap has to earn its own — but the height model
-  // describes the world, not the lap, and wiping it left pass 2 unable to ask
-  // for any lift at all.
-  coverage.reset({ keepWorld: true });
+  /*
+   * Do NOT wipe the map. Demote only what needs re-walking.
+   *
+   * This was `coverage.reset({ keepWorld: true })`, on the reasoning that a
+   * second lap should earn its own confidence. But verification is done by the
+   * survey's 720 bins, which have their own two-pass and single-lap rules; this
+   * map's only job is to tell the operator where to point. Wiping it left the
+   * 2026-08-21 capture guiding from a blank slate for its last six minutes,
+   * with the dot stuck and the operator covering sectors it never asked for.
+   *
+   * The weak sectors the director just identified are the ones that genuinely
+   * need another look, so those lose their confidence and everything else keeps
+   * what it earned.
+   */
+  const demoted = coverage.demote(director.targets || []);
   guidance.reset();
   state.lastCoverageAt = null;
   state.guidance = null;
   director.beginPass2();
-  log('info', `Verification pass planned: ${director.targets.length} sector(s) need more evidence.`);
+  log('info', `Verification pass planned: ${director.targets.length} sector(s) need more evidence; `
+    + `${demoted} bin(s) demoted, the rest of the ring keeps the confidence it earned.`);
 }
 
 /**
@@ -2772,6 +2841,7 @@ async function buildPanorama() {
     };
 
     await paintStitchedPanorama();
+    await syncDomeView();
     renderStitchVerdict(report, ms);
     renderCoverageTables();
     $('panoFindings').textContent = stitchFindings(
@@ -2878,6 +2948,41 @@ async function paintStitchedPanorama() {
   }
   pano.geomKey = geomKey;
   renderLandmarks();
+}
+
+/* ------------------------------------------------------------- the dome view
+ *
+ * Built lazily, because it costs a WebGL context and most sessions never open
+ * it, and kept alive afterwards so toggling is instant.
+ */
+let dome = null;
+
+async function syncDomeView() {
+  const wrap = $('domeWrap');
+  const on = $('domeToggle').checked;
+  const pano = state.pano;
+  if (!on || !pano?.panorama) {
+    wrap.hidden = true;
+    return;
+  }
+  try {
+    if (!dome) dome = new DomeView($('dome'));
+    wrap.hidden = false;
+    const r = pano.report?.render || {};
+    const blob = $('stitchShowControl').checked && pano.control ? pano.control : pano.panorama;
+    await dome.setPanorama(blob, {
+      altMinDeg: Number(r.altitudeMin) || -20,
+      altMaxDeg: Number(r.altitudeMax) || 60
+    });
+    dome.setGrid($('domeGrid').checked);
+    // Open looking at the horizon, which is what the survey is about, rather
+    // than at whatever azimuth happens to be zero.
+    dome.lookAt(dome.az, 0);
+  } catch (e) {
+    wrap.hidden = true;
+    $('domeToggle').checked = false;
+    log('warn', `The dome view could not start: ${e.message}`);
+  }
 }
 
 /** The verdict block: one grade, one sentence, then the numbers behind it. */
@@ -3596,7 +3701,10 @@ function wire() {
   // from blobs already in hand; it must never re-run the solve.
   $('stitchShowControl').addEventListener('change', () => {
     paintStitchedPanorama().catch(e => log('warn', `Could not redraw the panorama: ${e.message}`));
+    syncDomeView();
   });
+  $('domeToggle').addEventListener('change', syncDomeView);
+  $('domeGrid').addEventListener('change', () => dome?.setGrid($('domeGrid').checked));
   $('refreshCoverageBtn').addEventListener('click', renderCoverageTables);
   $('sectorSize').addEventListener('change', renderCoverageTables);
   $('framesOmittedOnly').addEventListener('change', renderCoverageTables);

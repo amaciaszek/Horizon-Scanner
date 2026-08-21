@@ -49,6 +49,12 @@ export const GUIDANCE_TUNING = {
    *  distance, before the dot will switch to it. */
   hysteresisDeg: 12,
 
+  /** How long the dot will hold a bearing waiting for its column to gain a band
+   *  before deciding the column cannot be finished from here and moving on.
+   *  Generous, because climbing a column deliberately takes several seconds a
+   *  band, and bounded, because an unfillable column must never pin the dot. */
+  columnPatienceSec: 12,
+
   /** Once the operator is within this of the target and the sector is still
    *  hungry, the dot holds position rather than creeping away from them. */
   holdRadiusDeg: 10,
@@ -148,6 +154,10 @@ export class ScanGuidance {
     this.elevationDeg = null;
     this.wantsLift = false;
     this.liftDeg = 0;
+    /** Set by the caller. When present the dot finishes a column of elevation
+     *  bands before it is allowed to move sideways. */
+    this.columnPlan = this.columnPlan || null;
+    this.holdingColumn = false;
     this.liftRemainingDeg = 0;
     this.dropRemainingDeg = 0;
     /** One elevation band, set by the caller from the working frame's vertical
@@ -278,6 +288,23 @@ export class ScanGuidance {
     const t = this.tuning;
     this._nowMs = nowMs;
     const summary = coverage.completeness();
+
+    /*
+     * A ring covered at the horizon is not a finished survey.
+     *
+     * `coverage.completeness()` only ever knew about bearings, so the scan
+     * declared itself done the moment the horizon row was painted all the way
+     * round — with the columns over the house still missing most of their
+     * bands. The guidance then returned 'complete' and stopped leading
+     * anywhere, which is the other half of "the dot got stuck and I had to
+     * cover places it wasn't telling me to": it was not stuck, it had quit.
+     */
+    const columnsDone = !this.columnPlan
+      || this.columnPlan.completeness().fraction >= 1;
+    summary.complete = summary.complete && columnsDone;
+    summary.columnsComplete = columnsDone;
+    summary.columnFraction = this.columnPlan
+      ? this.columnPlan.completeness().fraction : 1;
     this.complete = summary.complete;
 
     if (summary.complete) {
@@ -294,9 +321,79 @@ export class ScanGuidance {
     this.lastHereScore = hereScore;
     this.lastHungryHere = hungryHere;
 
-    const raw = this.chooseTarget(coverage, headingDeg, {
-      suppressLead: hungryHere, hfovDeg
-    });
+    /*
+     * HOLD THE BEARING UNTIL THE COLUMN IS FINISHED.
+     *
+     * The horizontal chooser below is a good frontier-finder and it has no idea
+     * that height exists. Left to itself it leads the operator onward the moment
+     * the bearing under them is covered at the horizon, which is exactly the
+     * motion that leaves a column half done — and a half-done column is a set of
+     * high frames with nothing beneath them, which is what the solver discards.
+     *
+     * So when a column plan is attached and the column here is unfinished, the
+     * dot does not move sideways at all. It stays on this bearing and the
+     * elevation half of update() walks it up or down a band at a time. Once the
+     * column completes, the plan reverses the vertical direction and the
+     * horizontal chooser is allowed to pick the next bearing — which is the
+     * serpentine, enforced rather than hoped for.
+     */
+    let raw;
+    const plan = this.columnPlan;
+    const columnHere = plan ? plan.indexOf(headingDeg) : -1;
+
+    /*
+     * A held column must be able to give up.
+     *
+     * Holding the bearing until the column finishes is the whole point, and it
+     * is also the most dangerous thing in this file: a column that CANNOT be
+     * finished — the obstruction is past the tilt limit, the sky there is blown
+     * out, the operator simply cannot get the angle from where they are
+     * standing — would pin the dot forever. That is the "very stuck" failure
+     * the operator has already reported twice, and enforcing the serpentine
+     * without this would make it worse rather than better.
+     *
+     * So progress is measured, not assumed. While the count of filled bands in
+     * this column keeps rising the hold is earning its keep; when it stops
+     * rising for `columnPatienceSec`, the column is deferred exactly like an
+     * unfillable bearing and the sweep moves on. Deferral is a cooldown, not a
+     * deletion: the dot will offer it again later, by which time the operator
+     * may be somewhere it works from.
+     */
+    let columnBusy = plan ? !plan.columnComplete(columnHere) : false;
+    if (columnBusy && plan) {
+      const filled = plan.bandsRequired[columnHere]
+        - Math.max(0, plan.lowestGap(columnHere) < 0 ? 0
+          : plan.bandsRequired[columnHere] - plan.lowestGap(columnHere));
+      if (columnHere !== this._heldColumn || filled !== this._heldFilled) {
+        this._heldColumn = columnHere;
+        this._heldFilled = filled;
+        this._heldForSec = 0;
+      } else {
+        this._heldForSec = (this._heldForSec || 0) + dtSec;
+      }
+      if (this._heldForSec > t.columnPatienceSec
+          || this.isDeferred(coverage, plan.bearingOf(columnHere), nowMs)) {
+        this.deferred.set(coverage.indexOf(plan.bearingOf(columnHere)),
+          nowMs + t.deferCooldownSec * 1000);
+        this.abandonedColumns = (this.abandonedColumns || 0) + 1;
+        this._heldForSec = 0;
+        columnBusy = false;
+      }
+    }
+    if (columnBusy) {
+      raw = plan.bearingOf(columnHere);
+      this.holdingColumn = true;
+    } else {
+      if (this.holdingColumn && plan) {
+        // A column just finished. Turning the sweep around here, rather than in
+        // the plan's own nextTarget, keeps one owner for the decision.
+        plan.ascending = !plan.ascending;
+      }
+      this.holdingColumn = false;
+      raw = this.chooseTarget(coverage, headingDeg, {
+        suppressLead: hungryHere, hfovDeg
+      });
+    }
     if (raw === null) return this.snapshot(headingDeg, summary);
 
     /*
@@ -466,6 +563,7 @@ export class ScanGuidance {
       /** Vertical aim for the dot, and how far above the camera it is asking. */
       elevationDeg: this.elevationDeg,
       wantsLift: this.wantsLift,
+      holdingColumn: !!this.holdingColumn,
       liftDeg: Number((this.liftDeg || 0).toFixed(1)),
       liftRemainingDeg: Number((this.liftRemainingDeg || 0).toFixed(1)),
       dropRemainingDeg: Number((this.dropRemainingDeg || 0).toFixed(1)),
@@ -480,6 +578,8 @@ export class ScanGuidance {
        *  this lap. A rising count is the signal that something in the scene or
        *  the frame gates is refusing to cooperate. */
       deferredCount: this.deferred.size,
+      abandonedColumns: this.abandonedColumns || 0,
+      heldColumnForSec: Number((this._heldForSec || 0).toFixed(1)),
       abandonedCount: this.abandonedCount || 0,
       waitingSec: this.waitingSec,
       /** Confidence of the sector the camera is on now, for the "keep going

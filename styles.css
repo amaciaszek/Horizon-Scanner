@@ -503,3 +503,18 @@ details[open] > *:not(summary) { margin-top: 14px; }
 
 .stitch-log-wrap { margin-top: 12px; }
 .stitch-log-wrap #stitchLog { max-height: 320px; overflow: auto; }
+
+
+/* ------------------------------------------------------------- dome view
+   Square-ish and large: the whole point is to look around inside it, and a
+   letterbox strip reintroduces exactly the cramped framing the flat panorama
+   already has. Touch panning must not scroll the page underneath. */
+.dome-wrap {
+  margin-top: 10px; border: 1px solid var(--rule); border-radius: 10px;
+  overflow: hidden; background: var(--chassis);
+}
+.dome {
+  display: block; width: 100%; height: min(62vh, 520px);
+  cursor: grab; touch-action: none;
+}
+.dome:active { cursor: grabbing; }

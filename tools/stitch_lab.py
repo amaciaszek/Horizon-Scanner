@@ -102,6 +102,83 @@ def matrix_to_rotvec(R):
 
 
 # --------------------------------------------------------------------------
+# Radial distortion.
+#
+# The camera model was a strict pinhole, and a phone's wide lens is not one.
+# Measured on the 2026-08-18 capture by sweeping k1 through the whole solve, the
+# cost surface is smooth and unimodal with a minimum at -0.10: median pair
+# residual falls 0.1044 deg to 0.0998 and p90 0.2707 to 0.2640, while positive
+# k1 makes both monotonically worse. That is a real barrel term, not fitting
+# noise.
+#
+# It is small in angle and loud in appearance. A pinhole model absorbs it into
+# the rotations, which is why the panorama still stitches; what it cannot do is
+# straighten a line. Viewed rectilinearly the clapboard on the house bows
+# symmetrically about the frame centre and more toward the edges, which is the
+# signature of exactly this term and is what the operator saw as "weird warping".
+#
+# Applied as an UNDISTORTION on the way in: observed pixel -> ideal ray. The
+# inverse is needed for rendering, and there is no closed form for it, so
+# `distort_uv` iterates. Three iterations is ample at |k1| ~ 0.1 — the map is a
+# strong contraction there — and it is checked in tests/, not assumed.
+# --------------------------------------------------------------------------
+
+DEFAULT_K1 = -0.10
+
+# WHAT THE END-TO-END COMPARISON ACTUALLY SAID, 2026-08-21, 103 frames, SIFT 3000:
+#
+#                          k1 = 0      k1 = -0.10
+#   residual median        0.0861      0.0709     (18% better)
+#   residual p90           0.2716      0.2532     (7% better)
+#   disagreement p95       47.8        46.5       (3% better)
+#   disagreement mean      15.5        17.1       (10% WORSE)
+#   solved focal scale     0.9883      0.9723
+#
+# Three of four improve and the fourth does not, so this is worth stating
+# plainly rather than filing as a win. The likely cause of the outlier is
+# visible in the last row: k1 and the focal length are correlated, and imposing
+# a fixed radial term makes the solver move the focal 1.6% to compensate. That
+# changes which regions overlap and resamples every frame slightly differently,
+# which shifts a mean of absolute differences without necessarily meaning the
+# geometry got worse — and the p95, where actual ghosting lives, improved.
+#
+# The deciding evidence is the one the operator asked about. Rendered
+# rectilinearly, where a straight edge in the world must be straight on screen,
+# the clapboard bows away from a true horizontal under k1 = 0 and runs parallel
+# to it under k1 = -0.10. That is not a metric, it is the defect itself.
+#
+# THE HONEST FIX IS TO SOLVE IT, NOT IMPOSE IT. k1 belongs in bundle_adjust
+# alongside the focal it is degenerate with, so the pair can find their joint
+# optimum instead of one being pinned while the other absorbs the error. Until
+# that exists this default is a measured constant, and `--k1 0` restores the
+# pinhole exactly.
+
+
+def undistort_uv(a, b, k1):
+    """Distorted normalized coords -> ideal. The forward polynomial."""
+    if not k1:
+        return a, b
+    r2 = a * a + b * b
+    f = 1.0 + k1 * r2
+    return a * f, b * f
+
+
+def distort_uv(a, b, k1, iterations=6):
+    """Ideal normalized coords -> distorted. Fixed-point inverse of the above."""
+    if not k1:
+        return a, b
+    da, db = a.copy(), b.copy()
+    for _ in range(iterations):
+        r2 = da * da + db * db
+        f = 1.0 + k1 * r2
+        # Guard the rare sample where the polynomial folds; leaving it put is
+        # better than emitting a NaN that silently voids a whole frame.
+        f = np.where(np.abs(f) < 1e-6, 1.0, f)
+        da, db = a / f, b / f
+    return da, db
+
+
+# --------------------------------------------------------------------------
 # The capture
 # --------------------------------------------------------------------------
 
@@ -115,13 +192,14 @@ class Frame:
     roll: float
     tan_h: float
     tan_v: float
+    k1: float                    # radial distortion, applied in normalized coords
     timestamp: float
     boundary: np.ndarray | None  # skyline row per column, in analysis space
     kp: list = field(default_factory=list)
     desc: np.ndarray | None = None
 
 
-def load_capture(zip_path: Path):
+def load_capture(zip_path: Path, k1: float = DEFAULT_K1):
     """Photos plus the pose each was taken at."""
     with zipfile.ZipFile(zip_path) as z:
         names = set(z.namelist())
@@ -166,6 +244,7 @@ def load_capture(zip_path: Path):
                 roll=point.get('rollDeg') or 0.0,
                 tan_h=cam['tanHalfHorizontal'],
                 tan_v=cam['tanHalfVertical'],
+                k1=k1,
                 timestamp=rec.get('timestampMs') or 0.0,
                 boundary=np.asarray(boundary, dtype=np.float32) if boundary else None,
             ))
@@ -182,7 +261,8 @@ def pixels_to_rays(pts, frame: Frame):
     h, w = frame.image.shape[:2]
     u = (pts[:, 0] + 0.5) / w * 2 - 1
     v = 1 - (pts[:, 1] + 0.5) / h * 2
-    d = np.stack([u * frame.tan_h, v * frame.tan_v, -np.ones_like(u)], axis=1)
+    a, b = undistort_uv(u * frame.tan_h, v * frame.tan_v, frame.k1)
+    d = np.stack([a, b, -np.ones_like(u)], axis=1)
     return d / np.linalg.norm(d, axis=1, keepdims=True)
 
 
@@ -191,8 +271,9 @@ def rays_to_pixels(dirs, frame: Frame, w, h):
     depth = -dirs[:, 2]
     ok = depth > 1e-6
     safe = np.where(ok, depth, 1.0)
-    u = dirs[:, 0] / safe / frame.tan_h
-    v = dirs[:, 1] / safe / frame.tan_v
+    a, b = distort_uv(dirs[:, 0] / safe, dirs[:, 1] / safe, frame.k1)
+    u = a / frame.tan_h
+    v = b / frame.tan_v
     ok &= (np.abs(u) <= 1) & (np.abs(v) <= 1)
     x = (u + 1) / 2 * w - 0.5
     y = (1 - v) / 2 * h - 0.5
@@ -615,6 +696,10 @@ def bundle_adjust(frames, pairs, iterations=40, huber_deg=0.6,
 
 
 def _to_uv(dirs, frame):
+    """Rays -> the IDEAL normalized coords the solver scales.
+
+    `dirs` already came through pixels_to_rays, so the distortion has been
+    removed; this only strips the focal length back off."""
     depth = -dirs[:, 2]
     return np.stack([dirs[:, 0] / depth / frame.tan_h,
                      dirs[:, 1] / depth / frame.tan_v], axis=1)
@@ -736,11 +821,8 @@ def altitude_bounds(frames, rotations, scale, padding=1.0):
     uv = np.array([[-1, -1], [-1, 1], [1, -1], [1, 1],
                    [0, -1], [0, 1]], dtype=float)
     for frame, rotation in zip(frames, rotations):
-        rays = np.stack([
-            uv[:, 0] * frame.tan_h * scale,
-            uv[:, 1] * frame.tan_v * scale,
-            -np.ones(len(uv)),
-        ], axis=1)
+        ca, cb = undistort_uv(uv[:, 0] * frame.tan_h, uv[:, 1] * frame.tan_v, frame.k1)
+        rays = np.stack([ca * scale, cb * scale, -np.ones(len(uv))], axis=1)
         rays /= np.linalg.norm(rays, axis=1, keepdims=True)
         world = rays @ rotation.T
         altitude = np.degrees(np.arcsin(np.clip(world[:, 2], -1.0, 1.0)))
@@ -756,8 +838,9 @@ def _project_world_to_frame(world, frame, rotation, scale):
     cam = world @ rotation
     depth = -cam[:, 2]
     safe = np.where(depth > 1e-6, depth, 1.0)
-    u = cam[:, 0] / safe / (frame.tan_h * scale)
-    v = cam[:, 1] / safe / (frame.tan_v * scale)
+    a, b = distort_uv(cam[:, 0] / safe / scale, cam[:, 1] / safe / scale, frame.k1)
+    u = a / frame.tan_h
+    v = b / frame.tan_v
     x = (u + 1.0) * 0.5 * w - 0.5
     y = (1.0 - v) * 0.5 * h - 0.5
     return np.stack([x, y], axis=1)
@@ -960,6 +1043,9 @@ def main():
     ap.add_argument('capture', type=Path)
     ap.add_argument('--out', type=Path, default=Path('stitch-out'))
     ap.add_argument('--px-per-deg', type=float, default=8.0)
+    ap.add_argument('--k1', type=float, default=DEFAULT_K1,
+                    help='radial distortion in normalized coords; 0 disables it. '
+                         'The default was measured by sweeping it through the solve.')
     ap.add_argument('--detector', choices=('sift', 'orb'), default='sift')
     ap.add_argument('--max-features', type=int, default=3000)
     ap.add_argument('--search-px', type=int, default=64,
@@ -989,7 +1075,7 @@ def main():
 
     t0 = time.time()
     print(f'Loading {args.capture.name}')
-    frames, session = load_capture(args.capture)
+    frames, session = load_capture(args.capture, k1=args.k1)
     print(f'  {len(frames)} photos, app {session.get("appVersion")}')
     hfov = 2 * math.atan(frames[0].tan_h) * RAD
     vfov = 2 * math.atan(frames[0].tan_v) * RAD
@@ -1138,6 +1224,10 @@ def main():
             'solvedP90': float(np.percentile(final, 90)), 'solvedMax': float(final.max()),
         },
         'focalScale': float(scale),
+        # Recorded beside the focal because the two are correlated: imposing a
+        # radial term shifts the solved focal to compensate, so neither number
+        # means anything without the other.
+        'k1': float(args.k1),
         'lensDeg': {'horizontal': hf, 'vertical': vf},
         'framesMovedDeg': {'median': float(np.median(moved)), 'max': float(max(moved))},
         'graph': {
@@ -1242,8 +1332,9 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None
         depth = -cam[..., 2]
         ok = depth > 1e-6
         safe = np.where(ok, depth, 1.0)
-        u = cam[..., 0] / safe / (f.tan_h * scale)
-        v = cam[..., 1] / safe / (f.tan_v * scale)
+        a, b = distort_uv(cam[..., 0] / safe / scale, cam[..., 1] / safe / scale, f.k1)
+        u = a / f.tan_h
+        v = b / f.tan_v
         x = (u + 1) / 2 * iw - 0.5
         y = (1 - v) / 2 * ih - 0.5
         warped_x, warped_y = _apply_render_warp(x, y, render_warps[n])
@@ -1359,8 +1450,9 @@ def find_seam_masks(frames, R, scale, alt_min=-12.0, alt_max=62.0,
         depth = -cam[..., 2]
         ok = depth > 1e-6
         safe = np.where(ok, depth, 1.0)
-        u = cam[..., 0] / safe / (frame.tan_h * scale)
-        v = cam[..., 1] / safe / (frame.tan_v * scale)
+        a, b = distort_uv(cam[..., 0] / safe / scale, cam[..., 1] / safe / scale, frame.k1)
+        u = a / frame.tan_h
+        v = b / frame.tan_v
         x = (u + 1) / 2 * iw - 0.5
         y = (1 - v) / 2 * ih - 0.5
         warped_x, warped_y = _apply_render_warp(x, y, render_warps[n])

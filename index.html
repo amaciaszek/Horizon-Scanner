@@ -10,7 +10,7 @@
      Bump it with VERSION in js/version.js; iPad Safari holds CSS aggressively
      and the resulting half-styled page looks like a broken build, not a stale
      one, which is a bad thing to be debugging in a field. -->
-<link rel="stylesheet" href="styles.css?v=0.19.0" />
+<link rel="stylesheet" href="styles.css?v=0.20.0" />
 </head>
 <body>
 
@@ -204,7 +204,18 @@
     <p class="hint" id="buildNote">The camera and sensors are paused. You can put the phone down — this runs on its own.</p>
   </div>
 
+  <div class="row">
+    <label class="toggle"><input type="checkbox" id="domeToggle" /> <span>Look around it as a dome</span></label>
+    <label class="toggle"><input type="checkbox" id="domeGrid" /> <span>10° graticule</span></label>
+    <span class="hint" id="domeNote">An equirectangular panorama is a map projection, so a
+    straight roofline above the horizon is drawn as a curve and the flat picture cannot tell
+    you whether bowing is the projection or a real error. Here a straight edge in the world
+    is straight on screen. Drag to look around; scroll to zoom. If a line snaps straight, the
+    stitch was right and the flattening was lying.</span>
+  </div>
+
   <div class="pano-wrap"><canvas id="pano" class="pano"></canvas></div>
+  <div class="dome-wrap" id="domeWrap" hidden><canvas id="dome" class="dome"></canvas></div>
 
   <p class="hint" id="panoStatus">Build this after a survey to see the profile drawn over the imagery it came from. Scroll sideways; the ruler is azimuth. Turn off <em>Blend seams</em> to see each frame cut hard against its neighbour — uglier, but a step in a roofline is then a measurable geometry error rather than something smoothed away.</p>
 
@@ -452,6 +463,6 @@
      modules aggressively, and a device pairing new markup with a cached script
      fails in ways that look like a broken build rather than a stale one. Bump
      with VERSION in js/version.js. -->
-<script type="module" src="js/main.js?v=0.19.0"></script>
+<script type="module" src="js/main.js?v=0.20.0"></script>
 </body>
 </html>
