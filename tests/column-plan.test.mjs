@@ -124,7 +124,19 @@ section('A finished column turns the sweep around');
     Math.abs(t.bearingDeg - bearing) > 1, `moved to ${t.bearingDeg.toFixed(1)}°`);
   check('it steps counter-clockwise',
     ((bearing - t.bearingDeg + 360) % 360) < 180, `${bearing.toFixed(1)}° -> ${t.bearingDeg.toFixed(1)}°`);
-  check('and the vertical direction reverses', plan.ascending !== ascendingBefore,
+
+  /*
+   * The reversal is NOT a side effect of asking. `nextTarget` is called on
+   * every frame to ask where the dot belongs, and a query that flipped the
+   * sweep direction each time reversed it ten times a second — the serpentine
+   * became a shiver. The flip is now one explicit call, made once by whoever
+   * owns the decision that a column has finished.
+   */
+  check('asking does not flip the sweep under you', plan.ascending === ascendingBefore,
+    `ascending stayed ${plan.ascending}`);
+  plan.advanceSerpentine();
+  check('and the vertical direction reverses when told to',
+    plan.ascending !== ascendingBefore,
     `ascending ${ascendingBefore} -> ${plan.ascending}`);
 }
 

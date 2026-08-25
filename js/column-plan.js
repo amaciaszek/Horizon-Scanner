@@ -92,7 +92,30 @@ export const COLUMN_TUNING = {
 
   /** Bearing tolerance for crediting a column. A frame taken half a step off
    *  the column centre still fills that column's band. */
-  columnToleranceDeg: 7
+  columnToleranceDeg: 7,
+
+  /**
+   * The highest elevation anything is allowed to ask the operator for.
+   *
+   * MEASURED, 2026-08-25. This existed nowhere, and its absence is the single
+   * defect that broke the guidance dot in the field.
+   *
+   * `CoverageMap` will never ask for more than 60 degrees — that is its
+   * `maxRequestedElevationDeg`, and past it `needsLift` gives up and marks the
+   * bin `beyondTilt` so the ring stops blocking. The column plan had no such
+   * ceiling. On the 2026-08-25 back-yard capture the house measured a top of
+   * 75.1 degrees, so `requireHeight` asked for six bands, whose top band centre
+   * is 74.4 degrees. Nothing in the app will ever aim the camera there, so that
+   * band could not be filled, so `columnComplete` was false forever on 19
+   * columns, so `ScanGuidance` held the bearing forever.
+   *
+   * 60 of the 180 bins finished the capture flagged `beyondTilt` — a third of
+   * the ring in a state the ring had forgiven and the column plan had not.
+   *
+   * A requirement the operator cannot carry out is not a requirement, it is a
+   * deadlock. Bands above this are recorded as wanted and not required.
+   */
+  maxAskElevationDeg: 60
 };
 
 export class ColumnPlan {
@@ -115,6 +138,46 @@ export class ColumnPlan {
     this.vfovDeg = vfov;
     this.bandStepDeg = Math.max(this.tuning.minBandStepDeg, vfov * this.tuning.overlapFraction);
     this.bandCount = this.tuning.maxBands + 1;      // band 0 is the horizon row
+    this._recomputeReach();
+  }
+
+  /**
+   * The highest band the operator will ever be asked to aim at, and therefore
+   * the highest one that may be REQUIRED.
+   *
+   * Derived rather than configured, because the two figures that decide it —
+   * the band step and the tilt ceiling — are both measured at runtime, and a
+   * hand-set band count would go stale the moment the lens was measured. A band
+   * is askable when its centre is at or below the ceiling; asking for the band
+   * above and hoping the tolerance catches it is how a column becomes
+   * unfinishable without anything looking wrong.
+   */
+  _recomputeReach() {
+    const ceiling = Number(this.tuning.maxAskElevationDeg);
+    const usable = Number.isFinite(ceiling) && ceiling > 0 ? ceiling : Infinity;
+    const reach = Number.isFinite(usable)
+      ? Math.floor((usable - this.tuning.restElevationDeg) / this.bandStepDeg) + 1
+      : this.bandCount;
+    this.reachableBands = clamp(reach, 1, this.bandCount);
+    // A change of lens or ceiling can make a standing requirement impossible.
+    // Re-derive every column from what the scene asked for, capped by what can
+    // be reached, so the two can never drift apart.
+    if (this.bandsWanted && this.bandsRequired) {
+      for (let i = 0; i < this.binCount; i++) {
+        this.bandsRequired[i] = Math.min(this.bandsWanted[i], this.reachableBands);
+      }
+      this.generation++;
+    }
+  }
+
+  /** The tilt ceiling, set from whatever the guidance is actually willing to
+   *  ask for, so the two can never disagree. */
+  setCeiling(maxAskElevationDeg) {
+    const value = Number(maxAskElevationDeg);
+    if (!Number.isFinite(value) || value <= 0) return;
+    if (value === this.tuning.maxAskElevationDeg) return;
+    this.tuning.maxAskElevationDeg = value;
+    this._recomputeReach();
   }
 
   reset() {
@@ -122,8 +185,13 @@ export class ColumnPlan {
     this.score = new Float32Array(cells);
     this.frames = new Uint16Array(cells);
     /** How many bands this bearing needs, from the obstruction height. Band 0
-     *  is always needed; the rest are added as the scene proves it is tall. */
+     *  is always needed; the rest are added as the scene proves it is tall.
+     *  This is the EFFECTIVE figure — already capped at what can be reached. */
     this.bandsRequired = new Uint8Array(this.binCount).fill(1);
+    /** What the scene asked for before the tilt ceiling was applied. Kept so
+     *  the archive can say "this obstruction is taller than we could ask for"
+     *  instead of silently pretending it was never that tall. */
+    this.bandsWanted = new Uint8Array(this.binCount).fill(1);
     /** Which way the serpentine is currently travelling in elevation. */
     this.ascending = true;
     this.generation = 0;
@@ -172,10 +240,34 @@ export class ColumnPlan {
     if (!Number.isFinite(obstructionTopDeg) || obstructionTopDeg <= 0) return;
     const aim = Math.max(0, obstructionTopDeg - this.vfovDeg * 0.4);
     const bands = clamp(Math.ceil(aim / this.bandStepDeg) + 1, 1, this.bandCount);
-    if (bands > this.bandsRequired[index]) {
-      this.bandsRequired[index] = bands;
+    if (bands > this.bandsWanted[index]) this.bandsWanted[index] = bands;
+    // The cap is the whole point. Above the tilt ceiling the app will not ask
+    // the operator to aim, so it must not demand the result either; the excess
+    // survives in `bandsWanted` and is reported, not required.
+    const effective = Math.min(this.bandsWanted[index], this.reachableBands);
+    if (effective > this.bandsRequired[index]) {
+      this.bandsRequired[index] = effective;
       this.generation++;
     }
+  }
+
+  /** Is this bearing taller than anything the operator can be asked to aim at?
+   *  The column-plan twin of `CoverageMap.beyondTilt`, and reported for the
+   *  same reason: an unmeasurable top should be recorded, never repeated at
+   *  someone who cannot act on it. */
+  beyondReach(index) {
+    return this.bandsWanted[index] > this.reachableBands;
+  }
+
+  /** How many of this bearing's required bands are filled. The progress figure
+   *  a hold is judged on. It counts EVERY filled band, not the run from the
+   *  bottom: filling band 3 while band 1 is still open is progress, and judging
+   *  it by `lowestGap` alone reported no progress and abandoned the column. */
+  bandsFilled(index) {
+    const need = this.bandsRequired[index];
+    let filled = 0;
+    for (let b = 0; b < need; b++) if (this._bandFilled(index, b)) filled++;
+    return filled;
   }
 
   /** Apply a whole coverage map's measured obstruction heights at once. */
@@ -258,27 +350,48 @@ export class ColumnPlan {
    * camera never travels through sky it has already covered to reach sky it
    * has not.
    */
-  nextTarget(headingDeg, elevationDeg, { direction = -1 } = {}) {
+  nextTarget(headingDeg, elevationDeg, { direction = -1, wanted = null } = {}) {
     const here = this.indexOf(headingDeg);
+    // `wanted` lets the caller widen or narrow what counts as unfinished work
+    // without this module having to know why. The guidance uses it for two
+    // things it owns and the plan does not: a bearing it has given up on for
+    // now, and a bearing whose column is full but whose horizon ring is still
+    // short of confidence. Without it the dot would skip past ring gaps the
+    // moment the bands above them were filled.
+    const needsWork = typeof wanted === 'function'
+      ? wanted : i => !this.columnComplete(i);
 
     // 1. Finish this column.
-    if (!this.columnComplete(here)) {
-      const band = this.ascending ? this.lowestGap(here) : this.highestGap(here);
-      return this._target(here, band, 'fill-column');
-    }
+    if (needsWork(here)) return this._target(here, this.gapBand(here), 'fill-column');
 
-    // 2. This column is done, so turn the sweep around and step sideways.
+    // 2. This column is done, so step sideways. The serpentine reversal is NOT
+    //    applied here: this function is called on every frame to ask where the
+    //    dot belongs, and a query that flips the sweep direction as a side
+    //    effect would reverse it ten times a second. `advanceSerpentine()` is
+    //    the one place the direction changes, and it is called once, by the
+    //    owner of the decision, when a column actually completes.
     //    `direction` is -1 for the counter-clockwise sweep the app asks for.
-    this.ascending = !this.ascending;
     const step = Math.max(1, Math.round(this.tuning.columnStepDeg / this.binSizeDeg));
     for (let k = 1; k <= this.binCount; k++) {
       const i = (here + direction * step * k + this.binCount * 2) % this.binCount;
-      if (!this.columnComplete(i)) {
-        const band = this.ascending ? this.lowestGap(i) : this.highestGap(i);
-        return this._target(i, band, k === 1 ? 'next-column' : 'skip-to-work');
-      }
+      if (!needsWork(i)) continue;
+      return this._target(i, this.gapBand(i), k === 1 ? 'next-column' : 'skip-to-work');
     }
     return { complete: true, bearingDeg: null, elevationDeg: null, band: -1, action: 'complete' };
+  }
+
+  /** Which band this bearing should be asked for next, in the sense the
+   *  serpentine is currently travelling. -1 when the column is finished. */
+  gapBand(index) {
+    return this.ascending ? this.lowestGap(index) : this.highestGap(index);
+  }
+
+  /** Turn the vertical sweep around. Called once, when a column completes, so
+   *  the camera comes back down the next column instead of travelling through
+   *  sky it has already covered. */
+  advanceSerpentine() {
+    this.ascending = !this.ascending;
+    return this.ascending;
   }
 
   _target(index, band, action) {
@@ -373,9 +486,15 @@ export class ColumnPlan {
       cellsFilled: c.have,
       fraction: c.fraction,
       tallestColumn: Math.max(...this.bandsRequired),
+      reachableBands: this.reachableBands,
+      maxAskElevationDeg: this.tuning.maxAskElevationDeg,
+      columnsBeyondReach: Array.from({ length: this.binCount },
+        (_, i) => (this.beyondReach(i) ? 1 : 0)).reduce((a, b) => a + b, 0),
       columns: Array.from({ length: this.binCount }, (_, i) => ({
         bearingDeg: Number(this.bearingOf(i).toFixed(2)),
         bandsRequired: this.bandsRequired[i],
+        bandsWanted: this.bandsWanted[i],
+        beyondReach: this.beyondReach(i),
         bandsFilled: Array.from({ length: this.bandsRequired[i] },
           (_, b) => this._bandFilled(i, b)).filter(Boolean).length,
         complete: this.columnComplete(i)

@@ -20,6 +20,8 @@ import { ScanGuidance, GUIDANCE_TUNING } from '../js/guidance.js';
 import { ColumnPlan } from '../js/column-plan.js';
 import { CoverageMap } from '../js/coverage.js';
 
+const angDiff = (a, b) => { let d = (a - b) % 360; if (d > 180) d -= 360; if (d < -180) d += 360; return d; };
+
 let failures = 0;
 function check(name, ok, detail = '') {
   console.log(`${ok ? '  ok  ' : '  FAIL'} ${name}${detail ? '  ' + detail : ''}`);
@@ -106,7 +108,15 @@ section('A finished column releases the dot and reverses the sweep');
     coverage, headingDeg: bearing, elevationDeg: 0,
     dtSec: 0.1, nowMs: 1000, hfovDeg: HFOV
   });
-  check('the dot is no longer held', g.holdingColumn === false);
+  /*
+   * "Released" means released from THIS column, not idle. The dot is expected
+   * to be holding something at almost every moment of a survey — that is what
+   * makes it an instruction rather than a mirror of the phone. What must not
+   * happen is that it stays on a bearing whose work is finished.
+   */
+  check('the dot leaves the finished bearing',
+    Math.abs(angDiff(g.rawBearingDeg, bearing)) > plan.binSizeDeg,
+    `dot at ${g.rawBearingDeg?.toFixed(1)}°, finished column at ${bearing.toFixed(1)}°`);
   check('the vertical direction reverses, which is the serpentine',
     plan.ascending !== before, `ascending ${before} -> ${plan.ascending}`);
 }
@@ -120,19 +130,23 @@ section('A column that cannot be filled does NOT pin the dot');
   const bearing = plan.bearingOf(idx);
 
   // The operator sits on the bearing and nothing ever fills — the obstruction
-  // is out of reach. Run well past the patience window.
+  // is out of reach. Run well past the patience window. What is measured is how
+  // long the DOT stays on that bearing: it may well hold some other column
+  // afterwards, and should, but it must not pin this one.
   let g = null, heldFor = 0;
   for (let ms = 0; ms < 40000; ms += 100) {
     g = guidance.update({
       coverage, headingDeg: bearing, elevationDeg: 0,
       dtSec: 0.1, nowMs: ms, hfovDeg: HFOV
     });
-    if (g.holdingColumn) heldFor += 0.1;
+    if (Math.abs(angDiff(g.rawBearingDeg, bearing)) <= plan.binSizeDeg) heldFor += 0.1;
     else break;
   }
   check('the hold is bounded', heldFor <= GUIDANCE_TUNING.columnPatienceSec + 1,
     `held ${heldFor.toFixed(1)} s, patience ${GUIDANCE_TUNING.columnPatienceSec} s`);
-  check('the dot lets go rather than pinning', g.holdingColumn === false);
+  check('the dot lets go rather than pinning',
+    Math.abs(angDiff(g.rawBearingDeg, bearing)) > plan.binSizeDeg,
+    `dot at ${g.rawBearingDeg?.toFixed(1)}° vs pinned bearing ${bearing.toFixed(1)}°`);
   check('and the abandonment is recorded, not silent',
     (g.abandonedColumns || 0) >= 1, `${g.abandonedColumns} column(s) given up`);
 }

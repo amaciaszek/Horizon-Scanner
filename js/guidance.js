@@ -95,6 +95,23 @@ export const GUIDANCE_TUNING = {
    *  the interface starts saying "tilt up" in words as well as in position. */
   liftPromptDeg: 8,
 
+  /**
+   * Dead band on "the dot is asking for a tilt".
+   *
+   * Small on purpose, and NOT `liftPromptDeg`. The decision about whether a
+   * vertical target is worth having is made upstream, where the target is
+   * chosen: the ring only asks for a lift when a top has never been framed, and
+   * only asks for a descent past `descentPromptDeg`. By the time there is a
+   * target, the only question left is which way the dot moved, and reusing the
+   * 8-degree prompt figure here silently swallowed real asks — a sector needing
+   * 7.6 degrees of lift reported `wantsLift: false` and the words said nothing
+   * while the dot sat above the camera.
+   *
+   * Two degrees is about the pose noise of a hand-held phone, which is the only
+   * thing this is meant to reject.
+   */
+  tiltDeadbandDeg: 2,
+
   /** How far ABOVE this sector's skyline the camera has to be before the dot
    *  starts leading the operator back down. Larger than `liftPromptDeg` on
    *  purpose: being a little high costs a slightly cropped foreground, while
@@ -158,6 +175,21 @@ export class ScanGuidance {
      *  bands before it is allowed to move sideways. */
     this.columnPlan = this.columnPlan || null;
     this.holdingColumn = false;
+    /** The column the dot is committed to, or -1. Held across frames on
+     *  purpose: it is what lets the dot wait somewhere the operator is not. */
+    this.heldColumn = -1;
+    this._heldFilled = -1;
+    this._heldForSec = 0;
+    this.lastPlanGeneration = -1;
+    /** The bin the waiting timer is measured on, and its last progress value.
+     *  Waiting is a question about the ground under the dot, so it is measured
+     *  there and reset whenever the dot moves to different ground. */
+    this._progressIndex = -1;
+    this._progressValue = null;
+    /** Which band the dot is currently asking for, and how many the column
+     *  needs. Reported so the interface can say "3 of 5" rather than nothing. */
+    this.targetBand = -1;
+    this.targetBands = 0;
     this.liftRemainingDeg = 0;
     this.dropRemainingDeg = 0;
     /** One elevation band, set by the caller from the working frame's vertical
@@ -337,59 +369,109 @@ export class ScanGuidance {
      * horizontal chooser is allowed to pick the next bearing — which is the
      * serpentine, enforced rather than hoped for.
      */
+    /*
+     * WHICH COLUMN IS BEING WORKED.
+     *
+     * Rewritten 2026-08-25 after the back-yard capture, where this file made
+     * the dot useless. The old rule was:
+     *
+     *     columnHere = plan.indexOf(headingDeg)
+     *     if (column under the operator is unfinished) raw = plan.bearingOf(columnHere)
+     *
+     * — the target was the operator's OWN bearing. It could not lead; it could
+     * only shadow. The recorded trail of that capture shows it exactly: the dot
+     * tracked the heading at an offset of a few tenths of a degree for most of
+     * 157 seconds, walking 255 → 253 → 251 → 249 behind a phone that was
+     * choosing its own path, and lurching 15-20° sideways whenever the patience
+     * timer expired. The operator's report — "it almost never moves even when I
+     * am centred in the circle, all of my movement was of my own decision" —
+     * is that behaviour described from the other side of the screen.
+     *
+     * The hold is now anchored to a COLUMN INDEX that the guidance picks and
+     * keeps. It is chosen by the plan's own serpentine walk, which is allowed
+     * to name a column the operator is not standing on — that is what makes the
+     * dot an instruction rather than a mirror. It survives the operator
+     * wandering off, so the patience timer measures the column's progress and
+     * not the operator's restlessness, and so the dot is still waiting where
+     * the work is when they come back.
+     */
     let raw;
     const plan = this.columnPlan;
-    const columnHere = plan ? plan.indexOf(headingDeg) : -1;
 
     /*
-     * A held column must be able to give up.
+     * What still counts as work at a bearing.
      *
-     * Holding the bearing until the column finishes is the whole point, and it
-     * is also the most dangerous thing in this file: a column that CANNOT be
-     * finished — the obstruction is past the tilt limit, the sky there is blown
-     * out, the operator simply cannot get the angle from where they are
-     * standing — would pin the dot forever. That is the "very stuck" failure
-     * the operator has already reported twice, and enforcing the serpentine
-     * without this would make it worse rather than better.
-     *
-     * So progress is measured, not assumed. While the count of filled bands in
-     * this column keeps rising the hold is earning its keep; when it stops
-     * rising for `columnPatienceSec`, the column is deferred exactly like an
-     * unfillable bearing and the sweep moves on. Deferral is a cooldown, not a
-     * deletion: the dot will offer it again later, by which time the operator
-     * may be somewhere it works from.
+     * Both halves, because the two maps grade differently: a band is filled at
+     * 0.62 confidence over 2 frames and a ring bin is covered at 0.88 over 8,
+     * so a column can be full while the horizon under it is still thin. Asking
+     * only the plan would walk the dot past every one of those; asking only the
+     * ring is what left columns half done in the first place.
      */
-    let columnBusy = plan ? !plan.columnComplete(columnHere) : false;
-    if (columnBusy && plan) {
-      const filled = plan.bandsRequired[columnHere]
-        - Math.max(0, plan.lowestGap(columnHere) < 0 ? 0
-          : plan.bandsRequired[columnHere] - plan.lowestGap(columnHere));
-      if (columnHere !== this._heldColumn || filled !== this._heldFilled) {
-        this._heldColumn = columnHere;
-        this._heldFilled = filled;
+    const columnWanted = plan ? (i) => {
+      const bearing = plan.bearingOf(i);
+      if (this.isDeferred(coverage, bearing, nowMs)) return false;
+      return !plan.columnComplete(i) || !coverage.completeAt(bearing);
+    } : null;
+
+    if (plan) {
+      // Let go of a column that is finished, or that has been given up on.
+      if (this.heldColumn >= 0 && !columnWanted(this.heldColumn)) {
+        // A column that FINISHED turns the sweep around, so the camera comes
+        // back down the next one instead of travelling through sky it has
+        // already covered. One owner for the decision, called once.
+        if (plan.columnComplete(this.heldColumn)) plan.advanceSerpentine();
+        this.heldColumn = -1;
         this._heldForSec = 0;
-      } else {
-        this._heldForSec = (this._heldForSec || 0) + dtSec;
       }
-      if (this._heldForSec > t.columnPatienceSec
-          || this.isDeferred(coverage, plan.bearingOf(columnHere), nowMs)) {
-        this.deferred.set(coverage.indexOf(plan.bearingOf(columnHere)),
-          nowMs + t.deferCooldownSec * 1000);
-        this.abandonedColumns = (this.abandonedColumns || 0) + 1;
-        this._heldForSec = 0;
-        columnBusy = false;
+
+      /*
+       * A held column must be able to give up.
+       *
+       * Holding until the column finishes is the whole point, and it is also
+       * the most dangerous thing in this file: a column that CANNOT be finished
+       * would pin the dot forever. So progress is measured, not assumed —
+       * `bandsFilled` counts every filled band, where the old code derived
+       * progress from `lowestGap` alone and therefore saw a band filled above
+       * an open one as no progress at all. Deferral is a cooldown, not a
+       * deletion: the dot offers the column again later.
+       */
+      if (this.heldColumn >= 0) {
+        const filled = plan.bandsFilled(this.heldColumn);
+        if (filled !== this._heldFilled) {
+          this._heldFilled = filled;
+          this._heldForSec = 0;
+        } else {
+          this._heldForSec = (this._heldForSec || 0) + dtSec;
+        }
+        if (this._heldForSec > t.columnPatienceSec) {
+          this.deferred.set(coverage.indexOf(plan.bearingOf(this.heldColumn)),
+            nowMs + t.deferCooldownSec * 1000);
+          this.abandonedColumns = (this.abandonedColumns || 0) + 1;
+          this.heldColumn = -1;
+          this._heldForSec = 0;
+        }
+      }
+
+      // Nothing held: ask the plan where the serpentine goes next. This is the
+      // line that makes the dot lead — `nextTarget` prefers the column under
+      // the operator when it still needs work, and otherwise names the next one
+      // along the sweep, which may be somewhere they are not yet pointing.
+      if (this.heldColumn < 0) {
+        const next = plan.nextTarget(headingDeg, elevationDeg, {
+          direction: t.sweepDirection, wanted: columnWanted
+        });
+        if (!next.complete) {
+          this.heldColumn = plan.indexOf(next.bearingDeg);
+          this._heldFilled = plan.bandsFilled(this.heldColumn);
+          this._heldForSec = 0;
+        }
       }
     }
-    if (columnBusy) {
-      raw = plan.bearingOf(columnHere);
-      this.holdingColumn = true;
+
+    this.holdingColumn = plan !== null && this.heldColumn >= 0;
+    if (this.holdingColumn) {
+      raw = plan.bearingOf(this.heldColumn);
     } else {
-      if (this.holdingColumn && plan) {
-        // A column just finished. Turning the sweep around here, rather than in
-        // the plan's own nextTarget, keeps one owner for the decision.
-        plan.ascending = !plan.ascending;
-      }
-      this.holdingColumn = false;
       raw = this.chooseTarget(coverage, headingDeg, {
         suppressLead: hungryHere, hfovDeg
       });
@@ -408,41 +490,79 @@ export class ScanGuidance {
      * behaviour this whole feature exists to avoid, and it did it while every
      * individual rule looked sensible.
      *
-     * Holding position until the target is genuinely covered is also simply
-     * what was asked for: the dot waits there until that region has been
-     * adequately covered. An operator who wanders off to work elsewhere leaves
-     * the dot behind on purpose — that sector still needs them, and when they
-     * finish where they are, the dot is still exactly where they must go next.
+     * A held column has already made this decision and owns it, so the ring's
+     * hysteresis only applies when nothing is held. Running both was how the
+     * dot ended up re-picked on every frame: `mapChanged` ticks whenever any
+     * bin anywhere gains coverage, which during an active sweep is constantly,
+     * so the "keep what you have" half never actually kept anything.
      */
-    /*
-     * Give up on a sector that is earning nothing, and come back to it later.
-     *
-     * `stillWanted` alone kept the dot on an impossible target forever. The
-     * escape is deliberately generous — six seconds of the operator standing
-     * there with the sector gaining no ground — because a sector that is merely
-     * slow to fill should NOT be abandoned; the whole design depends on the dot
-     * waiting rather than sliding along with the phone. What it must not do is
-     * wait for something that cannot happen from where the operator is.
-     */
-    if (this.rawBearingDeg !== null && this.waitingSec > t.abandonAfterSec
-        && !coverage.completeAt(this.rawBearingDeg)) {
-      this.deferred.set(coverage.indexOf(this.rawBearingDeg),
-        nowMs + t.deferCooldownSec * 1000);
-      this.rawBearingDeg = null;
-      this.waitingSec = 0;
-      this.abandonedCount = (this.abandonedCount || 0) + 1;
+    if (!this.holdingColumn) {
+      /*
+       * Give up on a sector that is earning nothing, and come back to it later.
+       *
+       * `stillWanted` alone kept the dot on an impossible target forever. The
+       * escape is deliberately generous because a sector that is merely slow to
+       * fill should NOT be abandoned; the whole design depends on the dot
+       * waiting rather than sliding along with the phone. What it must not do
+       * is wait for something that cannot happen from where the operator is.
+       */
+      if (this.rawBearingDeg !== null && this.waitingSec > t.abandonAfterSec
+          && !coverage.completeAt(this.rawBearingDeg)) {
+        this.deferred.set(coverage.indexOf(this.rawBearingDeg),
+          nowMs + t.deferCooldownSec * 1000);
+        this.rawBearingDeg = null;
+        this.waitingSec = 0;
+        this.abandonedCount = (this.abandonedCount || 0) + 1;
+      }
+
+      const stillWanted = this.rawBearingDeg !== null
+        && !coverage.completeAt(this.rawBearingDeg)
+        && !this.isDeferred(coverage, this.rawBearingDeg, nowMs);
+      if (!stillWanted) this.rawBearingDeg = raw;
+    } else {
+      this.rawBearingDeg = raw;
     }
 
-    const stillWanted = this.rawBearingDeg !== null
-      && !coverage.completeAt(this.rawBearingDeg)
-      && !this.isDeferred(coverage, this.rawBearingDeg, nowMs);
-    // The second half of the same rule: even a target that is still wanted may
-    // be reconsidered, but ONLY when some ground actually became covered since
-    // the last decision. Turning the phone changes nothing here; covering the
-    // horizon changes everything.
-    const mapChanged = coverage.generation !== this.lastGeneration;
-    if (!stillWanted || mapChanged) this.rawBearingDeg = raw;
+    /*
+     * IS THE GROUND UNDER THE DOT GAINING ANYTHING?
+     *
+     * Two wrong answers to this were tried before the right one.
+     *
+     * It first asked whether the TARGET had moved, which is a question about
+     * the dot and not about the survey. While the dot was pinned to the
+     * operator's own heading it moved constantly, so `waitingSec` never
+     * accumulated, so the six-second escape below never fired and the interface
+     * never once said "hold here" — the operator was told nothing while nothing
+     * was being recorded.
+     *
+     * It then asked whether either MAP had gained anything anywhere, which is
+     * worse in the opposite direction: during any sweep some bin somewhere is
+     * always becoming covered, so the timer resets forever and a dot parked on
+     * ground nobody is looking at is never given up. Measured on the clockwise
+     * sweep case, the dot stuck at 342° while the operator walked to 119° and
+     * the escape never fired once.
+     *
+     * The question is local, so the measurement must be: has the sector the dot
+     * is standing on gained anything. Both halves, since either can be the
+     * thing being waited for — the ring's confidence at that bearing, and the
+     * bands filled in the column if one is held.
+     */
+    const targetIndex = coverage.indexOf(this.rawBearingDeg);
+    const progressNow = (coverage.scoreAt(this.rawBearingDeg) || 0)
+      + (this.holdingColumn && plan ? plan.bandsFilled(this.heldColumn) : 0);
+    const sameTarget = targetIndex === this._progressIndex;
+    const gained = !sameTarget || progressNow > (this._progressValue ?? -1) + 1e-4;
+    this._progressIndex = targetIndex;
+    this._progressValue = progressNow;
     this.lastGeneration = coverage.generation;
+    this.lastPlanGeneration = plan ? plan.generation : 0;
+    if (gained) {
+      this.waitingSec = 0;
+      this.lastAdvanceAt = nowMs;
+    } else {
+      this.waitingSec += dtSec;
+    }
+    this.lastRawBearing = this.rawBearingDeg;
 
     // Slew limit then smoothing, so the dot travels rather than teleports.
     if (this.bearingDeg === null) {
@@ -455,73 +575,91 @@ export class ScanGuidance {
       this.bearingDeg = wrap360(this.bearingDeg + limited * alpha);
     }
 
-    // Is it moving? Used only to describe the situation in words.
-    const advanced = this.lastRawBearing === null
-      || Math.abs(angDiff(this.rawBearingDeg, this.lastRawBearing)) > 0.5;
-    if (advanced) {
-      this.waitingSec = 0;
-      this.lastAdvanceAt = nowMs;
-    } else {
-      this.waitingSec += dtSec;
+    /*
+     * WHERE THE DOT SITS VERTICALLY.
+     *
+     * Rewritten 2026-08-25, and this is the other half of why the dot was
+     * useless in the back yard.
+     *
+     * The rule was: climb when `coverage.needsLiftAt` says the top of this
+     * sector has never been framed, descend when the camera is well above the
+     * sector's skyline, and OTHERWISE ride at the camera's own elevation. That
+     * third case is not a default, it is a blind spot, and while a column was
+     * being held it was the case that applied almost all the time — the top had
+     * been seen, so no lift was wanted, so the dot sat at exactly the elevation
+     * the camera was already at, on exactly the bearing the camera was already
+     * on. Both axes mirrored the operator. The recorded trail shows six-second
+     * stretches of it: camera at 6.8°, dot at 6.8°, required 15.2°, lift 0.0,
+     * and the column quietly failing to gain the band at 14.9° that it needed.
+     *
+     * The plan knows exactly which band is missing. It always did — `gapBand`
+     * has been there the whole time and nothing called it. So while a column is
+     * held, the dot goes to the centre of the band being filled, and that is
+     * the instruction: put the dot back in the middle of the picture and the
+     * band fills. The coverage map's lift and descent still drive the dot when
+     * no column is held, because then there is no band to name.
+     */
+    let aim = null;              // where the dot ultimately wants the camera
+    let aimSource = 'camera';
+    let columnTopDeg = null;
+    this.targetBand = -1;
+    this.targetBands = 0;
+
+    if (this.holdingColumn && plan) {
+      const band = plan.gapBand(this.heldColumn);
+      this.targetBands = plan.bandsRequired[this.heldColumn];
+      if (band >= 0) {
+        this.targetBand = band;
+        aim = plan.elevationOf(band);
+        aimSource = 'band';
+        columnTopDeg = plan.elevationOf(Math.max(0, this.targetBands - 1));
+      }
     }
-    this.lastRawBearing = this.rawBearingDeg;
 
     /*
-     * Where the dot sits vertically.
+     * No band to name — the column is full and the ring is still thin, or there
+     * is no plan at all. Fall back to what the coverage map knows: climb to
+     * frame a top nobody has measured, and come back down off one afterwards.
      *
-     * By default it rides at whatever elevation the camera already holds, so it
-     * asks for a turn and nothing else — two instructions at once is one too
-     * many. But where the map has recorded that something stands above a sector
-     * whose top nobody has measured, the dot climbs to the elevation needed to
-     * see it, and following the dot becomes "tilt up" without a word being said.
+     * The descent matters as much as the climb. Coming off a tall roof at 60
+     * degrees and turning into open garden, every frame is sky and nothing
+     * fills; without a target to descend to the dot would ride along at 60
+     * waiting for a sector that can never fill.
      */
     const required = coverage.requiredElevationAt(this.rawBearingDeg);
-    const wantsLift = coverage.needsLiftAt(this.rawBearingDeg) && required > 0;
-
-    /*
-     * And where it sits on the way back DOWN.
-     *
-     * Riding at the camera's own elevation whenever no lift is wanted is
-     * correct while the operator is near the skyline, and it is why the dot
-     * normally asks for a turn and nothing else. But it is exactly wrong just
-     * after a tall obstruction: the operator is at 60 degrees, the next sector
-     * needs nothing, so `wantsLift` is false, the dot mirrors the camera at 60,
-     * and the sector below never fills because every frame up there is sky.
-     * The dot has to lead down as deliberately as it led up.
-     *
-     * The prompt threshold keeps this quiet in ordinary use. Only a camera well
-     * above where this sector's skyline actually is gets pulled down, so the
-     * operator is never fighting the dot over a degree or two of framing.
-     */
     const rest = coverage.restElevationAt(this.rawBearingDeg);
-    const wantsDrop = !wantsLift && (elevationDeg - rest) > t.descentPromptDeg;
+    if (aim === null) {
+      if (coverage.needsLiftAt(this.rawBearingDeg) && required > 0) {
+        aim = required;
+        aimSource = 'lift';
+        columnTopDeg = required;
+      } else if ((elevationDeg - rest) > t.descentPromptDeg) {
+        aim = rest;
+        aimSource = 'rest';
+      } else {
+        aim = elevationDeg;
+      }
+    }
 
     /*
      * CLIMB IN STEPS, NOT IN ONE JUMP.
      *
-     * This used to put the dot straight at `required` — the elevation that
-     * frames the top of the obstruction — and the operator, quite reasonably,
-     * went straight there. On the 2026-08-19 23:48 capture that meant tilting
-     * from about 9 degrees to about 47 in one movement, taking a picture, and
-     * coming back down. The vertical field of view is 30.9 degrees, so those
-     * two elevations share no pixels at all, nothing visually connects the high
-     * frames to the horizon row, and the stitcher discarded 13 of the 80
-     * photographs — every one of them a view over the house the survey was
-     * mainly there to measure.
-     *
-     * So the dot never asks for more than one band at a time. `bandStepDeg` is
-     * a little over half the vertical field, which leaves about 45% of each
-     * frame overlapping the one below it. The climb takes three prompts instead
-     * of one and deposits a frame at every height on the way, which is the
-     * whole difference between a column that stitches and a column that does
-     * not. Reaching the top is not the goal; arriving there with a connected
-     * chain behind you is.
+     * The dot never asks for more than one band at a time. `bandStepDeg` is
+     * 0.40 of the vertical field, which leaves 60% of each frame overlapping
+     * the one below it AND keeps the dot on the screen — at half the field it
+     * lands off the top edge, and an instruction you cannot see is not an
+     * instruction. On the 2026-08-19 capture a single 9°-to-47° jump cost 13 of
+     * 80 photographs, because two elevations that share no pixels leave the
+     * high frames in their own component. Reaching the top is not the goal;
+     * arriving there with a connected chain behind you is.
      */
     const step = Number.isFinite(this.bandStepDeg) && this.bandStepDeg > 0
       ? this.bandStepDeg : Infinity;
-    const climbTo = Math.min(required, elevationDeg + step);
-    const descendTo = Math.max(rest, elevationDeg - step);
-    const desiredElevation = wantsLift ? climbTo : (wantsDrop ? descendTo : elevationDeg);
+    const desiredElevation = clamp(aim, elevationDeg - step, elevationDeg + step);
+
+    const wantsLift = desiredElevation - elevationDeg > t.tiltDeadbandDeg;
+    const wantsDrop = !wantsLift && elevationDeg - desiredElevation > t.tiltDeadbandDeg;
+
     if (this.elevationDeg === null) {
       this.elevationDeg = desiredElevation;
     } else {
@@ -529,22 +667,41 @@ export class ScanGuidance {
         ? 1 - Math.exp(-dtSec / t.elevationSmoothingSec) : 1;
       this.elevationDeg += (desiredElevation - this.elevationDeg) * alpha;
     }
+    this.aimElevationDeg = aim;
+    this.aimSource = aimSource;
     this.wantsLift = wantsLift;
     // What is being asked for NOW, not the whole remaining climb. The operator
-    // is told "tilt up 17°" three times rather than "tilt up 38°" once.
-    this.liftDeg = wantsLift ? Math.max(0, climbTo - elevationDeg) : 0;
+    // is led up one band three times rather than told "38°" once.
+    this.liftDeg = wantsLift ? desiredElevation - elevationDeg : 0;
     /** How much climbing remains after this step, so the directive can say the
      *  column is not finished without asking for it all at once. */
-    this.liftRemainingDeg = wantsLift ? Math.max(0, required - elevationDeg) : 0;
+    this.liftRemainingDeg = wantsLift && columnTopDeg !== null
+      ? Math.max(0, columnTopDeg - elevationDeg) : this.liftDeg;
     this.wantsDrop = wantsDrop;
-    this.dropDeg = wantsDrop ? Math.max(0, elevationDeg - descendTo) : 0;
-    this.dropRemainingDeg = wantsDrop ? Math.max(0, elevationDeg - rest) : 0;
-    // Taller than any tilt this will ask for, even at the 50-degree ceiling.
-    // Recorded and reported rather than repeated at the operator, since there is
-    // no instruction here that could succeed.
-    this.beyondTilt = coverage.beyondTiltAt(this.rawBearingDeg);
+    this.dropDeg = wantsDrop ? elevationDeg - desiredElevation : 0;
+    this.dropRemainingDeg = wantsDrop ? Math.max(0, elevationDeg - Math.min(aim, rest)) : 0;
+    /*
+     * Taller than anything that can be asked for. Recorded and reported rather
+     * than repeated at the operator, since there is no instruction here that
+     * could succeed. Both maps are asked, because they cap independently and
+     * either one giving up is the thing the operator needs told.
+     */
+    this.beyondTilt = coverage.beyondTiltAt(this.rawBearingDeg)
+      || (plan ? plan.beyondReach(plan.indexOf(this.rawBearingDeg)) : false);
 
-    const behindOperator = distanceAlong(headingDeg, this.rawBearingDeg, t.sweepDirection) > 180;
+    /*
+     * "Behind" needs a dead band.
+     *
+     * The test was the sign of the sweep-relative distance alone, so a dot a
+     * fifth of a degree the wrong side of the heading was reported as behind
+     * the operator — and the interface said "Target is 0° right, sweep back
+     * onto it" while they were already on it. In the recorded trail the state
+     * flickered between `behind` and `advancing` on alternate frames for
+     * minutes. Behind means far enough behind to be worth turning around for.
+     */
+    const away = Math.abs(angDiff(this.rawBearingDeg, headingDeg));
+    const behindOperator = away > t.holdRadiusDeg
+      && distanceAlong(headingDeg, this.rawBearingDeg, t.sweepDirection) > 180;
     this.state = behindOperator ? 'behind'
       : this.waitingSec > t.stalledAfterSec ? 'waiting'
         : 'advancing';
@@ -564,6 +721,18 @@ export class ScanGuidance {
       elevationDeg: this.elevationDeg,
       wantsLift: this.wantsLift,
       holdingColumn: !!this.holdingColumn,
+      /** Which band the dot is asking for and how many the column needs, so
+       *  the interface can say "band 3 of 5" instead of leaving a climb with no
+       *  visible end. -1 when no column is held. */
+      targetBand: this.targetBand,
+      targetBands: this.targetBands,
+      /** Where the dot ultimately wants the camera, and which map asked for it:
+       *  'band' (the column plan), 'lift'/'rest' (the coverage ring), or
+       *  'camera' when nothing has an opinion. A session spent almost entirely
+       *  in 'camera' is a dot that is not instructing anyone. */
+      aimElevationDeg: Number.isFinite(this.aimElevationDeg)
+        ? Number(this.aimElevationDeg.toFixed(1)) : null,
+      aimSource: this.aimSource || 'camera',
       liftDeg: Number((this.liftDeg || 0).toFixed(1)),
       liftRemainingDeg: Number((this.liftRemainingDeg || 0).toFixed(1)),
       dropRemainingDeg: Number((this.dropRemainingDeg || 0).toFixed(1)),

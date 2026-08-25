@@ -21,7 +21,8 @@ import * as store from './storage.js';
 import * as out from './exporters.js';
 import { buildCaptureDebugZip } from './diagnostic-export.js';
 import { captureGapReport } from './capture-gaps.js';
-import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted, overlapFloor, pass1OverTravel, keyframeSpacingReached } from './capture-policy.js';
+import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted, overlapFloor, pass1OverTravel, keyframeSpacingReached, captureDemand } from './capture-policy.js';
+import { SurveyRates, estimateSurvey, describeSurveyPlan, roughMinutes } from './survey-estimate.js';
 import { disagreementByBin, pixelToAzAlt, landmarkResiduals } from './panorama.js';
 import { PyodideStitcher, stitcherAvailability } from './pyodide-stitch.js';
 import { bearingCoverage, frameCoverage, stitchVerdict } from './coverage-table.js';
@@ -69,6 +70,14 @@ const guidance = new ScanGuidance();
  * step IS the vertical field of view times the overlap fraction and getting it
  * from a default would reintroduce the exact bug it exists to prevent. */
 const columns = new ColumnPlan({ vfovDeg: 30, binCount: coverage.binCount });
+
+/* How long this device takes to walk a horizon and to build a panorama, learned
+ * from what it has actually done. Seeded from the 2026-08-25 reference capture
+ * and replaced by real measurements after one run. */
+const surveyRates = new SurveyRates(
+  typeof localStorage === 'undefined' ? null : localStorage);
+/** Wall clock at the start of pass 1, so the capture rate can be measured. */
+let captureStartedAt = null;
 const orientation = new OrientationSource(log);
 const camera = new CameraSource($('video'), log);
 const pipeline = new Pipeline(log);
@@ -234,6 +243,29 @@ function recordGuidanceSample(t, pose, att, quality) {
     wantsDrop: !!g.wantsDrop,
     dropDeg: Number.isFinite(g.dropDeg) ? Number(g.dropDeg.toFixed(2)) : 0,
     beyondTilt: !!g.beyondTilt,
+    /*
+     * WHAT THE DOT WAS ACTUALLY ASKING FOR, AND WHO ASKED.
+     *
+     * Reading the 2026-08-25 trail, the fatal state was invisible: the dot was
+     * mirroring the camera in both axes and every recorded field was consistent
+     * with a dot doing its job. `aimSource` names the map that chose the
+     * elevation — 'band' (the column plan), 'lift'/'rest' (the coverage ring),
+     * or 'camera', which means nothing had an opinion and the dot was following
+     * the phone. A trail that is mostly 'camera' is a dot instructing nobody,
+     * and that is a thing a reader can now see at a glance.
+     *
+     * `holdingColumn`, `targetBand` and `targetBands` say which cell of the
+     * plan is being worked, so a column that never finishes can be traced to
+     * the band that never filled.
+     */
+    aimSource: g.aimSource || 'camera',
+    aimElevationDeg: Number.isFinite(g.aimElevationDeg) ? g.aimElevationDeg : null,
+    dotElevationDeg: Number.isFinite(g.elevationDeg) ? Number(g.elevationDeg.toFixed(2)) : null,
+    holdingColumn: !!g.holdingColumn,
+    targetBand: Number.isFinite(g.targetBand) ? g.targetBand : -1,
+    targetBands: Number.isFinite(g.targetBands) ? g.targetBands : 0,
+    heldForSec: Number.isFinite(g.heldColumnForSec) ? g.heldColumnForSec : 0,
+    waitingSec: Number.isFinite(g.waitingSec) ? Number(g.waitingSec.toFixed(2)) : 0,
     /* What the frame itself said about the skyline running off the top edge —
      * the input that drives the whole lift decision. */
     clippedFraction: Number.isFinite(state.clippedFraction)
@@ -659,6 +691,22 @@ async function processFrame() {
       // band either. syncRequirements is cheap and picks up obstruction tops
       // the coverage map refined on this very frame.
       columns.setFieldOfView(camera.intrinsics().vfovDeg);
+      /*
+       * ONE CEILING, HELD IN ONE PLACE.
+       *
+       * The coverage ring stops asking for elevation at
+       * `maxRequestedElevationDeg` and marks anything taller `beyondTilt`, so
+       * it never blocks on a top it cannot reach. The column plan had no such
+       * ceiling of its own, and on the 2026-08-25 back-yard capture that
+       * mismatch was fatal: the house measured 75.1°, the plan demanded a band
+       * centred at 74.4°, nothing in the app would ever aim there, and 19
+       * columns stayed unfinished forever. The guidance held its bearing on
+       * them, so the dot stopped leading and became a shadow of the phone.
+       *
+       * Telling the plan the ring's ceiling makes a disagreement impossible
+       * rather than merely unlikely.
+       */
+      columns.setCeiling(coverage.tuning.maxRequestedElevationDeg);
       columns.syncRequirements(coverage);
       // The guidance dot climbs in the same increments the column plan is built
       // from, so following the dot produces a chain of overlapping frames
@@ -808,10 +856,25 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     return;
   }
 
-  // 80% horizontal overlap gives the visual solver roughly forty views per
-  // lap on the iPad instead of twenty-one. Every physical edge now appears
-  // near the optical centre in several frames.
-  const stepDeg = keyframeStepDeg(camera.hfovDeg);
+  /*
+   * SPEND FRAMES WHERE THEY BUY SOMETHING.
+   *
+   * The spacing gate used to be one fraction of the field of view everywhere,
+   * so a stretch of horizon seen eight times cost exactly as many photographs
+   * as the band above the roof nobody had seen once. On the 2026-08-25 capture
+   * that came out as 757 refusals for spacing against 115 photographs taken,
+   * while the arc the stitcher then lost was lost for want of frames.
+   *
+   * `captureDemand` asks both maps what is still wanted at this exact pose. The
+   * step tightens to 90% overlap where something is, and relaxes to 70% where
+   * neither map wants anything — still far more overlap than the matcher needs,
+   * just not the same photograph four times over.
+   */
+  const demand = captureDemand({
+    coverage, plan: columns,
+    headingDeg: currentHeading(), elevationDeg: pose.att.elevation
+  });
+  const stepDeg = keyframeStepDeg(camera.hfovDeg, demand);
   const intrForStep = camera.intrinsics();
   const last = survey.keyframes[survey.keyframes.length - 1];
   let accept = false;
@@ -837,7 +900,8 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
         ? 0 : pose.att.elevation - state.elevationAtKeyframe,
       elevationDeg: pose.att.elevation,
       hfovDeg: intrForStep.hfovDeg,
-      vfovDeg: intrForStep.vfovDeg
+      vfovDeg: intrForStep.vfovDeg,
+      demand
     });
   } else {
     // A normal pass 2 is a dense second lap. Targeted holds are reserved for
@@ -852,7 +916,8 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
         tiltDeltaDeg: state.elevationAtKeyframe === null
           ? 0 : pose.att.elevation - state.elevationAtKeyframe,
         elevationDeg: pose.att.elevation,
-        hfovDeg: intrForStep.hfovDeg, vfovDeg: intrForStep.vfovDeg
+        hfovDeg: intrForStep.hfovDeg, vfovDeg: intrForStep.vfovDeg,
+        demand
       }) ? stepDeg : 0,
       stepDeg,
       onTarget,
@@ -864,7 +929,9 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
     const reason = director.phase === PHASE.PASS2 && !director.verificationSweep
       ? 'off-target-or-not-still'
       : 'spacing-not-reached';
-    recordCaptureDecision(reason, { pose, t, exposure, detail: { stepDeg } });
+    // `demand` in the audit, because "spacing-not-reached" alone never said
+    // whether the app was refusing a frame it did not need or one it did.
+    recordCaptureDecision(reason, { pose, t, exposure, detail: { stepDeg, demand } });
     return;
   }
 
@@ -1171,6 +1238,29 @@ function finishCalibration() {
     }
   }, 4000);
   log('info', `Pass 1 started at azimuth ${currentHeading().toFixed(1)}°.`);
+
+  /*
+   * SAY HOW LONG THIS WILL TAKE, BEFORE IT TAKES IT.
+   *
+   * The 2026-08-25 survey was 2m37s of capture and 16m20s of building, and the
+   * operator learned that by watching it happen. The build is the part that
+   * matters here: it needs the phone awake and left alone for a quarter of an
+   * hour, and a screen that dims into sleep partway through throws away the
+   * walk. That is a setting the operator can change in ten seconds — but only
+   * if somebody tells them, and only if somebody tells them now.
+   */
+  captureStartedAt = performance.now();
+  const plan = estimateSurvey({
+    rates: surveyRates,
+    hfovDeg: camera.hfovDeg,
+    stepAcrossDeg: keyframeStepDeg(camera.hfovDeg, 1)
+  });
+  log('info', describeSurveyPlan(plan), {
+    expectedFrames: plan.frames,
+    captureSec: Math.round(plan.captureSec),
+    buildSec: Math.round(plan.buildSec),
+    fromMeasuredRates: plan.measured
+  });
   state.sensorCal = { stage: 'complete', startedAt: performance.now() };
   syncControls();
 }
@@ -1715,6 +1805,20 @@ function finishSurvey() {
   state.paused = true;
   syncControls();
   log('info', 'Survey complete.');
+
+  // Learn from what just happened, so the next survey's estimate is this
+  // device's own figure rather than the reference capture's.
+  if (captureStartedAt !== null) {
+    surveyRates.recordCapture(
+      survey.keyframes.length, (performance.now() - captureStartedAt) / 1000);
+    captureStartedAt = null;
+  }
+  const next = estimateSurvey({
+    rates: surveyRates, frames: survey.keyframes.length
+  });
+  log('info', `Building the panorama from ${survey.keyframes.length} photographs will take `
+    + `${roughMinutes(next.buildSec)}. Keep the screen awake and this tab in front.`,
+    { buildSec: Math.round(next.buildSec) });
 }
 
 /** Archives record the mode their acceptance thresholds were set by; restoring
@@ -2870,6 +2974,7 @@ async function buildPanorama() {
     status.textContent = `${report.frames} keyframes, ${report.render?.renderedFrames ?? 0} in the `
       + `solved panorama, ${(report.render?.paintedFraction * 100 || 0).toFixed(0)}% of the panel `
       + `painted, ${(ms / 1000).toFixed(1)} s.`;
+    surveyRates.recordBuild(report.frames, ms / 1000);
     log('info', `Panorama built by the Python stitcher: ${report.pairs} pairs, `
       + `${report.matches} matches, focal x${report.focalScale?.toFixed(4)}, `
       + `overlap disagreement ${v?.meanDisagreement?.toFixed(1)} (${v?.grade}).`,

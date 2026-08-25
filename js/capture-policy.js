@@ -20,7 +20,44 @@
  * be wrong in: extra frames cost seconds of walking and a little solver time,
  * and missing ones cost a return trip.
  */
-export function keyframeStepDeg(horizontalFovDeg) {
+/**
+ * Spacing is spent where it buys something.
+ *
+ * MEASURED, 2026-08-25. That capture evaluated 872 candidate frames and
+ * photographed 115 of them; 757 were refused for spacing. Meanwhile the arc the
+ * stitcher lost was lost for want of frames, not for want of quality — a
+ * contiguous block of 30 photographs came off the graph because the pairs
+ * across it did not survive pruning. So the app was simultaneously refusing
+ * frames it did not need and short of frames it did.
+ *
+ * A single fixed fraction of the field of view cannot express that. It spends
+ * exactly as much on a stretch of horizon already seen eight times as on the
+ * band above the roof nobody has photographed once. `demand` is what the maps
+ * say is still wanted here, 0 to 1, and it slides the step between:
+ *
+ *   demand 1  DENSE, 0.10 of the field — 90% overlap. New ground, an unfilled
+ *             band, a column the plan is still climbing. Frames are the thing
+ *             this survey is short of and the cost of one is a fraction of a
+ *             second.
+ *   demand 0  SPARSE, 0.30 of the field — 70% overlap. Ground both maps call
+ *             finished. Still well inside `MIN_PHOTO_OVERLAP`, so the chain
+ *             cannot come apart; it simply stops taking the same photograph
+ *             four times.
+ *
+ * The default is 1. Nothing that does not know about demand is quietly made
+ * sparser by this change, and the dense end is where an unmeasured scene
+ * belongs.
+ */
+const DENSE_FRACTION = 0.10;
+const SPARSE_FRACTION = 0.30;
+
+function spacingFraction(demand) {
+  const d = Number(demand);
+  const want = Number.isFinite(d) ? Math.min(1, Math.max(0, d)) : 1;
+  return SPARSE_FRACTION + (DENSE_FRACTION - SPARSE_FRACTION) * want;
+}
+
+export function keyframeStepDeg(horizontalFovDeg, demand = 1) {
   // A non-finite field of view must not poison the step. `Math.max(3, NaN)` is
   // NaN, and a NaN step makes `keyframeSpacingReached` return false forever —
   // so the app would stop photographing entirely while logging
@@ -29,14 +66,50 @@ export function keyframeStepDeg(horizontalFovDeg) {
   // rotation, so this is reachable, not theoretical.
   const fov = Number(horizontalFovDeg);
   if (!Number.isFinite(fov) || fov <= 0) return 3;
-  return Math.max(3, Math.min(360, fov) * 0.14);
+  return Math.max(3, Math.min(360, fov) * spacingFraction(demand));
 }
 
 /** Vertical keyframe spacing, on the same principle as the horizontal one. */
-export function keyframeTiltStepDeg(verticalFovDeg) {
+export function keyframeTiltStepDeg(verticalFovDeg, demand = 1) {
   const fov = Number(verticalFovDeg);
   if (!Number.isFinite(fov) || fov <= 0) return 2.5;
-  return Math.max(2.5, Math.min(180, fov) * 0.14);
+  return Math.max(2.5, Math.min(180, fov) * spacingFraction(demand));
+}
+
+/**
+ * How much this pose is still worth photographing, 0 to 1.
+ *
+ * Asked of both maps, because they are short of different things and either one
+ * being hungry is a reason to spend a frame. The ring's confidence answers "has
+ * this bearing been looked at enough"; the column plan's band answers "has this
+ * HEIGHT at this bearing been looked at at all", and it is the second question
+ * that the 2026-08-25 capture kept getting wrong — the arcs it lost were high
+ * ones.
+ *
+ * Deliberately generous. Half demand still steps at 0.20 of the field, which is
+ * the density this app shipped with before any of this existed, so the sparse
+ * end is only reached where both maps are satisfied.
+ */
+export function captureDemand({ coverage = null, plan = null, headingDeg = 0, elevationDeg = 0 } = {}) {
+  let demand = 0;
+  if (coverage) {
+    // Ring confidence, inverted: an uncovered bearing wants everything.
+    const score = Number(coverage.scoreAt?.(headingDeg));
+    const covered = coverage.completeAt?.(headingDeg) === true;
+    if (!covered) demand = Math.max(demand, 1 - (Number.isFinite(score) ? score : 0));
+    if (coverage.needsLiftAt?.(headingDeg)) demand = 1;
+  }
+  if (plan) {
+    const i = plan.indexOf(headingDeg);
+    const band = plan.bandOf(elevationDeg);
+    // Aimed between bands, or at a band this column still needs: full demand.
+    // A frame between bands is the connective tissue of a climb, so it is the
+    // last thing that should be refused.
+    if (band < 0) demand = 1;
+    else if (!plan._bandFilled(i, band)) demand = 1;
+    else if (!plan.columnComplete(i)) demand = Math.max(demand, 0.5);
+  }
+  return Math.min(1, Math.max(0, demand));
 }
 
 /**
@@ -66,13 +139,13 @@ export function keyframeTiltStepDeg(verticalFovDeg) {
  */
 export function keyframeSpacingReached({
   yawDeltaDeg = 0, tiltDeltaDeg = 0, elevationDeg = 0,
-  hfovDeg = 45, vfovDeg = 34
+  hfovDeg = 45, vfovDeg = 34, demand = 1
 } = {}) {
   const across = Math.abs(Number(yawDeltaDeg) || 0)
     * Math.cos(Math.min(85, Math.abs(Number(elevationDeg) || 0)) * Math.PI / 180);
   const down = Math.abs(Number(tiltDeltaDeg) || 0);
-  const stepAcross = keyframeStepDeg(hfovDeg);
-  const stepDown = keyframeTiltStepDeg(vfovDeg);
+  const stepAcross = keyframeStepDeg(hfovDeg, demand);
+  const stepDown = keyframeTiltStepDeg(vfovDeg, demand);
   return Math.hypot(across / stepAcross, down / stepDown) >= 1;
 }
 

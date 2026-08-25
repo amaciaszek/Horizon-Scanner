@@ -13,16 +13,16 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.20.2';
-export const BUILD_DATE = '2026-08-21';
+export const VERSION = '0.21.0';
+export const BUILD_DATE = '2026-08-25';
 
 /**
- * The bug sweep before the field: a dot that could never be satisfied.
+ * The dot leads again.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'Pre-field bug sweep. A tall sector could never satisfy its own lift rule, so the dot parked on it forever; sky frames could not fill a column band, so tall columns could never finish; and one bad number could hang the capture loop outright. A stale cache now announces itself.';
+  'The guidance dot was a mirror of the phone, not an instruction: it sat on your own bearing at your own elevation and asked for nothing. It now names the exact band it wants filled and waits there while you go and get it. Columns no longer demand heights the app will never ask you to aim at. Frames are spent densely on unseen ground and sparsely on ground already done. And the survey says up front how long it will take, so you can stop the screen dimming first.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {

@@ -1,6 +1,7 @@
 import {
   keyframeStepDeg, maxKeyframeYawRate, keyframeMotionAccepted,
-  pass2CaptureAccepted, keyframeSpacingReached, keyframeTiltStepDeg
+  pass2CaptureAccepted, keyframeSpacingReached, keyframeTiltStepDeg,
+  maxUsableStepDeg, captureDemand
 } from '../js/capture-policy.js';
 
 let failures = 0;
@@ -9,13 +10,33 @@ function check(name, ok, detail = '') {
   if (!ok) failures++;
 }
 
-// 86% overlap, raised from 80% on 2026-08-20. A frame is cheap on a survey that
-// is run once and relied on for years; a hole in the overlap graph is not, and
-// the 2026-08-20 capture lost 24 of its 63 photographs in the arc that had the
-// least redundancy in it.
-check('iPad sweep targets about 86% horizontal overlap',
-  Math.abs(keyframeStepDeg(45.6) - 45.6 * 0.14) < 1e-9,
-  `${keyframeStepDeg(45.6).toFixed(2)}° step on a 45.6° lens`);
+/*
+ * Spacing is now a ramp, not a constant. It was a flat 0.14 of the field — 86%
+ * overlap everywhere, raised from 80% on 2026-08-20 because a frame is cheap on
+ * a survey run once and relied on for years while a hole in the overlap graph
+ * is not.
+ *
+ * The 2026-08-25 capture showed the cost of spending it evenly: 757 of 872
+ * candidates refused for spacing, while the arc the stitcher lost was lost for
+ * want of frames. So the ramp: 0.10 of the field where the maps still want
+ * something, 0.30 where both call it finished. The sparse end is still well
+ * inside MIN_PHOTO_OVERLAP, so the chain cannot come apart.
+ */
+check('unmeasured ground is photographed densely — 90% overlap',
+  Math.abs(keyframeStepDeg(45.6, 1) - 45.6 * 0.10) < 1e-9,
+  `${keyframeStepDeg(45.6, 1).toFixed(2)}° step on a 45.6° lens`);
+check('ground both maps call finished is photographed sparsely',
+  Math.abs(keyframeStepDeg(45.6, 0) - 45.6 * 0.30) < 1e-9,
+  `${keyframeStepDeg(45.6, 0).toFixed(2)}° step`);
+check('a caller that says nothing gets the dense end, never the sparse one',
+  keyframeStepDeg(45.6) === keyframeStepDeg(45.6, 1),
+  `${keyframeStepDeg(45.6).toFixed(2)}°`);
+check('the sparse end still leaves more overlap than the policy floor',
+  keyframeStepDeg(45.6, 0) < maxUsableStepDeg(45.6),
+  `${keyframeStepDeg(45.6, 0).toFixed(1)}° vs floor at ${maxUsableStepDeg(45.6).toFixed(1)}°`);
+check('demand moves the step monotonically',
+  keyframeStepDeg(45.6, 1) < keyframeStepDeg(45.6, 0.5)
+  && keyframeStepDeg(45.6, 0.5) < keyframeStepDeg(45.6, 0));
 check('very narrow lenses retain a safe minimum spacing', keyframeStepDeg(10) === 3);
 check('handheld rate ceiling admits a deliberate 25 deg/s sweep',
   maxKeyframeYawRate({ mode: 'handheld' }) === 35
@@ -98,6 +119,53 @@ check('targeted cleanup retains its hold and timing gates',
   check('and they are spaced for overlap, not crowded',
     taken <= 60 / (keyframeTiltStepDeg(VF) * 0.8),
     `${taken} frames, step ${keyframeTiltStepDeg(VF).toFixed(1)}°`);
+}
+
+console.log('\n=== Demand answers both maps, and either being hungry is enough ===');
+{
+  const { CoverageMap } = await import('../js/coverage.js');
+  const { ColumnPlan } = await import('../js/column-plan.js');
+
+  const coverage = new CoverageMap();
+  const plan = new ColumnPlan({ vfovDeg: 37.2, binCount: coverage.binCount });
+  const HF = 48.4;
+
+  // Nothing seen anywhere yet.
+  check('unseen ground wants every frame it can get',
+    captureDemand({ coverage, plan, headingDeg: 90, elevationDeg: 0 }) === 1);
+
+  // Fill the ring and the bottom band at one bearing, and leave the column tall.
+  for (let pass = 0; pass < 40; pass++) {
+    coverage.observe({
+      headingDeg: 90, elevationDeg: 0, rollDeg: 0, yawRateDegPerSec: 2, jitterDeg: 0.2,
+      skylineConfidence: 0.8, visualQuality: 0.3, glareFraction: 0, frameStatus: 'ok',
+      hfovDeg: HF, vfovDeg: 37.2, dtSec: 0.2, atMs: pass * 300
+    });
+  }
+  for (let k = 0; k < 8; k++) {
+    plan.observe({ headingDeg: 90, elevationDeg: 0, quality: 1, hfovDeg: HF });
+  }
+  plan.requireHeight(plan.indexOf(90), 45);
+
+  const atHorizon = captureDemand({ coverage, plan, headingDeg: 90, elevationDeg: 0 });
+  check('a filled band under an unfinished column is not free, but is cheaper',
+    atHorizon > 0 && atHorizon < 1, `demand ${atHorizon}`);
+
+  const atEmptyBand = captureDemand({
+    coverage, plan, headingDeg: 90, elevationDeg: plan.elevationOf(2)
+  });
+  check('an empty band at the same bearing still wants everything',
+    atEmptyBand === 1, `demand ${atEmptyBand}`);
+  check('and it is therefore photographed more densely than the horizon under it',
+    keyframeStepDeg(HF, atEmptyBand) < keyframeStepDeg(HF, atHorizon),
+    `${keyframeStepDeg(HF, atEmptyBand).toFixed(1)}° vs ${keyframeStepDeg(HF, atHorizon).toFixed(1)}°`);
+
+  // A frame aimed between two bands is the connective tissue of a climb.
+  const between = captureDemand({
+    coverage, plan, headingDeg: 90, elevationDeg: plan.bandStepDeg * 0.5
+  });
+  check('a frame between bands is never refused as redundant', between === 1,
+    `demand ${between}`);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall capture-policy checks passed');

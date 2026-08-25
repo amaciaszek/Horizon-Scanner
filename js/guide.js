@@ -466,10 +466,18 @@ export class ScanDirector {
      */
     if (g.wantsLift && away < 25) {
       const more = (g.liftRemainingDeg || 0) - (g.liftDeg || 0) > 4;
+      /*
+       * How far up this column the operator has got, in bands rather than in
+       * degrees. A climb with no stated end is the thing that makes people
+       * give up on it halfway — and half a column is precisely the shape the
+       * solver discards. Bands are countable from the screen; degrees are not.
+       */
+      const step = g.targetBand >= 0 && g.targetBands > 0
+        ? ` Level ${g.targetBand + 1} of ${g.targetBands}.` : '';
       return {
         tone: 'work',
         headline: 'Follow the target up',
-        detail: `The top of what stands here has never been inside a picture, so its height is unmeasured. The target has moved up — raise the camera until it sits back in the middle, keeping your feet where they are.${more ? ' It will step up again once this height is covered.' : ''} ${pct}% of the horizon done.`,
+        detail: `The top of what stands here has never been inside a picture, so its height is unmeasured. The target has moved up — raise the camera until it sits back in the middle, keeping your feet where they are.${step}${more ? ' It will step up again once this height is covered.' : ''} ${pct}% of the horizon done.`,
         arrow: 0, tilt: +1, phase: this.phase, progress: g.summary.fraction
       };
     }
@@ -496,8 +504,18 @@ export class ScanDirector {
         0, g.summary.fraction);
     }
     if (g.state === 'behind' || away > 35) {
+      /*
+       * Say what is wanted there, not just that something is. "That section did
+       * not get enough usable data" is true of both cases and actionable in
+       * neither — an operator sent back to a bearing needs to know whether they
+       * are being asked to sweep it again or to look further up it, because
+       * those are different movements.
+       */
+      const column = g.holdingColumn && g.targetBand > 0
+        ? `That column still needs the view above the skyline — level ${g.targetBand + 1} of ${g.targetBands}. Turn back onto the target and follow it up.`
+        : 'That section did not get enough usable data. Sweep back onto the target and cover it again.';
       return say('fix', `Target is ${away.toFixed(0)}° ${g.offsetDeg > 0 ? 'right' : 'left'}`,
-        `That section did not get enough usable data. Sweep back onto the target and cover it again. ${pct}% of the horizon done.`,
+        `${column} ${pct}% of the horizon done.`,
         arrow, g.summary.fraction);
     }
     if (away > 12) {
