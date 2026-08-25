@@ -85,10 +85,29 @@ export const COLUMN_TUNING = {
    *  band along instead. */
   centreTolerance: 0.75,
 
-  /** Degrees of bearing the dot advances when a column is complete. Matches the
-   *  horizontal sweep's own step so the two agree about what "a bit further
-   *  round" means. */
-  columnStepDeg: 9,
+  /**
+   * How far sideways the dot steps when a column is finished, as a FRACTION OF
+   * THE HORIZONTAL FIELD OF VIEW.
+   *
+   * It was a flat 9 degrees, which is a number that only makes sense on one
+   * lens. The operator uses both a phone and an iPad and the phone's field is
+   * narrower, so the same 9 degrees is a much larger share of the phone's
+   * picture — the dot appears to jump further across the screen for the same
+   * instruction, and the columns it walks are spaced too far apart relative to
+   * what each frame can see. Their words: "how much the serpentine shift is
+   * should be proportional to the device".
+   *
+   * 0.20 of the field reproduces the old 9 degrees at the 45-degree lens these
+   * captures were tuned on, so nothing about the tuning changes on that device;
+   * it simply follows the glass now. It also stays comfortably inside the
+   * horizontal keyframe spacing, so stepping to the next column never opens a
+   * gap the sweep has to come back for.
+   */
+  columnStepFraction: 0.20,
+
+  /** Absolute floor, so a very narrow lens cannot reduce the step to a crawl
+   *  and make the serpentine take hundreds of columns to get round. */
+  minColumnStepDeg: 5,
 
   /** Bearing tolerance for crediting a column. A frame taken half a step off
    *  the column centre still fills that column's band. */
@@ -128,6 +147,7 @@ export class ColumnPlan {
     this.tuning = { ...COLUMN_TUNING, ...tuning };
     this.binCount = Math.max(8, Math.round(binCount));
     this.binSizeDeg = 360 / this.binCount;
+    this.hfovDeg = 45;
     this.setFieldOfView(vfovDeg);
     this.reset();
   }
@@ -168,6 +188,26 @@ export class ColumnPlan {
       }
       this.generation++;
     }
+  }
+
+  /**
+   * Degrees of bearing between columns, from the lens actually in use.
+   *
+   * The horizontal field is not stored on the plan — the plan owns the vertical
+   * half — so the caller hands it in, and it falls back to the value the old
+   * flat 9 degrees implied so a caller that has not been taught to pass it
+   * behaves exactly as before.
+   */
+  columnStepDeg(hfovDeg = this.hfovDeg) {
+    const fov = Number(hfovDeg);
+    if (!Number.isFinite(fov) || fov <= 0) return 9;
+    return Math.max(this.tuning.minColumnStepDeg, fov * this.tuning.columnStepFraction);
+  }
+
+  /** Told the horizontal field so the sideways step can follow the glass. */
+  setHorizontalFieldOfView(hfovDeg) {
+    const fov = Number(hfovDeg);
+    if (Number.isFinite(fov) && fov > 1) this.hfovDeg = fov;
   }
 
   /** The tilt ceiling, set from whatever the guidance is actually willing to
@@ -383,7 +423,7 @@ export class ColumnPlan {
     //    the one place the direction changes, and it is called once, by the
     //    owner of the decision, when a column actually completes.
     //    `direction` is -1 for the counter-clockwise sweep the app asks for.
-    const step = Math.max(1, Math.round(this.tuning.columnStepDeg / this.binSizeDeg));
+    const step = Math.max(1, Math.round(this.columnStepDeg() / this.binSizeDeg));
     for (let k = 1; k <= this.binCount; k++) {
       const i = (here + direction * step * k + this.binCount * 2) % this.binCount;
       if (!needsWork(i)) continue;

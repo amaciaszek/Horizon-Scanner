@@ -691,6 +691,10 @@ async function processFrame() {
       // band either. syncRequirements is cheap and picks up obstruction tops
       // the coverage map refined on this very frame.
       columns.setFieldOfView(camera.intrinsics().vfovDeg);
+      // The sideways step between columns follows the glass: a narrower phone
+      // lens steps less far than a wide iPad one, so the instruction is the
+      // same size on screen whichever device is in the operator's hands.
+      columns.setHorizontalFieldOfView(camera.hfovDeg);
       /*
        * ONE CEILING, HELD IN ONE PLACE.
        *
@@ -763,11 +767,67 @@ async function processFrame() {
     // deliberate measurement. The passive estimator runs on whatever the survey
     // happened to give it; the guided one ran on a scene chosen for the job and
     // measured the vertical against gravity, so it wins.
-    if (survey.focalPx && camera.focalSource !== 'self-calibrated'
-        && camera.focalSource !== 'measured' && camera.focalSource !== 'manual') {
+    /*
+     * ADOPT A SELF-CALIBRATED FOCAL ONLY ONCE IT HAS CONVERGED.
+     *
+     * MEASURED, 2026-08-25 23:35, and this one number ruined a whole survey.
+     * `survey.focalPx` goes non-null at TWELVE samples, and this adopted it the
+     * instant it appeared and then never revised it — `focalSource` becomes
+     * 'self-calibrated', which the condition above excludes. So whatever the
+     * estimator happened to think after twelve frames was locked in for the
+     * session.
+     *
+     * On the same phone, on three consecutive runs, it locked in 427.6 px,
+     * 458.0 px and 335.3 px — 48.4°, 45.5° and 59.6° of horizontal field. The
+     * 59.6° run was a catastrophe and it is worth being precise about why,
+     * because none of it looks like a lens problem from the field:
+     *
+     *   - the keyframe step is a fraction of the field, so a 31% overstatement
+     *     spaced the photographs 31% too far apart: 88 frames where the same
+     *     walk had produced 152;
+     *   - `bandStepDeg` is 0.40 of the VERTICAL field, so the columns were
+     *     18.6° tall instead of 14.0° and only four bands were reachable;
+     *   - and fatally, the stitcher's guided matching predicts where a feature
+     *     should appear in the next frame FROM THESE INTRINSICS, then searches
+     *     112 px around that prediction. A 31% scale error puts the prediction
+     *     outside the search window, so matching collapsed: 89 verified pairs
+     *     and 14,968 matches, against 1,489 pairs and 120,816 the run before.
+     *     Thirteen of 88 frames could be placed. The panorama was mostly black.
+     *
+     * `focalStats().converged` already exists, already means the right thing —
+     * 25 samples with an inter-quartile spread under 8% — and already carries a
+     * comment explaining that sample count alone proves nothing. It simply was
+     * never consulted. A wrong focal is worse than no focal, because the 45°
+     * default is at least stable and honest about being a guess.
+     */
+    /*
+     * ...AND LET A CONVERGED ESTIMATE REPLACE AN EARLIER SELF-CALIBRATED ONE.
+     *
+     * The old condition excluded `self-calibrated`, so the first value adopted
+     * was the last value ever used. Combined with adopting at twelve samples
+     * that meant the earliest, noisiest guess won permanently. A deliberate
+     * measurement ('measured') or the operator's own figure ('manual') still
+     * outrank this and are never overwritten — they were made on a scene chosen
+     * for the job, and this runs on whatever the survey happened to give it.
+     */
+    const focal = survey.focalStats();
+    /*
+     * Only the app's own guesses may be revised. An allow-list, not a deny-list:
+     * the deny-list version excluded 'measured' and 'manual' and therefore
+     * silently overwrote the FOV SLIDER, whose source string is
+     * `sensor 43.0° × 1.000 crop`. Telling an operator to set the lens by hand
+     * and then throwing their figure away on the next converged sample would be
+     * worse than not offering the control.
+     */
+    const mayRevise = camera.focalSource === 'default'
+      || camera.focalSource === 'self-calibrated';
+    if (survey.focalPx && focal.converged && mayRevise
+        && Math.abs(survey.focalPx * (WORK_W / LUMA_W) - camera.focalPx) > camera.focalPx * 0.02) {
       const workFocal = survey.focalPx * (WORK_W / LUMA_W);
       if (camera.adoptFocal(workFocal)) {
-        log('info', `Focal length self-calibrated: ${workFocal.toFixed(1)} px at ${WORK_W} px wide, giving ${camera.hfovDeg.toFixed(1)}° horizontal FOV.`);
+        log('info', `Focal length self-calibrated: ${workFocal.toFixed(1)} px at ${WORK_W} px wide, `
+          + `giving ${camera.hfovDeg.toFixed(1)}° horizontal FOV `
+          + `(${focal.n} samples, spread ${focal.iqrPct.toFixed(1)}%).`);
         syncFovReadout();
       }
     }
@@ -1291,6 +1351,35 @@ function finishCalibration() {
    * walk. That is a setting the operator can change in ten seconds — but only
    * if somebody tells them, and only if somebody tells them now.
    */
+  /*
+   * SAY IT OUT LOUD IF THE LENS IS STILL A GUESS.
+   *
+   * MEASURED, 2026-08-25 23:35. The hardcoded default is 66°; this phone's real
+   * working-frame field is about 42°. Self-calibration did not converge until
+   * two and a half minutes after pass 1 began, so essentially the entire survey
+   * was captured at 66° — the keyframe spacing, the band heights and the
+   * intrinsics written into the archive were all derived from a number that was
+   * 50% too large. The stitcher's guided matching then predicted feature
+   * positions from those intrinsics and searched 112 px around the prediction,
+   * found almost nothing, and placed 13 of 88 frames. The panorama was mostly
+   * black, and nothing on screen had said a word about it.
+   *
+   * The operator can fix this in ten seconds from Advanced, and cannot fix it
+   * at all afterwards. So it is said before they walk, not after.
+   */
+  if (camera.focalSource !== 'measured' && camera.focalSource !== 'manual') {
+    const stats = survey.focalStats();
+    log('warn', `The lens has not been measured — this survey will start on `
+      + `${camera.hfovDeg.toFixed(0)}° horizontal, which is a guess`
+      + `${stats.converged ? '' : ' that self-calibration has not yet refined'}. `
+      + 'If that figure is wrong, the photograph spacing, the column heights and '
+      + 'the feature search inside the stitcher are all wrong with it, and the '
+      + 'panorama can come out mostly black. Set it from Advanced now if you know '
+      + 'it — for this phone the solver has measured about 42 degrees.',
+      { hfovDeg: camera.hfovDeg, source: camera.focalSource,
+        focalSamples: stats.n, focalSpreadPct: stats.iqrPct, converged: stats.converged });
+  }
+
   captureStartedAt = performance.now();
   const plan = estimateSurvey({
     rates: surveyRates,

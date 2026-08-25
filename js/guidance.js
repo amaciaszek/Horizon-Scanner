@@ -59,9 +59,18 @@ export const GUIDANCE_TUNING = {
    *  hungry, the dot holds position rather than creeping away from them. */
   holdRadiusDeg: 10,
 
-  /** Fastest the dot may travel across the horizon. Slow enough to follow with
-   *  the eye, fast enough not to feel stuck when a target legitimately moves. */
-  maxSlewDegPerSec: 90,
+  /**
+   * Fastest the dot may travel across the horizon.
+   *
+   * Lowered from 90 on 2026-08-25: "the dot is sometimes hard to keep up with".
+   * 90°/s is faster than anyone turns deliberately, so when the target moved a
+   * long way the dot arrived before the operator had finished registering that
+   * it had left. 45°/s is still quicker than a comfortable sweep — the ramps in
+   * `js/coverage.js` call 25°/s comfortable and stop crediting at 70 — so the
+   * dot continues to lead rather than trail, while staying something a person
+   * can follow with their body instead of chase.
+   */
+  maxSlewDegPerSec: 45,
 
   /** Exponential smoothing constant, in seconds, applied after the slew limit. */
   smoothingSec: 0.22,
