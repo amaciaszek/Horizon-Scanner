@@ -124,6 +124,29 @@ export const GUIDANCE_TUNING = {
    *  frame a roofline is worse than one that arrives a moment late. */
   elevationSmoothingSec: 0.35,
 
+  /**
+   * Fastest the dot may travel vertically, in degrees per second.
+   *
+   * MEASURED, 2026-08-25 22:23. The horizontal target has had a slew limit
+   * since the beginning, for the stated reason that a dot which teleports looks
+   * random. The vertical target had exponential smoothing and nothing else, so
+   * a change of desired height moved it 60% of the way in a single update. When
+   * the ask jumped a full column — 55.9° to 0° — the dot crossed most of the
+   * screen in about a third of a second, and the operator's verdict was that it
+   * "was moving just a bit erratically, going from the top to the bottom
+   * instantly".
+   *
+   * The cause of those jumps is fixed in `ColumnPlan.gapBand`, which no longer
+   * asks for the far end of a column. This is the belt to that braces: whatever
+   * the maps decide, the dot is a thing a person is watching and following with
+   * their hands, and it must always look like it travelled there.
+   *
+   * 30°/s crosses one band (about 14°) in half a second — unmistakably moving,
+   * comfortably followable, and slower than the tilt rate of an operator who is
+   * paying attention, so the dot leads rather than races.
+   */
+  maxElevationSlewDegPerSec: 30,
+
   /** A stretch of swept-but-uncovered ground has to be at least this wide
    *  before the dot will turn the operator around for it. Every sweep leaves a
    *  thin under-exposed sliver at the trailing edge of wherever it began, and
@@ -190,6 +213,9 @@ export class ScanGuidance {
      *  needs. Reported so the interface can say "3 of 5" rather than nothing. */
     this.targetBand = -1;
     this.targetBands = 0;
+    /** The band currently being asked for, held until it fills so the ask does
+     *  not flip back and forth as the camera drifts over a band boundary. */
+    this._askBand = -1;
     this.liftRemainingDeg = 0;
     this.dropRemainingDeg = 0;
     /** One elevation band, set by the caller from the working frame's vertical
@@ -464,6 +490,17 @@ export class ScanGuidance {
           this.heldColumn = plan.indexOf(next.bearingDeg);
           this._heldFilled = plan.bandsFilled(this.heldColumn);
           this._heldForSec = 0;
+          /*
+           * Which way to travel this column, decided from where the camera is
+           * rather than from a flag that has to be flipped correctly at every
+           * hand-off. That flag spent the whole 2026-08-25 22:23 survey stuck
+           * on `true`, so every new column asked for its bottom band from
+           * whatever height the operator was already at — the top-to-bottom
+           * lurch they reported. Arriving at the top of one column, the next
+           * band worth filling is at the top of the next one along.
+           */
+          plan.ascending = plan.directionFrom(this.heldColumn, elevationDeg);
+          this._askBand = -1;
         }
       }
     }
@@ -606,14 +643,34 @@ export class ScanGuidance {
     this.targetBands = 0;
 
     if (this.holdingColumn && plan) {
-      const band = plan.gapBand(this.heldColumn);
       this.targetBands = plan.bandsRequired[this.heldColumn];
+      /*
+       * STICK TO THE BAND UNTIL IT IS FILLED.
+       *
+       * The band is chosen from where the camera is, which is exactly what
+       * stops the dot lurching — and, left alone, would make it twitch instead.
+       * The camera drifts across a band boundary, the nearest unfilled band
+       * changes, and the ask flips back and forth over a boundary the operator
+       * cannot see. So once a band is asked for it stays asked for until it
+       * fills, the column is dropped, or it stops being one of the bands this
+       * column still needs.
+       */
+      let band = this._askBand;
+      const stale = band < 0
+        || band >= this.targetBands
+        || plan.bandFilled(this.heldColumn, band);
+      if (stale) {
+        band = plan.gapBand(this.heldColumn, { fromElevationDeg: elevationDeg });
+        this._askBand = band;
+      }
       if (band >= 0) {
         this.targetBand = band;
         aim = plan.elevationOf(band);
         aimSource = 'band';
         columnTopDeg = plan.elevationOf(Math.max(0, this.targetBands - 1));
       }
+    } else {
+      this._askBand = -1;
     }
 
     /*
@@ -660,12 +717,23 @@ export class ScanGuidance {
     const wantsLift = desiredElevation - elevationDeg > t.tiltDeadbandDeg;
     const wantsDrop = !wantsLift && elevationDeg - desiredElevation > t.tiltDeadbandDeg;
 
+    /*
+     * Slew limit, then smoothing — the same order the horizontal target has
+     * used since the beginning, and for the same reason. Smoothing alone moves
+     * the dot 60% of the way to a new target in one update; against a large
+     * change that is a jump with soft edges, not a journey. The limit makes the
+     * dot travel at a speed a person can follow with their hands, and the
+     * smoothing then takes the corners off.
+     */
     if (this.elevationDeg === null) {
       this.elevationDeg = desiredElevation;
     } else {
+      const delta = desiredElevation - this.elevationDeg;
+      const maxStep = t.maxElevationSlewDegPerSec * dtSec;
+      const limited = clamp(delta, -maxStep, maxStep);
       const alpha = t.elevationSmoothingSec > 0
         ? 1 - Math.exp(-dtSec / t.elevationSmoothingSec) : 1;
-      this.elevationDeg += (desiredElevation - this.elevationDeg) * alpha;
+      this.elevationDeg += limited * alpha;
     }
     this.aimElevationDeg = aim;
     this.aimSource = aimSource;

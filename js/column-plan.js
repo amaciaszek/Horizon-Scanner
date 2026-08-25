@@ -314,6 +314,15 @@ export class ColumnPlan {
       && this.frames[c] >= this.tuning.minBandFrames;
   }
 
+  /** Has this one band at this bearing been filled? Public because the
+   *  guidance needs it to know whether the band it is currently asking for is
+   *  still wanted, and reaching into `_bandFilled` from another module to ask
+   *  that was the wrong kind of shortcut. */
+  bandFilled(index, band) {
+    if (!(band >= 0) || band >= this.bandCount) return false;
+    return this._bandFilled(index, band);
+  }
+
   /** Is every band this bearing needs filled? */
   columnComplete(index) {
     const need = this.bandsRequired[index];
@@ -361,8 +370,11 @@ export class ColumnPlan {
     const needsWork = typeof wanted === 'function'
       ? wanted : i => !this.columnComplete(i);
 
-    // 1. Finish this column.
-    if (needsWork(here)) return this._target(here, this.gapBand(here), 'fill-column');
+    // 1. Finish this column, from the end the camera is already at.
+    if (needsWork(here)) {
+      return this._target(here, this.gapBand(here, { fromElevationDeg: elevationDeg }),
+        'fill-column');
+    }
 
     // 2. This column is done, so step sideways. The serpentine reversal is NOT
     //    applied here: this function is called on every frame to ask where the
@@ -375,15 +387,103 @@ export class ColumnPlan {
     for (let k = 1; k <= this.binCount; k++) {
       const i = (here + direction * step * k + this.binCount * 2) % this.binCount;
       if (!needsWork(i)) continue;
-      return this._target(i, this.gapBand(i), k === 1 ? 'next-column' : 'skip-to-work');
+      // The next column is entered at the height the camera is already holding,
+      // which is what makes the step sideways a step and not a plunge.
+      return this._target(i, this.gapBand(i, { fromElevationDeg: elevationDeg }),
+        k === 1 ? 'next-column' : 'skip-to-work');
     }
     return { complete: true, bearingDeg: null, elevationDeg: null, band: -1, action: 'complete' };
   }
 
-  /** Which band this bearing should be asked for next, in the sense the
-   *  serpentine is currently travelling. -1 when the column is finished. */
-  gapBand(index) {
-    return this.ascending ? this.lowestGap(index) : this.highestGap(index);
+  /**
+   * Which band this bearing should be asked for next.
+   *
+   * MEASURED, 2026-08-25 22:23. This used to be `ascending ? lowestGap :
+   * highestGap` — the far end of the column, chosen by a flag, with no regard
+   * for where the camera actually was. The recorded trail of that capture shows
+   * what that does to a person:
+   *
+   *     t=67.8  camera at 53.4°, ask jumps 55.9° -> 0.0°
+   *     t=71.4  camera at  3.3°, ask jumps  0.0° -> 41.9°
+   *     t=78.8  camera at 58.9°, ask jumps 59.5° -> 0.0°
+   *
+   * Eighteen jumps of more than 20°, several of the full 59.5° height of the
+   * column, and the operator dutifully followed every one of them. That is the
+   * "going from the top to the bottom instantly" they reported, and it is also
+   * why the capture path zig-zagged: the dot was throwing them at whichever end
+   * of the column they were not already at.
+   *
+   * The flag made it worse by never flipping. `ascending` was still `true` at
+   * the end of that survey — `advanceSerpentine()` only fires when a column
+   * completes AND its ring bin is covered, and most columns are released for
+   * other reasons — so EVERY new column asked for band 0 from whatever height
+   * the camera happened to be at.
+   *
+   * The rule now is continuity: the nearest unfilled band to where the camera
+   * already is, searched in the direction of travel first and the other way
+   * only if that direction is exhausted. A column is still finished before the
+   * dot moves sideways; it is simply finished from the end the operator is
+   * standing at. An instruction that can be obeyed with a small movement is the
+   * only kind that produces overlapping photographs.
+   */
+  gapBand(index, { fromElevationDeg = null, ascending = null } = {}) {
+    const up = ascending === null ? this.ascending : ascending;
+    if (!Number.isFinite(fromElevationDeg)) {
+      // No camera position offered — the old ends-of-the-column behaviour, kept
+      // so a caller that genuinely wants "the lowest gap" still gets it.
+      return up ? this.lowestGap(index) : this.highestGap(index);
+    }
+    const need = this.bandsRequired[index];
+    const raw = (fromElevationDeg - this.tuning.restElevationDeg) / this.bandStepDeg;
+    const here = clamp(Math.round(raw), 0, Math.max(0, need - 1));
+    const first = up ? 1 : -1;
+    /*
+     * The travel direction is exhausted before the sweep turns around, and only
+     * then does it look the other way, nearest first.
+     *
+     * The alternative — always the nearest gap in either direction — was tried
+     * and is worse in the way that matters. Entering a column low, with the
+     * bands just above already credited from the neighbouring column and only
+     * the bottom band open, "nearest" sends the operator DOWN one band, and the
+     * moment that band fills the only work left is at the top, so the dot
+     * reverses after less than a second. Down, then straight back up, is
+     * exactly the erratic feel this is meant to remove.
+     *
+     * Exhausting the direction gives one climb and one descent per column,
+     * which is the serpentine as designed: at most one reversal, at the end,
+     * where the operator can see why. The one-band clamp and the slew limit in
+     * `js/guidance.js` turn even a long turnaround into a steady travel of the
+     * dot rather than a jump.
+     *
+     * This ordering is only safe because the direction is now chosen from where
+     * the camera actually is (`directionFrom`) on entering a column. Under the
+     * old stuck flag it sent an operator at the top of a column to its bottom
+     * band, which is the 59.5° lurch the 2026-08-25 22:23 capture recorded.
+     */
+    for (let b = here; b >= 0 && b < need; b += first) {
+      if (!this._bandFilled(index, b)) return b;
+    }
+    for (let d = 1; d < need; d++) {
+      const b = here - d * first;
+      if (b >= 0 && b < need && !this._bandFilled(index, b)) return b;
+    }
+    return -1;
+  }
+
+  /**
+   * Which way the serpentine should travel, decided from where the camera is.
+   *
+   * Not a flag that has to be flipped correctly at every hand-off — that flag
+   * spent the whole 2026-08-25 22:23 survey stuck on `true`. Where the camera
+   * already sits is a fact, always available, and it gives the right answer for
+   * the right reason: arriving at the top of one column, the next band worth
+   * filling is at the top of the next column along, so come back down.
+   */
+  directionFrom(index, elevationDeg) {
+    const need = this.bandsRequired[index];
+    if (need <= 1) return this.ascending;
+    const middle = this.elevationOf((need - 1) / 2);
+    return !(Number.isFinite(elevationDeg) && elevationDeg > middle);
   }
 
   /** Turn the vertical sweep around. Called once, when a column completes, so

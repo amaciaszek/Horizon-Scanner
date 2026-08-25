@@ -13,16 +13,16 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.21.0';
+export const VERSION = '0.22.0';
 export const BUILD_DATE = '2026-08-25';
 
 /**
- * The dot leads again.
+ * The dot travels instead of teleporting.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'The guidance dot was a mirror of the phone, not an instruction: it sat on your own bearing at your own elevation and asked for nothing. It now names the exact band it wants filled and waits there while you go and get it. Columns no longer demand heights the app will never ask you to aim at. Frames are spent densely on unseen ground and sparsely on ground already done. And the survey says up front how long it will take, so you can stop the screen dimming first.';
+  'The dot led, but it lurched: it asked for the far end of each column, so from the top of the house it sent you straight to the horizon and back, eighteen times in one survey. It now asks for the nearest height still needed, in the direction you are already travelling, and it is speed limited so it always looks like it travelled there. Photographs taken while the camera is swinging are refused on both axes now, not just on turning, and the app no longer photographs the ground.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {

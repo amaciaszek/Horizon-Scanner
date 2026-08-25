@@ -106,7 +106,7 @@ export function captureDemand({ coverage = null, plan = null, headingDeg = 0, el
     // A frame between bands is the connective tissue of a climb, so it is the
     // last thing that should be refused.
     if (band < 0) demand = 1;
-    else if (!plan._bandFilled(i, band)) demand = 1;
+    else if (!plan.bandFilled(i, band)) demand = 1;
     else if (!plan.columnComplete(i)) demand = Math.max(demand, 0.5);
   }
   return Math.min(1, Math.max(0, demand));
@@ -149,14 +149,57 @@ export function keyframeSpacingReached({
   return Math.hypot(across / stepAcross, down / stepDown) >= 1;
 }
 
-/** Instantaneous yaw-rate ceiling at the exposure, not a smoothed later rate. */
-export function maxKeyframeYawRate() {
-  return 35;
+/**
+ * Instantaneous angular-rate ceiling at the exposure, not a smoothed later rate.
+ *
+ * LOWERED FROM 35 AND MEASURED ON THE SPHERE, 2026-08-25 22:23.
+ *
+ * The gate tested yaw and nothing else, which left the entire vertical axis
+ * ungoverned — and this app's whole capture pattern is vertical. On that
+ * capture 28 of 152 photographs were taken while tilting faster than 15°/s with
+ * the yaw rate under 15, so every one of them sailed through a gate that
+ * believed the camera was barely moving. The fastest was a combined 135°/s.
+ *
+ * It shows in the tracker. Median `visualQuality` was 0.437 for frames taken
+ * under 8°/s and 0.240 for frames over 15°/s — a well-tracked frame scores
+ * about 0.25 on this scene, so the fast ones are landing at the floor. Motion
+ * blur is the one defect no amount of solving repairs: a smeared photograph has
+ * fewer and worse SIFT features, its pairs are the ones `prune_outliers`
+ * deletes, and the frames around it lose the neighbours that would have placed
+ * them. Against a close, highly detailed subject like the house, that is
+ * exactly where the ghosting appears.
+ *
+ * 30°/s combined would have refused 8 of those 152 frames — 5%, and the
+ * spacing gate immediately asks for a replacement as soon as the operator
+ * slows, so the cost is a fraction of a second and the benefit is that no
+ * smeared photograph enters the graph at all.
+ */
+export function maxKeyframeRate() {
+  return 30;
 }
 
-export function keyframeMotionAccepted(yawRateDegPerSec, options) {
-  return Number.isFinite(yawRateDegPerSec)
-    && Math.abs(yawRateDegPerSec) <= maxKeyframeYawRate(options);
+/** Kept for callers and tests that still speak of yaw. Same number: the ceiling
+ *  is on total angular rate now, and yaw is one component of it. */
+export function maxKeyframeYawRate() {
+  return maxKeyframeRate();
+}
+
+/**
+ * Was the camera still enough at the exposure?
+ *
+ * Both axes, combined on the sphere. Bearing is NOT scaled by the cosine of
+ * elevation here, unlike the spacing test: this is about how far the image
+ * smeared across the sensor during the exposure, and a degree of yaw smears the
+ * picture by a degree whatever the camera is pointed at.
+ */
+export function keyframeMotionAccepted(yawRateDegPerSec, options = {}) {
+  const yaw = Number(yawRateDegPerSec);
+  if (!Number.isFinite(yaw)) return false;
+  // A caller that has not been taught to measure tilt yet is not penalised for
+  // it — but it is also not credited with a stillness it never observed.
+  const tilt = Number(options?.tiltRateDegPerSec);
+  const combined = Number.isFinite(tilt) ? Math.hypot(yaw, tilt) : Math.abs(yaw);
+  return combined <= maxKeyframeRate(options);
 }
 
 /**

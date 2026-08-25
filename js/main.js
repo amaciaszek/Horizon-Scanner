@@ -851,8 +851,50 @@ function maybeKeyframe({ seg, pose, capturedFrame, t }) {
   const instantRate = Number.isFinite(pose.gyro.yawRateDegPerSec)
     ? Math.abs(pose.gyro.yawRateDegPerSec)
     : Math.abs(pose.gyro.rotationRateDegPerSec);
-  if (!keyframeMotionAccepted(instantRate, { mode: director.mode.id })) {
-    recordCaptureDecision('motion-too-fast', { pose, t, exposure, detail: { instantRate } });
+  /*
+   * Both axes. The gate tested yaw alone, and this app's capture pattern is
+   * vertical: on the 2026-08-25 22:23 capture 28 of 152 photographs were taken
+   * while tilting faster than 15°/s with the yaw rate under 15, so every one
+   * passed a gate that believed the camera was barely moving. Median
+   * `visualQuality` was 0.240 for those against 0.437 for frames under 8°/s.
+   * Motion blur is the one defect the solver cannot repair.
+   */
+  const tiltRate = orientation.tiltRate;
+  if (!keyframeMotionAccepted(instantRate, {
+    mode: director.mode.id, tiltRateDegPerSec: tiltRate
+  })) {
+    recordCaptureDecision('motion-too-fast', {
+      pose, t, exposure, detail: { instantRate, tiltRate }
+    });
+    return;
+  }
+
+  /*
+   * A PHOTOGRAPH OF THE GROUND IS NOT A HORIZON SURVEY.
+   *
+   * The 2026-08-25 22:23 capture ended with seven frames between -74° and -78°
+   * elevation — the phone lowered while a pass-2 cleanup hold was still
+   * running, which accepts on stillness and bearing and never looked at where
+   * the camera was pointed. All seven were stranded by the solver, because
+   * nothing else in the survey is anywhere near them, and all seven produced an
+   * alarming "photographs are not connected" warning naming a bearing the
+   * operator was told to go and re-shoot. The instruction was to fix frames
+   * that should never have been taken.
+   *
+   * The floor is one whole frame below the HORIZON — not below this sector's
+   * required elevation. `restElevationAt` returns the lift target, which over
+   * a tall house is 40 to 60 degrees, and measuring the floor from that would
+   * have refused the entire lower half of every tall column: exactly the frames
+   * that connect the roof to the ground and the ones this app exists to take.
+   * The bottom band of every column sits at the horizon by construction, so the
+   * horizon is what the floor hangs from.
+   */
+  const floorDeg = -camera.intrinsics().vfovDeg;
+  if (pose.att.elevation < floorDeg) {
+    recordCaptureDecision('below-survey-band', {
+      pose, t, exposure,
+      detail: { elevationDeg: pose.att.elevation, floorDeg }
+    });
     return;
   }
 

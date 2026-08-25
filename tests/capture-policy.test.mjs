@@ -39,10 +39,29 @@ check('demand moves the step monotonically',
   && keyframeStepDeg(45.6, 0.5) < keyframeStepDeg(45.6, 0));
 check('very narrow lenses retain a safe minimum spacing', keyframeStepDeg(10) === 3);
 check('handheld rate ceiling admits a deliberate 25 deg/s sweep',
-  maxKeyframeYawRate({ mode: 'handheld' }) === 35
+  maxKeyframeYawRate({ mode: 'handheld' }) === 30
   && keyframeMotionAccepted(-25, { mode: 'handheld' }));
 check('fast handheld frames are rejected using instantaneous rate',
-  !keyframeMotionAccepted(35.01, { mode: 'handheld' }));
+  !keyframeMotionAccepted(30.01, { mode: 'handheld' }));
+
+/*
+ * BOTH AXES. The gate tested yaw alone, and this app's capture pattern is
+ * vertical: on the 2026-08-25 22:23 capture, 28 of 152 photographs were taken
+ * while tilting faster than 15°/s with the yaw rate under 15, so every one
+ * passed a gate that believed the camera was barely moving. The fastest was a
+ * combined 135°/s. Median visualQuality was 0.240 for frames over 15°/s
+ * against 0.437 under 8°/s — motion blur, which no amount of solving repairs.
+ */
+check('a fast tilt is refused even when the yaw rate is nearly zero',
+  !keyframeMotionAccepted(1, { tiltRateDegPerSec: 40 }));
+check('and a diagonal fling is refused on the combination, not on either axis',
+  keyframeMotionAccepted(22, {}) && keyframeMotionAccepted(1, { tiltRateDegPerSec: 22 })
+  && !keyframeMotionAccepted(22, { tiltRateDegPerSec: 22 }),
+  '22°/s in each axis is 31°/s on the sphere');
+check('an ordinary paced sweep-and-climb still passes',
+  keyframeMotionAccepted(12, { tiltRateDegPerSec: 12 }));
+check('a caller that cannot measure tilt is judged on yaw alone, as before',
+  keyframeMotionAccepted(29, {}) && !keyframeMotionAccepted(31, {}));
 // The per-mode rate ceilings (tripod 20, probe 3) were removed; the function
 // now ignores its argument and returns one number. Asserting the old contract
 // left this suite red, which is how the genuine failures beside it went unread.
@@ -53,9 +72,9 @@ check('fast handheld frames are rejected using instantaneous rate',
 // fast frames, so a hurried probe earns little — but the hard gate no longer
 // distinguishes them.
 check('the rate ceiling is now one number for every mode',
-  maxKeyframeYawRate() === 35
-  && maxKeyframeYawRate({ mode: 'tripod' }) === 35
-  && maxKeyframeYawRate({ probe: true }) === 35);
+  maxKeyframeYawRate() === 30
+  && maxKeyframeYawRate({ mode: 'tripod' }) === 30
+  && maxKeyframeYawRate({ probe: true }) === 30);
 check('verification sweep accepts dense angular steps without a target hold',
   pass2CaptureAccepted({ verificationSweep: true, angularTravelDeg: -9.2, stepDeg: 9.12 }));
 check('verification sweep still rejects insufficient overlap steps',

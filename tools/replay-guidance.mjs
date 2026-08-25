@@ -88,6 +88,14 @@ for (const x of trail) {
     // it did record, so old captures can still be compared against new code.
     sourceWas: x.aimSource || (x.wantsLift ? 'lift' : x.wantsDrop ? 'rest' : 'camera'),
     sourceNow: g.aimSource,
+    // The vertical target, before and after. This is the number the operator
+    // feels: an asked-for height that moves half a column between two samples
+    // is the "top to the bottom instantly" complaint, whatever the smoothing
+    // downstream does to soften its edges.
+    aimWasDeg: Number.isFinite(x.aimElevationDeg) ? x.aimElevationDeg : null,
+    aimNowDeg: Number.isFinite(g.aimElevationDeg) ? g.aimElevationDeg : null,
+    dotWasDeg: Number.isFinite(x.dotElevationDeg) ? x.dotElevationDeg : null,
+    dotNowDeg: Number.isFinite(g.elevationDeg) ? g.elevationDeg : null,
     band: g.targetBand, state: g.state
   });
 }
@@ -109,6 +117,38 @@ console.log(`  field: mirrored the camera  ${pct(r => r.sourceWas === 'camera')}
 console.log(`  now:   mirrored the camera  ${pct(r => r.sourceNow === 'camera')}`);
 console.log(`  now:   named a plan band    ${pct(r => r.sourceNow === 'band')}`);
 console.log(`  now:   ring lift or descent ${pct(r => r.sourceNow === 'lift' || r.sourceNow === 'rest')}`);
+
+/*
+ * VERTICAL CONTINUITY.
+ *
+ * The dot is followed with someone's hands. An asked-for height that moves half
+ * a column between two samples cannot be followed, and an operator who tries
+ * sweeps the camera through a huge arc photographing nothing on the way. On the
+ * 2026-08-25 22:23 capture the ask jumped more than 20 degrees eighteen times,
+ * several of them the full 59.5 degree height of the column.
+ */
+function jumps(key) {
+  const out = [];
+  let previous = null;
+  for (const r of rows) {
+    const v = r[key];
+    if (v === null || v === undefined) continue;
+    if (previous !== null) out.push(Math.abs(v - previous));
+    previous = v;
+  }
+  return out.sort((a, b) => a - b);
+}
+const quote = (label, list) => {
+  if (!list.length) { console.log(`  ${label} no samples`); return; }
+  const at = f => list[Math.min(list.length - 1, Math.floor(list.length * f))];
+  console.log(`  ${label} median ${at(0.5).toFixed(1)}°  p99 ${at(0.99).toFixed(1)}°  `
+    + `max ${list[list.length - 1].toFixed(1)}°  over 20°: ${list.filter(v => v > 20).length}`);
+};
+console.log('\nVERTICAL CONTINUITY  (change in asked-for height between samples)');
+quote('field ask ', jumps('aimWasDeg'));
+quote('now   ask ', jumps('aimNowDeg'));
+quote('field dot ', jumps('dotWasDeg'));
+quote('now   dot ', jumps('dotNowDeg'));
 
 console.log('\nCOLUMN PLAN OVER THE SAME POSES');
 console.log(`  cells filled  ${done.have} / ${done.need}  (${(done.fraction * 100).toFixed(1)}%)`);
