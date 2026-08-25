@@ -249,7 +249,13 @@ const GLOBALS = new Set([
   'LinearAccelerationSensor', 'AbsoluteOrientationSensor', 'RelativeOrientationSensor', 'Magnetometer', 'self', 'globalThis', 'postMessage',
   'importScripts', 'require', 'super', 'this', 'if', 'for', 'while', 'switch', 'catch', 'return',
   'typeof', 'new', 'delete', 'void', 'in', 'of', 'do', 'else', 'try', 'finally', 'throw', 'await', 'async',
-  'yield', 'function', 'class', 'const', 'let', 'var', 'export', 'import', 'default', 'extends'
+  'yield', 'function', 'class', 'const', 'let', 'var', 'export', 'import', 'default', 'extends',
+  // `constructor(` is a class METHOD DEFINITION, not a call, and the scan below
+  // only excludes `.foo(`. This suite had been red on that single false
+  // positive since build-progress.js gained a class, and a permanently-red
+  // suite is a suite nobody reads — which is how four other genuine failures
+  // sat unnoticed beside it until 2026-08-21.
+  'constructor', 'get', 'set', 'static'
 ]);
 
 const files = sourceFiles();

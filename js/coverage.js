@@ -189,6 +189,12 @@ export const COVERAGE_TUNING = {
    *  centre would throw the horizon out of the bottom of the picture. */
   liftHeadroomFraction: 0.35,
 
+  /** Extra degrees added to the requested elevation beyond the bare minimum the
+   *  satisfaction test needs. Small, but it must not be zero: asking for exactly
+   *  the threshold means any rounding, any hand tremor, any half-degree of pose
+   *  noise leaves the sector unsatisfied and the dot parked on it. */
+  liftAimMarginDeg: 1.5,
+
   /**
    * The highest tilt this will ever ask for.
    *
@@ -372,7 +378,13 @@ export class CoverageMap {
       const from = Number(entry?.fromDeg ?? entry);
       const width = Number(entry?.widthDeg ?? this.binSizeDeg);
       if (!Number.isFinite(from)) continue;
-      const steps = Math.max(1, Math.ceil(width / this.binSizeDeg));
+      // Bounded by the ring itself. In practice `width` comes from weakSectors
+      // or the photo-gap report and is at most 360, but an unbounded loop over a
+      // caller-supplied number is a freeze waiting to happen: 1e9 degrees spins
+      // 500 million times and locks the interface for six seconds. You can never
+      // demote more bins than exist.
+      const steps = Math.max(1, Math.min(this.binCount,
+        Math.ceil((Number.isFinite(width) ? Math.abs(width) : this.binSizeDeg) / this.binSizeDeg)));
       for (let k = 0; k < steps; k++) {
         const index = this.indexOf(from + k * this.binSizeDeg);
         if (this.score[index] > to) {
@@ -384,6 +396,39 @@ export class CoverageMap {
     }
     if (touched) this.generation++;
     return touched;
+  }
+
+  /**
+   * Camera elevation at which a top of `topDeg` is framed with headroom.
+   *
+   * THE ASK AND THE TEST MUST COME FROM ONE PLACE. They did not, and the two
+   * disagreed by construction:
+   *
+   *   the ask   required = top - vfov * 0.35
+   *   the test  satisfied when top <= elevation + vfov/2 - (vfov * 0.35)/2
+   *             i.e. elevation >= top - vfov * 0.325
+   *
+   * 0.35 is larger than 0.325, so the elevation the guidance asked for was
+   * ALWAYS about a degree lower than the elevation its own satisfaction rule
+   * demanded. An operator who obeyed the dot exactly, and who had the top of the
+   * obstruction plainly inside the frame, could never satisfy the sector.
+   * `isComplete` is `isCovered && !needsLift`, so that bearing never completed,
+   * the frontier never advanced past it, and the dot sat there indefinitely —
+   * which is the "white dot got very stuck places" reported from the field on
+   * 2026-08-21 and, in part, on every capture before it.
+   *
+   * The margin is added on top so a frame that lands exactly on the boundary is
+   * not left a hundredth of a degree short by rounding or by a hand that moved.
+   */
+  aimForTop(topDeg, vfovDeg) {
+    const headroom = vfovDeg * this.tuning.liftHeadroomFraction;
+    return topDeg - (vfovDeg / 2 - headroom / 2) + this.tuning.liftAimMarginDeg;
+  }
+
+  /** Is a top at `topDeg` framed with headroom from this camera elevation? */
+  topIsFramed(topDeg, elevationDeg, vfovDeg) {
+    const headroom = vfovDeg * this.tuning.liftHeadroomFraction;
+    return topDeg <= elevationDeg + vfovDeg / 2 - headroom * 0.5;
   }
 
   /** Bin index containing a bearing. */
@@ -454,6 +499,56 @@ export class CoverageMap {
   }
 
   /**
+   * How good was this instant AS A PHOTOGRAPH, ignoring whether it saw a skyline?
+   *
+   * `observationQuality` answers a different question — was the HORIZON
+   * observed — and it is right to return zero for a frame full of sky, because
+   * a frame full of sky measures no horizon.
+   *
+   * The column plan needs the other question. Its job is to guarantee that
+   * consecutive photographs overlap so the stitcher can chain them together,
+   * and for that purpose a frame of empty sky is worth exactly as much as any
+   * other: it carries texture, it has a pose, it links the frame below it to
+   * the frame above.
+   *
+   * Feeding it `observationQuality` was a bug with a nasty shape. The top band
+   * of a tall column is BY CONSTRUCTION aimed over the obstruction, so it
+   * reports `allSky` or `clippedTop` and scored zero — the band could never
+   * fill, so the column could never complete, so the serpentine hold would pin
+   * the dot for its whole patience window and then abandon every tall column in
+   * the survey. The photograph was being taken and stored, and the plan was
+   * being told it did not exist.
+   *
+   * The motion gates stay, because a smeared or wildly rolled frame is bad for
+   * stitching too, and so does tracking loss, because a frame whose pose is
+   * unknown cannot be placed at all.
+   */
+  structuralQuality(sample) {
+    const t = this.tuning;
+    if (sample.trackingLost) return 0;
+    if (sample.frameStatus === 'tooHigh' || sample.frameStatus === 'tooDark'
+      || sample.frameStatus === 'parallax') return 0;
+    if (Number.isFinite(sample.glareFraction)
+      && sample.glareFraction > t.maxGlareFraction) return 0;
+
+    let jerk = null;
+    if (Number.isFinite(sample.yawRateDegPerSec) && Number.isFinite(this.lastYawRate)
+      && Number.isFinite(sample.dtSec) && sample.dtSec > 1e-3) {
+      jerk = Math.abs(sample.yawRateDegPerSec - this.lastYawRate) / sample.dtSec;
+    }
+    const factors = [
+      fallingRamp(sample.yawRateDegPerSec, t.comfortableRateDegPerSec, t.maxRateDegPerSec),
+      fallingRamp(sample.rollDeg, t.comfortableRollDeg, t.maxRollDeg),
+      fallingRamp(jerk, t.comfortableJerkDegPerSec2, t.maxJerkDegPerSec2),
+      fallingRamp(sample.jitterDeg, t.comfortableJitterDeg, t.maxJitterDeg),
+      risingRamp(sample.visualQuality, t.minVisualQuality, t.goodVisualQuality)
+    ];
+    let quality = 1;
+    for (const f of factors) quality *= f;
+    return clamp(quality, 0, 1);
+  }
+
+  /**
    * Credit one processed frame to every bin it could see.
    *
    * Crediting only the bin under the optical axis would be wrong twice over: it
@@ -469,8 +564,19 @@ export class CoverageMap {
    */
   observe(sample = {}) {
     const t = this.tuning;
-    const heading = Number(sample.headingDeg);
-    if (!Number.isFinite(heading)) return { credited: false, reason: 'no-heading', quality: 0 };
+    /*
+     * Wrapped before anything is derived from it.
+     *
+     * The bin bounds below are computed from `heading` and then walked with
+     * `raw++`. At a large enough magnitude that increment does nothing at all —
+     * 1 is below the ULP of 5e299 — so `raw <= last` stays true forever and the
+     * per-frame path hangs the device with no error. Wrapping first keeps every
+     * derived index a small integer, which is what the loop assumes, and it is
+     * what `indexOf` was already doing to the same number a line later.
+     */
+    const raw = Number(sample.headingDeg);
+    if (!Number.isFinite(raw)) return { credited: false, reason: 'no-heading', quality: 0 };
+    const heading = wrap360(raw);
     const elevationDeg = Number(sample.elevationDeg);
     const vfovDeg = Number(sample.vfovDeg);
     const clippedFraction = Number(sample.clippedFraction) || 0;
@@ -485,17 +591,34 @@ export class CoverageMap {
     const quality = this.observationQuality({ ...sample, dtSec, requiredElevationDeg });
     if (Number.isFinite(sample.yawRateDegPerSec)) this.lastYawRate = sample.yawRateDegPerSec;
 
-    const hfov = Number.isFinite(sample.hfovDeg) && sample.hfovDeg > 1 ? sample.hfovDeg : 45;
-    const halfSpan = hfov * t.usableFovFraction / 2;
+    /*
+     * The span is clamped to the ring, and that is not paranoia.
+     *
+     * This loop runs once per bin the frame can see, and its bounds came
+     * straight from `hfovDeg` — a value that is computed, not declared. Self
+     * calibration divides pixel shift by measured rotation, so a lap that
+     * logged almost no rotation can hand back an enormous field of view, and
+     * this is the per-frame path: the loop would run for hfov/binSize
+     * iterations and freeze the app in the middle of a survey with no error and
+     * no way back. Measured here: hfovDeg of 1e12 spins 4x10^11 times.
+     *
+     * No frame can see more than the whole circle, so nothing is lost by
+     * saying so, and a wild intrinsic degrades to "credits everything" instead
+     * of "hangs the device in a field".
+     */
+    const hfov = Number.isFinite(sample.hfovDeg) && sample.hfovDeg > 1
+      ? Math.min(sample.hfovDeg, 360) : 45;
+    const halfSpan = Math.min(hfov * t.usableFovFraction / 2, 180);
     const first = Math.floor((heading - halfSpan) / this.binSizeDeg);
-    const last = Math.ceil((heading + halfSpan) / this.binSizeDeg);
+    const last = Math.min(first + this.binCount,
+      Math.ceil((heading + halfSpan) / this.binSizeDeg));
 
     let touched = 0;
-    for (let raw = first; raw <= last; raw++) {
-      const centre = (raw + 0.5) * this.binSizeDeg;
+    for (let slot = first; slot <= last; slot++) {
+      const centre = (slot + 0.5) * this.binSizeDeg;
       const offset = Math.abs(angDiff(centre, heading));
       if (offset > halfSpan) continue;
-      const index = ((raw % this.binCount) + this.binCount) % this.binCount;
+      const index = ((slot % this.binCount) + this.binCount) % this.binCount;
 
       // The camera pointed here. Recorded even for a worthless frame, because
       // "swept through and got nothing" is precisely the state the guidance dot
@@ -534,14 +657,38 @@ export class CoverageMap {
           if (measured > this.measuredTop[index]) this.measuredTop[index] = measured;
           // Framed with headroom, so a top sitting on the very edge does not
           // count. This is the test the old code should have been making.
-          const headroom = vfovDeg * t.liftHeadroomFraction;
-          if (measured <= frameTop - headroom * 0.5 && quality > 0) {
+          if (this.topIsFramed(measured, elevationDeg, vfovDeg) && quality > 0) {
             this.topSeen[index] = 1;
             // Kept as the camera elevation that achieved it, which is what the
             // archive wants to show and what a later lap can aim to repeat.
             if (elevationDeg > this.satisfiedElevation[index]) {
               this.satisfiedElevation[index] = elevationDeg;
             }
+          }
+        }
+
+        /*
+         * A MEASURED top revises the ask, not only a clipped one.
+         *
+         * The requirement used to be recomputed only inside the clipped branch
+         * below, so the moment a frame stopped clipping the ask froze at
+         * whatever the last LOWER BOUND had implied — and a lower bound taken
+         * from a frame that was still too low is, by definition, too low. On a
+         * 30° obstruction the ask settled at 15.3° while its own satisfaction
+         * rule needed 18.6°, so the operator was parked at a bearing that could
+         * never finish while looking straight at the thing that would finish it.
+         *
+         * A traced top is the better evidence of the two. When it implies a
+         * higher aim than the bound did, it must be allowed to say so.
+         */
+        if (Number.isFinite(measured) && measuredFraction >= t.minMeasuredFractionForTop
+            && measured > this.measuredTop[index] - 1e-9 && !this.topSeen[index]) {
+          const wantedFromMeasured = this.aimForTop(
+            Math.max(this.obstructionTop[index], this.measuredTop[index]), vfovDeg);
+          if (wantedFromMeasured > this.requiredElevation[index]) {
+            this.requiredElevation[index] = Math.min(
+              t.maxRequestedElevationDeg, Math.max(0, wantedFromMeasured));
+            if (wantedFromMeasured > t.maxRequestedElevationDeg) this.beyondTilt[index] = 1;
           }
         }
 
@@ -565,7 +712,8 @@ export class CoverageMap {
           if (topEdge > this.obstructionTop[index]) this.obstructionTop[index] = topEdge;
           // Prefer the measured top where one exists; fall back to the bound.
           const best = Math.max(this.obstructionTop[index], this.measuredTop[index]);
-          const wanted = best - vfovDeg * t.liftHeadroomFraction;
+          // Derived from the satisfaction test, not guessed alongside it.
+          const wanted = this.aimForTop(best, vfovDeg);
           this.requiredElevation[index] = Math.min(t.maxRequestedElevationDeg, Math.max(0, wanted));
           if (wanted > t.maxRequestedElevationDeg) this.beyondTilt[index] = 1;
         }

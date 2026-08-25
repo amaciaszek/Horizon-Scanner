@@ -33,8 +33,27 @@ void main() {
   gl_Position = uProj * uView * vec4(aPos, 1.0);
 }`;
 
+/*
+ * highp, not mediump.
+ *
+ * Desktop GL quietly hands you highp whichever you ask for, so mediump looks
+ * fine on a laptop and is wrong on the devices this actually ships to. A
+ * mediump float carries about ten bits of mantissa — roughly 1e-3 relative — and
+ * vUV.x is sampled across a panorama 2880 pixels wide, so the texture lookup
+ * lands about three pixels away from where it should. The graticule is worse
+ * still: az reaches 360, so the same relative error is a third of a degree, and
+ * fract(az/10) turns that into visibly wobbling lines.
+ *
+ * The guard is required by the spec rather than optional: highp is not
+ * guaranteed present in a fragment shader on ES 2.0, and a shader that names it
+ * unconditionally fails to compile where it is missing rather than degrading.
+ */
 const FRAG = `
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
 precision mediump float;
+#endif
 varying vec2 vUV;
 uniform sampler2D uTex;
 uniform float uAltMin;
@@ -154,6 +173,8 @@ export class DomeView {
     this.ready = false;
     this._setup();
     this._bindPointer();
+    this._bindResize();
+    this._bindContextLoss();
   }
 
   _setup() {
@@ -189,6 +210,8 @@ export class DomeView {
   async setPanorama(blob, { altMinDeg = -20, altMaxDeg = 60 } = {}) {
     const gl = this.gl;
     const bitmap = await createImageBitmap(blob);
+    // Kept so a restored context can re-upload without the caller's help.
+    this._lastBlob = blob;
     this.altMin = altMinDeg; this.altMax = altMaxDeg;
 
     gl.bindTexture(gl.TEXTURE_2D, this.tex);
@@ -241,6 +264,60 @@ export class DomeView {
     }, { passive: false });
   }
 
+  /*
+   * Redraw when the canvas changes size.
+   *
+   * draw() resizes the backing store to match the CSS box, but it only runs on
+   * interaction — so rotating a tablet, or the browser chrome collapsing on
+   * scroll, left the sphere rendered at the old aspect ratio until the operator
+   * happened to drag it. On a phone that is most of the time.
+   */
+  /*
+   * Mobile drops WebGL contexts, and does it silently.
+   *
+   * Backgrounding the app, a second tab wanting memory, an OS decision — any of
+   * these take the context away, and every later gl call becomes a no-op. The
+   * canvas keeps showing whatever was last rendered, so the operator sees a
+   * frozen panorama that no longer responds to dragging and has no idea why.
+   * This is common enough on iOS that not handling it is a bug, not a nicety.
+   *
+   * The default action of the lost event must be prevented or the context can
+   * never be restored, and the GPU objects are all gone by then, so restoration
+   * has to rebuild the program and re-upload the texture from the blob we kept.
+   */
+  _bindContextLoss() {
+    this.canvas.addEventListener('webglcontextlost', e => {
+      e.preventDefault();
+      this.ready = false;
+      this.onContextLost?.();
+    });
+    this.canvas.addEventListener('webglcontextrestored', async () => {
+      try {
+        this._setup();
+        if (this._lastBlob) {
+          await this.setPanorama(this._lastBlob, {
+            altMinDeg: this.altMin, altMaxDeg: this.altMax
+          });
+        }
+        this.onContextRestored?.();
+      } catch (err) {
+        this.onContextLost?.(err);
+      }
+    });
+  }
+
+  _bindResize() {
+    const redraw = () => this.draw();
+    if (typeof ResizeObserver !== 'undefined') {
+      this._ro = new ResizeObserver(redraw);
+      this._ro.observe(this.canvas);
+    } else {
+      this._onResize = redraw;
+      window.addEventListener('resize', redraw);
+      window.addEventListener('orientationchange', redraw);
+    }
+  }
+
   lookAt(azDeg, altDeg, fovDeg = null) {
     this.az = ((Number(azDeg) || 0) % 360 + 360) % 360;
     this.alt = Math.max(-85, Math.min(85, Number(altDeg) || 0));
@@ -290,6 +367,11 @@ export class DomeView {
   }
 
   dispose() {
+    this._ro?.disconnect();
+    if (this._onResize) {
+      window.removeEventListener('resize', this._onResize);
+      window.removeEventListener('orientationchange', this._onResize);
+    }
     const gl = this.gl;
     gl.deleteTexture(this.tex);
     gl.deleteBuffer(this.buf.pos); gl.deleteBuffer(this.buf.uv); gl.deleteBuffer(this.buf.idx);

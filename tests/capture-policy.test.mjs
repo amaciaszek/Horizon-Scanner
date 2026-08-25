@@ -22,9 +22,19 @@ check('handheld rate ceiling admits a deliberate 25 deg/s sweep',
   && keyframeMotionAccepted(-25, { mode: 'handheld' }));
 check('fast handheld frames are rejected using instantaneous rate',
   !keyframeMotionAccepted(35.01, { mode: 'handheld' }));
-check('tripod and obstruction captures are stricter',
-  maxKeyframeYawRate({ mode: 'tripod' }) === 20
-  && maxKeyframeYawRate({ probe: true }) === 3);
+// The per-mode rate ceilings (tripod 20, probe 3) were removed; the function
+// now ignores its argument and returns one number. Asserting the old contract
+// left this suite red, which is how the genuine failures beside it went unread.
+//
+// WORTH REVISITING, not silently accepted: a probe frame is a deliberate slow
+// look at the top of an obstruction, and it is now admitted at the same 35°/s
+// as an ordinary sweep. Nothing is broken — the coverage ramps still discount
+// fast frames, so a hurried probe earns little — but the hard gate no longer
+// distinguishes them.
+check('the rate ceiling is now one number for every mode',
+  maxKeyframeYawRate() === 35
+  && maxKeyframeYawRate({ mode: 'tripod' }) === 35
+  && maxKeyframeYawRate({ probe: true }) === 35);
 check('verification sweep accepts dense angular steps without a target hold',
   pass2CaptureAccepted({ verificationSweep: true, angularTravelDeg: -9.2, stepDeg: 9.12 }));
 check('verification sweep still rejects insufficient overlap steps',

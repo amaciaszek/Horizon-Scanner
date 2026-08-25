@@ -10,7 +10,7 @@
      Bump it with VERSION in js/version.js; iPad Safari holds CSS aggressively
      and the resulting half-styled page looks like a broken build, not a stale
      one, which is a bad thing to be debugging in a field. -->
-<link rel="stylesheet" href="styles.css?v=0.20.0" />
+<link rel="stylesheet" href="styles.css?v=0.20.2" />
 </head>
 <body>
 
@@ -30,6 +30,12 @@
 </header>
 
 <main>
+
+<!-- Written to only by the stale-build check at startup, and by nothing else.
+     The first version of that check wrote into the directive panel, which the
+     render loop rewrites every frame — so the warning appeared for one frame and
+     was gone, which is worse than not having it. -->
+<div class="stale-banner" id="staleBanner" hidden></div>
 
 <!-- ------------------------------------------------------------- capture -->
 <section class="card stage-card" id="captureCard">
@@ -463,6 +469,6 @@
      modules aggressively, and a device pairing new markup with a cached script
      fails in ways that look like a broken build rather than a stale one. Bump
      with VERSION in js/version.js. -->
-<script type="module" src="js/main.js?v=0.20.0"></script>
+<script type="module" src="js/main.js?v=0.20.2"></script>
 </body>
 </html>

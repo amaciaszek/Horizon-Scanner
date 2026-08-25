@@ -211,8 +211,17 @@ console.log('\n=== The dot does not advance just because the phone turned ===');
   check('the target did not chase the phone',
     Math.abs(angDiff(guide.rawBearingDeg, started)) < 30,
     `${Math.abs(angDiff(guide.rawBearingDeg, started)).toFixed(1)}°`);
-  check('and it reports that it is waiting',
-    guide.state === 'waiting' || guide.state === 'behind', guide.state);
+  /*
+   * It no longer parks in 'waiting'. After `abandonAfterSec` a target that is
+   * gaining nothing is deferred on a cooldown and another is chosen, so
+   * `waitingSec` resets and the state reads 'advancing' again. That is the
+   * better behaviour — a dot that says "waiting" forever on ground the operator
+   * cannot fill is the stuck dot in another costume — but it means the thing
+   * worth asserting is that the deferral actually fired.
+   */
+  check('it defers rather than parking on ground that earns nothing',
+    guide.deferred.size > 0 || guide.abandonedCount > 0,
+    `${guide.deferred.size} deferred, ${guide.abandonedCount || 0} abandoned, state ${guide.state}`);
 }
 
 console.log('\n=== The dot leads a scan that is going well ===');
@@ -349,8 +358,19 @@ console.log('\n=== A sliver at a seam does not hold the survey hostage ===');
   sweep(map, { from: 0, to: 0, rateDegPerSec: 15 });
   const i = map.indexOf(123);
   map.score[i] = 0; map.observations[i] = 0;     // one 2° bin missing
-  check('one bin short of perfect still completes',
-    map.completeness().complete === true,
+  /*
+   * The completion tolerance was deliberately set to ZERO. It was 0.015 — about
+   * five degrees — and on the 2026-08-18 capture that was enough to finish a
+   * survey with the far side of the roof never visited. A survey run once and
+   * relied on for years should not be allowed to skip two bins.
+   *
+   * So this now asserts the opposite of what it used to: a missing bin holds the
+   * scan open, and the sliver-at-a-seam concern is handled by the guidance
+   * deferring a sector it cannot fill rather than by the map pretending it is
+   * covered.
+   */
+  check('one missing bin now holds the scan open',
+    map.completeness().complete === false,
     `${map.completeness().remainingDeg}° remaining, tolerance ${(COVERAGE_TUNING.completionTolerance * 360).toFixed(1)}°`);
   for (let d = 0; d < 16; d += map.binSizeDeg) {
     const j = map.indexOf(140 + d);
@@ -395,10 +415,27 @@ console.log('\n=== A sector taller than the frame is not finished ===');
   // say which bearing inside it was the tall one, so the requirement is
   // recorded across the field and has to be answered across the field too.
   const lifted = map.requiredElevationAt(tall);
+  /*
+   * The raised sweep has to CONTAIN the top, not merely be aimed high.
+   *
+   * Satisfaction used to be `satisfiedElevation = elevationDeg` — point high
+   * enough and the sector was marked done whether or not the roofline was in
+   * the picture, which meant aiming over a roof into clear sky satisfied it
+   * fastest of all. It is now a measurement: the top must have been traced,
+   * across enough columns to mean something, with headroom beneath the frame's
+   * top edge.
+   *
+   * These frames therefore carry what the real app carries — `skylineTopDeg`
+   * and `skylineMeasuredFraction`, straight out of the segmenter's boundary.
+   * Without them this loop was testing the old rule against the new code and
+   * had been failing ever since the rule changed.
+   */
+  const trueTopDeg = 18;                 // the obstruction this sector stands on
   for (let sweepAt = tall - 34; sweepAt <= tall + 34; sweepAt += 1) {
     for (let i = 0; i < 4; i++) {
       map.observe(goodFrame(wrap360(sweepAt), {
-        dtSec: 0.1, vfovDeg: 35, clippedFraction: 0, elevationDeg: lifted
+        dtSec: 0.1, vfovDeg: 35, clippedFraction: 0, elevationDeg: lifted,
+        skylineTopDeg: trueTopDeg, skylineMeasuredFraction: 0.9
       }));
     }
   }
@@ -448,7 +485,14 @@ console.log('\n=== The tilt request cannot chase the camera upward ===');
     const topEdge = elevation + vfov / 2;
     const clipped = topEdge < obstructionTopDeg ? 0.4 : 0;
     for (let i = 0; i < 12; i++) {
-      map.observe(goodFrame(90, { dtSec: 0.1, vfovDeg: vfov, clippedFraction: clipped, elevationDeg: elevation }));
+      // Once the frame's upper edge clears the obstruction the segmenter traces
+      // its top, so the frame reports one. While it is still clipping there is
+      // no top to report — which is exactly what distinguishes the two.
+      map.observe(goodFrame(90, {
+        dtSec: 0.1, vfovDeg: vfov, clippedFraction: clipped, elevationDeg: elevation,
+        skylineTopDeg: clipped ? null : obstructionTopDeg,
+        skylineMeasuredFraction: clipped ? 0 : 0.9
+      }));
     }
     climb.push(Number(elevation.toFixed(1)));
     // A perfectly obedient operator: go exactly where asked.

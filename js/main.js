@@ -667,10 +667,26 @@ async function processFrame() {
       // Handing the plan to the guidance is what makes the serpentine binding:
       // the dot may not move sideways while the column under it is unfinished.
       guidance.columnPlan = columns;
+      /*
+       * The column plan is credited on STRUCTURAL quality, not horizon quality.
+       * A frame aimed over the roof is all sky and observes no horizon, so it
+       * earns nothing on the ring — correctly. It still overlaps its neighbours,
+       * which is the only thing the column cares about, and refusing it there
+       * made the top band of every tall column permanently unfillable.
+       */
       columns.observe({
         headingDeg: currentHeading(),
         elevationDeg: att.elevation,
-        quality,
+        quality: coverage.structuralQuality({
+          trackingLost: state.trackingLost,
+          frameStatus: state.frameStatus,
+          glareFraction: state.glareFraction,
+          yawRateDegPerSec: pose.gyro.yawRateDegPerSec,
+          rollDeg: att.roll,
+          jitterDeg: pose.jitterDeg,
+          visualQuality: state.visualQuality,
+          dtSec
+        }),
         hfovDeg: camera.hfovDeg
       });
       state.guidance = guidance.update({
@@ -2966,7 +2982,14 @@ async function syncDomeView() {
     return;
   }
   try {
-    if (!dome) dome = new DomeView($('dome'));
+    if (!dome) {
+      dome = new DomeView($('dome'));
+      dome.onContextLost = err => log('warn',
+        'The dome view lost its graphics context, which phones do when the app is '
+        + 'backgrounded. It will rebuild itself when the browser gives it back.'
+        + (err ? ` (${err.message})` : ''));
+      dome.onContextRestored = () => log('info', 'Dome view restored.');
+    }
     wrap.hidden = false;
     const r = pano.report?.render || {};
     const blob = $('stitchShowControl').checked && pano.control ? pano.control : pano.panorama;
@@ -3900,6 +3923,45 @@ syncControls();
 // you think it is should be answerable by looking at it.
 $('buildLabel').textContent = versionLabel();
 $('buildLabel').title = RELEASE_NOTE;
+
+/*
+ * CATCH A HALF-CACHED BUILD, LOUDLY.
+ *
+ * index.html loads `js/main.js?v=X`, but main.js imports version.js, camera.js
+ * and twenty others with no query at all. Bumping the version therefore busts
+ * exactly one file, and a device can end up running new markup and new main.js
+ * against a cached copy of everything they import. Observed on 2026-08-21: the
+ * header read v0.19.0 while v0.20.0 was on disk, and every module in between
+ * was whichever version the browser felt like.
+ *
+ * That is a nightmare to debug in a field, and worse across several devices at
+ * once, because each one is stale in a different place. The honest fix is a
+ * build step that fingerprints every module; short of that, the failure must at
+ * least be VISIBLE rather than silent. The script tag carries the version the
+ * markup expects, VERSION is what the module graph actually loaded, and if they
+ * disagree the device is telling you it is running something other than what
+ * you shipped.
+ */
+(() => {
+  const tag = document.querySelector('script[type="module"][src*="main.js"]');
+  const want = (tag?.getAttribute('src') || '').match(/[?&]v=([^&]+)/)?.[1];
+  if (!want || want === VERSION) return;
+  // A dedicated element, because the directive panel is rewritten by renderLive
+  // on every frame — the first version of this warning was clobbered within
+  // about sixteen milliseconds of being set, and looked exactly like no warning.
+  const banner = $('staleBanner');
+  banner.hidden = false;
+  banner.innerHTML = 'STALE CODE ON THIS DEVICE — the page expects <b></b> '
+    + 'but the modules that loaded are <b></b>. Some files came from the browser '
+    + 'cache and some did not, so this device is running a mixture of builds. '
+    + 'Force-reload before capturing anything: on iOS, close the tab entirely and '
+    + 'reopen it. Do not trust a survey taken like this.';
+  const slots = banner.querySelectorAll('b');
+  slots[0].textContent = want;
+  slots[1].textContent = VERSION;
+  log('error', `STALE CACHE: markup expects ${want}, modules loaded ${VERSION}. `
+    + 'This device is running a mixture of builds.', { expected: want, loaded: VERSION });
+})();
 log('info', `Horizon Survey ${versionLabel()} ready.`, JSON.stringify({
   version: VERSION, buildDate: BUILD_DATE,
   ua: navigator.userAgent, secure: window.isSecureContext,

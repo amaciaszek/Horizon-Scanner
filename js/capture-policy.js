@@ -21,12 +21,22 @@
  * and missing ones cost a return trip.
  */
 export function keyframeStepDeg(horizontalFovDeg) {
-  return Math.max(3, Number(horizontalFovDeg) * 0.14);
+  // A non-finite field of view must not poison the step. `Math.max(3, NaN)` is
+  // NaN, and a NaN step makes `keyframeSpacingReached` return false forever —
+  // so the app would stop photographing entirely while logging
+  // 'spacing-not-reached' at every frame, which looks exactly like a survey
+  // going fine and produces nothing. Intrinsics are computed from a measured
+  // rotation, so this is reachable, not theoretical.
+  const fov = Number(horizontalFovDeg);
+  if (!Number.isFinite(fov) || fov <= 0) return 3;
+  return Math.max(3, Math.min(360, fov) * 0.14);
 }
 
 /** Vertical keyframe spacing, on the same principle as the horizontal one. */
 export function keyframeTiltStepDeg(verticalFovDeg) {
-  return Math.max(2.5, Number(verticalFovDeg) * 0.14);
+  const fov = Number(verticalFovDeg);
+  if (!Number.isFinite(fov) || fov <= 0) return 2.5;
+  return Math.max(2.5, Math.min(180, fov) * 0.14);
 }
 
 /**

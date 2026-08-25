@@ -130,7 +130,12 @@ export class ColumnPlan {
   }
 
   indexOf(headingDeg) {
-    return Math.floor(wrap360(headingDeg) / this.binSizeDeg) % this.binCount;
+    // A NaN index silently no-ops every typed-array write it is used for, so a
+    // bad heading would look like a frame that simply earned nothing rather
+    // than like an error. Fail to bin 0 instead, and visibly.
+    const h = Number(headingDeg);
+    if (!Number.isFinite(h)) return 0;
+    return Math.floor(wrap360(h) / this.binSizeDeg) % this.binCount;
   }
 
   bearingOf(index) {

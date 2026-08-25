@@ -518,3 +518,14 @@ details[open] > *:not(summary) { margin-top: 14px; }
   cursor: grab; touch-action: none;
 }
 .dome:active { cursor: grabbing; }
+
+
+/* Stale-build banner. Loud on purpose: a device running a mixture of builds
+   produces a survey nobody should trust, and the operator is standing outside
+   with no other way to know. */
+.stale-banner {
+  margin: 0 0 var(--gap); padding: 12px 14px; border-radius: var(--radius);
+  background: rgba(255,122,89,.12); border: 1px solid rgba(255,122,89,.5);
+  color: var(--ink); font-size: 0.86rem; line-height: 1.5;
+}
+.stale-banner b { color: var(--coral); font-family: var(--mono); }

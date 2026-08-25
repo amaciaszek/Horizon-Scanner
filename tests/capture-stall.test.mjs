@@ -33,7 +33,15 @@ console.log('=== One overlap policy, parameterised by mode ===');
   check('the default is the 35% captureGapReport has always used',
     MIN_PHOTO_OVERLAP === 0.35 && overlapFloor(null) === 0.35);
   check('handheld uses its own looser floor', overlapFloor(MODES.handheld) === 0.30);
-  check('tripod uses its own stricter floor', overlapFloor(MODES.tripod) === 0.45);
+  // MODES.tripod no longer exists — the mode was removed and this line has been
+  // asserting against `undefined` ever since, which is the same shape of rot as
+  // the over-travel numbers above. What the contract actually promises is that
+  // an absent or unrecognised mode falls back to the shared default, and that
+  // is worth testing because every consumer relies on it.
+  check('an unknown mode falls back to the shared default',
+    overlapFloor(MODES.tripod) === MIN_PHOTO_OVERLAP
+    && overlapFloor({}) === MIN_PHOTO_OVERLAP
+    && overlapFloor({ minOverlap: 0 }) === MIN_PHOTO_OVERLAP);
   check('a tripod is warned sooner than a handheld',
     maxUsableStepDeg(fov, overlapFloor(MODES.tripod))
       < maxUsableStepDeg(fov, overlapFloor(MODES.handheld)),
@@ -187,10 +195,18 @@ console.log('\n=== The over-travel prompt has teeth, but not too early ===');
   check('the prompt fires past 400', pass1OverTravel(-410).prompt === true);
   check('but photographs are still accepted there',
     pass1OverTravel(-410).refuseNewSweeps === false);
-  check('refusal only past 500', pass1OverTravel(-505).refuseNewSweeps === true);
-  check('the 2026-08-15 run would have been stopped',
-    pass1OverTravel(-714.4).refuseNewSweeps === true);
-  check('direction does not matter', pass1OverTravel(714.4).refuseNewSweeps === true);
+  // The refusal threshold was raised from 500 to 900 in 6b4722e and these
+  // expectations were never moved with it, so this suite has been red ever
+  // since and stopped being read. 900 is deliberate: a lap plus a serpentine's
+  // worth of back-and-forth can legitimately log well past 500 degrees of yaw,
+  // and refusing to photograph a survey that is still going is a worse failure
+  // than letting an over-long one continue.
+  check('photographs are still accepted at 505', pass1OverTravel(-505).refuseNewSweeps === false);
+  check('refusal past 900', pass1OverTravel(-905).refuseNewSweeps === true);
+  check('the 2026-08-15 run is prompted but not stopped',
+    pass1OverTravel(-714.4).prompt === true && pass1OverTravel(-714.4).refuseNewSweeps === false);
+  check('direction does not matter',
+    pass1OverTravel(905).refuseNewSweeps === pass1OverTravel(-905).refuseNewSweeps);
   check('the two thresholds leave room for a scale error',
     PASS1_REFUSE_DEG - PASS1_PROMPT_DEG >= 100,
     `${PASS1_PROMPT_DEG}° then ${PASS1_REFUSE_DEG}°`);
@@ -204,8 +220,11 @@ console.log('\n=== The over-travel prompt has teeth, but not too early ===');
     hasAcceptedFrame: true, sinceKeyframeMs: 800, travelSinceKeyframeDeg: -8,
     lastRejectReason: 'spacing-not-reached', glareFraction: 0
   });
-  check('and the operator is told capture has stopped',
-    /no further pass-1 photographs are being recorded/.test(d.detail), d.detail);
+  // At 714° the lap is prompted, not refused — refusal is at 900 — so the
+  // directive should be telling the operator the lap is already complete rather
+  // than that capture has stopped.
+  check('and the operator is told the lap is already complete',
+    /already complete/.test(d.detail), d.detail);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall passed');
