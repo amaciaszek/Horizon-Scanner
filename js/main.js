@@ -1667,8 +1667,40 @@ function lensGuidance(diag) {
   return { tone: 'good', advice: 'Both directions measured.', counts };
 }
 
+/**
+ * The square-pixel cross-check must GATE the vertical, not merely comment on it.
+ *
+ * MEASURED, 2026-09-02. The two halves of the lens are measured against
+ * different sensors on purpose — sideways against the gyroscope, up and down
+ * against gravity — and on a square-pixel sensor they must arrive at the same
+ * focal length in working-frame pixels. The app computed that agreement,
+ * printed "they DISAGREE by 13%, treat this with suspicion", and then used the
+ * disagreeing vertical anyway.
+ *
+ * On the Pixel that meant `focalV` 408.3 against `focalH` 469.7, so the vertical
+ * field was recorded as 38.86° where square pixels give 33.35° — 16% too tall.
+ * Every altitude in the survey scales with it, the column band step is 0.40 of
+ * it, and the stitcher's vertical geometry comes from it. House in the sky.
+ *
+ * The vertical is also, on every device measured, the less trustworthy half:
+ * Pixel `scatterV` 0.677 against `scatterH` 0.318; even the iPad, which agreed
+ * to 1.3%, had `uncertaintyV` 1.99 against `uncertaintyH` 1.23. Tilts are
+ * slower and shorter than pans, so there is less angle per pair to divide by.
+ *
+ * So when the halves disagree, the horizontal wins and the vertical is derived
+ * from it and the working frame's aspect. That is not an assumption about the
+ * lens — it is what square pixels mean. The measurement is still reported in
+ * full so the disagreement is visible rather than silently averaged away.
+ */
+const SQUARE_PIXEL_TOLERANCE = 0.06;
+
 function finishLens(r) {
-  if (r && (r.ready || r.salvageable) && camera.setMeasuredLens(r.focalH, r.focalV)) {
+  // Corroborated verticals are adopted; contradicted ones are dropped, and
+  // `setMeasuredLens` then derives the vertical from the horizontal.
+  const ratio = r && Number.isFinite(r.squarePixelRatio) ? r.squarePixelRatio : null;
+  const verticalAgrees = ratio !== null && Math.abs(ratio - 1) <= SQUARE_PIXEL_TOLERANCE;
+  const focalVToUse = verticalAgrees ? r.focalV : null;
+  if (r && (r.ready || r.salvageable) && camera.setMeasuredLens(r.focalH, focalVToUse)) {
     log('info', 'LENS_MEASURED', JSON.stringify({
       hfovDeg: Number(r.hfovDeg.toFixed(2)),
       vfovDeg: Number(r.vfovDeg.toFixed(2)),
@@ -1683,13 +1715,13 @@ function finishLens(r) {
     // gyroscope, tilt against gravity — and on a square-pixel sensor they must
     // arrive at the same focal length in pixels. Saying whether they did is
     // the difference between a measurement and an assertion.
-    const agree = Math.abs(r.squarePixelRatio - 1) < 0.12;
-    log(agree ? 'info' : 'warn',
-      `Lens measured: ${r.hfovDeg.toFixed(1)}° across the frame and ${r.vfovDeg.toFixed(1)}° down it, `
+    const used = camera.intrinsics();
+    log(verticalAgrees ? 'info' : 'warn',
+      `Lens measured: ${used.hfovDeg.toFixed(1)}° across the frame and ${used.vfovDeg.toFixed(1)}° down it, `
       + `to about ±${(Math.max(r.uncertaintyH, r.uncertaintyV) * 100).toFixed(1)}%, from ${r.nPan} pan and ${r.nTilt} tilt pairs. `
-      + (agree
-        ? `The two halves were measured against different sensors — sideways against the gyroscope, up-and-down against gravity — and agree on the same lens to ${Math.abs(r.squarePixelRatio - 1) * 100 < 1 ? 'under 1' : (Math.abs(r.squarePixelRatio - 1) * 100).toFixed(0)}%, which is the cross-check that makes this a measurement rather than a guess.`
-        : `But they DISAGREE by ${((r.squarePixelRatio - 1) * 100).toFixed(0)}% about the same lens, which on a square-pixel sensor they should not. Treat this with suspicion and check it against a landmark of known height before trusting altitudes.`));
+      + (verticalAgrees
+        ? `The two halves were measured against different sensors — sideways against the gyroscope, up-and-down against gravity — and agree on the same lens to ${Math.abs(ratio - 1) * 100 < 1 ? 'under 1' : (Math.abs(ratio - 1) * 100).toFixed(0)}%, which is the cross-check that makes this a measurement rather than a guess.`
+        : `The up-and-down half DISAGREED by ${((ratio - 1) * 100).toFixed(0)}% about the same lens, which on a square-pixel sensor it cannot, so it has been DISCARDED and the vertical field derived from the sideways measurement instead. The tilt half is the noisier of the two — shorter, slower movements give it less angle to work with — so the sideways figure is the one to keep. Altitudes stand on the sideways measurement alone.`));
     syncFovReadout();
   } else {
     log('warn', 'LENS_NOT_MEASURED', JSON.stringify(r || {}));
@@ -2836,6 +2868,9 @@ function captureThumb(kf, capturedFrame = null) {
 /* ------------------------------------------------------ diagnostic panorama */
 
 let panoBuilt = false;
+/** Wall-clock spent in each named build stage, so a slow build can say which
+ *  part was slow instead of only that it was. Reset at the start of a build. */
+const buildStageTimes = { current: null, startedAt: 0, spent: {} };
 
 /**
  * Decode the stored keyframe JPEGs into raw pixel buffers, aligned to the
@@ -2950,6 +2985,32 @@ function getStitcher() {
       $('buildEta').textContent = '';
       if (Number.isFinite(fraction)) $('buildBar').style.width = `${(fraction * 100).toFixed(1)}%`;
       if (detail) $('panoStatus').textContent = detail;
+      /*
+       * TIME EACH STAGE, BECAUSE "IT IS SLOW ON ANDROID" IS NOT A BUG REPORT.
+       *
+       * The 2026-09-02 Pixel build took 43m36s over 167 photographs where an
+       * iPad did 196 in 12m08s — four times the wall clock per frame, and nine
+       * times per feature match. Nothing in the archive said where any of it
+       * went, so the question could only be answered by guessing. Two guesses
+       * were tried and both were wrong: the photographs are the same 640x480 on
+       * both devices, and a controlled test showed the feature counts are
+       * comparable on comparable frames and that raising the SIFT contrast
+       * threshold changes matched inliers by under 2%.
+       *
+       * This is cheap — one timestamp per stage transition — and it turns the
+       * next report into a measurement. The stage names come from the Python
+       * side, so nothing here has to know what they will be.
+       */
+      const stage = String(text || '').trim();
+      if (stage && stage !== buildStageTimes.current) {
+        const now = performance.now();
+        if (buildStageTimes.current) {
+          buildStageTimes.spent[buildStageTimes.current] =
+            (buildStageTimes.spent[buildStageTimes.current] || 0) + (now - buildStageTimes.startedAt);
+        }
+        buildStageTimes.current = stage;
+        buildStageTimes.startedAt = now;
+      }
     },
     onLog: (line, isStderr) => {
       const el = $('stitchLog');
@@ -3064,6 +3125,9 @@ async function buildPanorama() {
   await new Promise(r => requestAnimationFrame(() => r()));
 
   const t0 = performance.now();
+  buildStageTimes.current = null;
+  buildStageTimes.startedAt = t0;
+  buildStageTimes.spent = {};
   try {
     const photos = await loadKeyframeBlobs({ waitForPending: true });
     const withPhoto = kfs.filter(kf => photos.has(kf.index)).length;
@@ -3129,6 +3193,19 @@ async function buildPanorama() {
       + `solved panorama, ${(report.render?.paintedFraction * 100 || 0).toFixed(0)}% of the panel `
       + `painted, ${(ms / 1000).toFixed(1)} s.`;
     surveyRates.recordBuild(report.frames, ms / 1000);
+    // Close the final stage and report the breakdown, worst first.
+    if (buildStageTimes.current) {
+      buildStageTimes.spent[buildStageTimes.current] =
+        (buildStageTimes.spent[buildStageTimes.current] || 0)
+        + (performance.now() - buildStageTimes.startedAt);
+      buildStageTimes.current = null;
+    }
+    const stageSec = Object.fromEntries(Object.entries(buildStageTimes.spent)
+      .sort((a, b) => b[1] - a[1])
+      .map(([k, v]) => [k, Number((v / 1000).toFixed(1))]));
+    log('info', `Build took ${(ms / 1000).toFixed(0)} s for ${report.frames} photographs `
+      + `(${(ms / 1000 / Math.max(1, report.frames)).toFixed(1)} s each). Time by stage, slowest first.`,
+      { totalSec: Number((ms / 1000).toFixed(1)), frames: report.frames, stageSec });
     /*
      * LEARN THE LENS FROM THE SOLVE.
      *

@@ -13,16 +13,16 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.24.0';
-export const BUILD_DATE = '2026-08-25';
+export const VERSION = '0.25.0';
+export const BUILD_DATE = '2026-09-02';
 
 /**
- * Every device learns its own lens.
+ * The vertical half of the lens has to earn its place.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'One hand-written table entry was the whole difference between a perfect 198-photograph panorama on the iPad and a black screen on the phone: the iPad was in the table, the phone was not, so the phone ran on a 66 degree fallback against a real 42. The app now remembers the lens each device actually has, learned from the bundle adjustment over an entire survey, so one good run makes a device correct for good. The phone is in the table as well, and the fallback for an unknown device is 45 rather than 66.';
+  'The lens is measured twice, sideways against the gyroscope and up-and-down against gravity, and on a square-pixel sensor the two must agree. When they did not the app said so in the log and then used the disagreeing vertical anyway: on the phone that recorded a vertical field 16 percent too tall, which scales every altitude, the column heights and the stitcher geometry with it. A contradicted vertical is now discarded and derived from the sideways measurement instead. Builds also report where their time went, by stage.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {
