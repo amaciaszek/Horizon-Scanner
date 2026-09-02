@@ -1,6 +1,8 @@
 'use strict';
 import { clamp, RAD, DEG } from './math3d.js';
 
+import { deviceKey } from './lens-store.js';
+
 export const WORK_W = 384, WORK_H = 288;   // segmentation working frame
 export const LUMA_W = 160, LUMA_H = 120;   // registration base frame
 
@@ -69,6 +71,32 @@ const KNOWN_LENSES = [
       && (navigator.maxTouchPoints || 0) > 0
       && Math.min(s.width, s.height) === 1080 && Math.max(s.width, s.height) === 1920,
     focalVideoPx: 540 / Math.tan(22.8 * Math.PI / 180)
+  },
+  /*
+   * Android phone, 1080x1920 rear stream.
+   *
+   * NOT a spec-sheet figure — a solved one. The 2026-08-25 22:23 capture on a
+   * Pixel ran 152 photographs into 902 verified pairs and 108,585 feature
+   * matches, and the bundle adjustment reported the working-frame lens as
+   * 42.40° x 32.44°. A second capture the same evening agreed at 45.2°. This
+   * table entry is the first of those, expressed the way the prior wants it.
+   *
+   * Its absence is what made that device unusable: with no prior it started on
+   * the 66° fallback, which is 57% too wide, and everything derived from the
+   * field of view was wrong with it — 68 photographs where the iPad took 198,
+   * 42 verified pairs where the same frames yield 684 under brute-force
+   * matching, and 3 frames placed in the panorama.
+   *
+   * A prior is a starting value, not ground truth: the guided measurement and
+   * `js/lens-store.js` both overrule it as soon as they have something better.
+   */
+  {
+    label: 'Android phone (rear, 1080x1920 stream)',
+    match: s => /Android/.test(navigator.userAgent)
+      && Math.min(s.width, s.height) === 1080 && Math.max(s.width, s.height) === 1920,
+    // 42.40° across a 384 px working frame, carried back to video pixels by the
+    // cover-fit scale (1080 video px across the same 384 px of working frame).
+    focalVideoPx: (1080 / 2) / Math.tan(42.40 / 2 * Math.PI / 180)
   }
 ];
 
@@ -96,12 +124,30 @@ export class CameraSource {
     this._videoFrameRequest = null;
     this._lastVideoFrame = null;
 
-    // Intrinsics: horizontal half-FOV tangent. Starts from a sane phone default
-    // and is replaced by the self-calibrated value once the scan produces one.
-    this.hfovDeg = 66;
+    /*
+     * Intrinsics before anything has been measured or recalled.
+     *
+     * LOWERED FROM 66 ON 2026-08-25, because 66 is not a plausible working-frame
+     * field of view for any device this app has ever run on and being wrong here
+     * is not a small matter. The working frame is 4:3 and every rear camera the
+     * app has measured lands near 40°: an iPad at 40.5° and an Android phone at
+     * 42.4°, both solved from hundreds of thousands of feature matches. 66° is
+     * roughly the DIAGONAL of a phone camera before the cover-fit crop, which is
+     * probably where the number came from, and it is 57% too wide once cropped.
+     *
+     * A device with no prior and no stored lens now starts within about 10% of
+     * both known devices instead of 57% away from them. That is still a guess
+     * and is still announced as one before the operator walks, but it is a guess
+     * that leaves guided matching working rather than blind.
+     */
+    this.hfovDeg = 45;
     this.focalPx = null;
     this.focalSource = 'default';
     this.measuredFocalV = null;
+    /** Set by the app. What this browser has learned about this device's lens,
+     *  consulted before the hand-written table and written back whenever
+     *  something better than a guess is established. */
+    this.lensStore = null;
 
     // Lens inventory
     this.devices = [];           // [{deviceId, label, hfovDeg|null, isWide}]
@@ -637,15 +683,35 @@ export class CameraSource {
       this.sensorFocalPx = focalH / scale;
       this.sensorFocalVPx = this.measuredFocalV ? this.measuredFocalV / scale : null;
       this.sensorFocalLabel = 'measured';
+      // Learned, so the next session on this device starts correct instead of
+      // starting on a table entry or a fallback.
+      this.rememberLens(this.sensorFocalPx, 'measured');
     }
     this.focalSource = 'measured';
     return true;
   }
 
 
-  /** Pin a lens from the table if this device is one we know. */
+  /**
+   * Pin a lens: what this browser has learned about this device first, then the
+   * hand-written table, then nothing.
+   *
+   * The learned value wins because it was measured on THIS camera — by the
+   * guided calibration or, better, by a bundle adjustment over the whole
+   * survey — while the table is a general figure for a class of device. A
+   * device nobody has ever added to the table gets correct optics after one
+   * good run, which is what "every device" requires.
+   */
   _pinKnownLens() {
     if (!this.settings) return false;
+    const learned = this.lensStore?.get(deviceKey(this.settings, navigator.userAgent));
+    if (learned && this.setSensorFocalPx(learned.focalVideoPx, `remembered (${learned.source})`)) {
+      this.log('info', `Lens recalled for this device: ${this.hfovDeg.toFixed(1)}° across the `
+        + `working frame, ${this.intrinsics().vfovDeg.toFixed(1)}° down it, `
+        + `${learned.source} on ${String(learned.at).slice(0, 10)}. `
+        + 'Measured here before, so this is not a guess.');
+      return true;
+    }
     const hit = KNOWN_LENSES.find(k => { try { return k.match(this.settings); } catch (_) { return false; } });
     if (!hit) return false;
     if (this.setSensorFocalPx(hit.focalVideoPx, 'known-device')) {
@@ -653,6 +719,30 @@ export class CameraSource {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Write a lens back to the learned store, in video pixels.
+   *
+   * `source` decides precedence inside the store: a solved focal from a bundle
+   * adjustment outranks a guided measurement, which outranks a self-calibrated
+   * estimate. Nothing here can demote a better figure.
+   */
+  rememberLens(focalVideoPx, source) {
+    if (!this.lensStore || !this.settings) return false;
+    return this.lensStore.remember(
+      deviceKey(this.settings, navigator.userAgent), focalVideoPx, source);
+  }
+
+  /** Convert a working-frame focal length back to video pixels, which is the
+   *  form the store keeps because it survives rotation and cropping. */
+  videoFocalFromWork(workFocalPx) {
+    const vw = this.video?.videoWidth, vh = this.video?.videoHeight;
+    if (!vw || !vh || !Number.isFinite(workFocalPx)) return null;
+    const swapped = this.frameRotation === 90 || this.frameRotation === 270;
+    const srcW = swapped ? vh : vw, srcH = swapped ? vw : vh;
+    const scale = Math.max(WORK_W / srcW, WORK_H / srcH);
+    return workFocalPx / scale;
   }
 
   /** Pin the lens from a known focal length in VIDEO pixels.

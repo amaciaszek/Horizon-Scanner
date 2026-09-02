@@ -23,6 +23,7 @@ import { buildCaptureDebugZip } from './diagnostic-export.js';
 import { captureGapReport } from './capture-gaps.js';
 import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted, overlapFloor, pass1OverTravel, keyframeSpacingReached, captureDemand } from './capture-policy.js';
 import { SurveyRates, estimateSurvey, describeSurveyPlan, roughMinutes } from './survey-estimate.js';
+import { LensStore } from './lens-store.js';
 import { disagreementByBin, pixelToAzAlt, landmarkResiduals } from './panorama.js';
 import { PyodideStitcher, stitcherAvailability } from './pyodide-stitch.js';
 import { bearingCoverage, frameCoverage, stitchVerdict } from './coverage-table.js';
@@ -76,10 +77,24 @@ const columns = new ColumnPlan({ vfovDeg: 30, binCount: coverage.binCount });
  * and replaced by real measurements after one run. */
 const surveyRates = new SurveyRates(
   typeof localStorage === 'undefined' ? null : localStorage);
+
+/* What this browser has learned about the lenses on this device. Consulted when
+ * the camera starts, written back whenever a measurement or a solve establishes
+ * something better than a guess. One good run and the device is correct
+ * afterwards, whatever device it is. */
+const lensStore = new LensStore(
+  typeof localStorage === 'undefined' ? null : localStorage);
 /** Wall clock at the start of pass 1, so the capture rate can be measured. */
 let captureStartedAt = null;
 const orientation = new OrientationSource(log);
 const camera = new CameraSource($('video'), log);
+// Handed the store straight after construction, and never before: `camera` is a
+// `const` in the module scope, so touching it above this line is a temporal
+// dead zone error that kills the whole module graph before a single frame is
+// drawn. Caught in the browser rather than by any test, because every test in
+// this suite imports the modules it exercises directly and none of them loads
+// main.js at all.
+camera.lensStore = lensStore;
 const pipeline = new Pipeline(log);
 const lensCal = new LensCalibrator(WORK_W, WORK_H);
 const preflight = new PreflightSweep();
@@ -1367,10 +1382,18 @@ function finishCalibration() {
    * The operator can fix this in ten seconds from Advanced, and cannot fix it
    * at all afterwards. So it is said before they walk, not after.
    */
-  if (camera.focalSource !== 'measured' && camera.focalSource !== 'manual') {
+  /*
+   * Only warn when the figure really is a guess. A lens recalled from the store
+   * because a previous survey on this device SOLVED it — from every verified
+   * feature correspondence in that survey — is a better number than the guided
+   * measurement produces, so calling it a guess would be both wrong and the
+   * kind of noise that teaches an operator to skip warnings.
+   */
+  const recalledSolved = /^remembered \(solved\)/.test(camera.focalSource || '');
+  if (!recalledSolved && camera.focalSource !== 'measured' && camera.focalSource !== 'manual') {
     const stats = survey.focalStats();
     log('warn', `The lens has not been measured — this survey will start on `
-      + `${camera.hfovDeg.toFixed(0)}° horizontal, which is a guess`
+      + `${camera.hfovDeg.toFixed(1)}° horizontal (${camera.focalSource}), which is a guess`
       + `${stats.converged ? '' : ' that self-calibration has not yet refined'}. `
       + 'If that figure is wrong, the photograph spacing, the column heights and '
       + 'the feature search inside the stitcher are all wrong with it, and the '
@@ -3106,6 +3129,36 @@ async function buildPanorama() {
       + `solved panorama, ${(report.render?.paintedFraction * 100 || 0).toFixed(0)}% of the panel `
       + `painted, ${(ms / 1000).toFixed(1)} s.`;
     surveyRates.recordBuild(report.frames, ms / 1000);
+    /*
+     * LEARN THE LENS FROM THE SOLVE.
+     *
+     * This is the best measurement of the camera the app will ever have. The
+     * guided calibration works from a few hundred pairs gathered in under a
+     * minute; the bundle adjustment fits the focal length to every verified
+     * correspondence in the survey — 108,585 of them on the 2026-08-25 22:23
+     * capture, 297,806 on the iPad run — and reports the scale it had to apply
+     * to make them agree.
+     *
+     * Only when the solve is worth believing. A build that placed a handful of
+     * frames from a few dozen pairs has not measured a lens, it has fitted
+     * noise: the 23:53 Pixel build reported a focal scale of 0.9868 off 42
+     * pairs while being wrong by 57%, and learning that would have burned the
+     * error in permanently instead of letting the next run fix it.
+     */
+    const solvedScale = Number(report.focalScale);
+    const placed = report.graph?.largestComponentFrames || 0;
+    if (Number.isFinite(solvedScale) && solvedScale > 0.5 && solvedScale < 2
+        && report.pairs >= 200 && placed >= Math.max(20, report.frames * 0.6)) {
+      const solvedWorkFocal = camera.focalPx / solvedScale;
+      const videoFocal = camera.videoFocalFromWork(solvedWorkFocal);
+      if (videoFocal && camera.rememberLens(videoFocal, 'solved')) {
+        const solvedHfov = 2 * Math.atan((WORK_W / 2) / solvedWorkFocal) * 180 / Math.PI;
+        log('info', `Lens learned from this solve: ${solvedHfov.toFixed(2)}° across the working `
+          + `frame, from ${report.pairs} verified pairs over ${placed} placed frames. `
+          + 'The next survey on this device will start from it instead of a guess.',
+          { solvedHfovDeg: solvedHfov, focalScale: solvedScale, pairs: report.pairs, placed });
+      }
+    }
     log('info', `Panorama built by the Python stitcher: ${report.pairs} pairs, `
       + `${report.matches} matches, focal x${report.focalScale?.toFixed(4)}, `
       + `overlap disagreement ${v?.meanDisagreement?.toFixed(1)} (${v?.grade}).`,
