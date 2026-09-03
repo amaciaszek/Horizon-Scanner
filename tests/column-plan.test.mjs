@@ -15,6 +15,7 @@
 
 import { ColumnPlan, COLUMN_TUNING, overlapAudit, bridgeTargets } from '../js/column-plan.js';
 
+const angDiff = (a, b) => { let d = (a - b) % 360; if (d > 180) d -= 360; if (d < -180) d += 360; return d; };
 let failures = 0;
 function check(name, ok, detail = '') {
   console.log(`${ok ? '  ok  ' : '  FAIL'} ${name}${detail ? '  ' + detail : ''}`);
@@ -293,6 +294,78 @@ section('A stranded group is turned into somewhere to point');
   const audit = overlapAudit(frames, { hfovDeg: 38.73, vfovDeg: 30.75 });
   check('a connected survey proposes nothing',
     bridgeTargets(frames, audit, {}).length === 0);
+}
+
+section('A band is filled by looks, not by glimpses at the edge of a picture');
+
+{
+  /*
+   * MEASURED, 2026-09-03. `observe` credits every bin within half the usable
+   * field — nine columns either side on a 44° lens at 2° bins — with the weight
+   * falling to about 0.1 at the outermost. The comment beside it said "an
+   * edge-of-frame glimpse cannot complete a band", and then the frame counter
+   * was incremented for every one of those nineteen bins.
+   *
+   * On that capture 83 of 180 columns were marked COMPLETE with zero
+   * photographs ever aimed at them, and 41 more with exactly one. The plan
+   * reported 97.4% done off 207 photographs against 813 required cells. The
+   * operator: "the white dot guide is constantly ahead of me and I doubt if it
+   * is actually checking the quality of the measurements."
+   */
+  const plan = new ColumnPlan({ vfovDeg: VFOV, binCount: 180 });
+  const HF = 44.5;
+  const target = plan.indexOf(100);
+  const edge = plan.bearingOf(target) + HF * 0.38;   // near the edge of the credit fan
+
+  for (let k = 0; k < 40; k++) {
+    plan.observe({ headingDeg: edge, elevationDeg: 0, quality: 1, hfovDeg: HF });
+  }
+  check('forty edge glimpses do not complete a column nobody aimed at',
+    !plan.columnComplete(target),
+    `bands filled ${plan.bandsFilled(target)} of ${plan.bandsRequired[target]}`);
+
+  // The same number of frames actually pointed at it does complete it.
+  const plan2 = new ColumnPlan({ vfovDeg: VFOV, binCount: 180 });
+  for (let k = 0; k < 6; k++) {
+    plan2.observe({ headingDeg: plan2.bearingOf(target), elevationDeg: 0, quality: 1, hfovDeg: HF });
+  }
+  check('but a handful aimed at it does', plan2.columnComplete(target));
+  check('and the edge credit still counts toward the score, just not as a look',
+    plan.score[plan.cell(target, 0)] > 0,
+    `score ${plan.score[plan.cell(target, 0)].toFixed(2)}`);
+}
+
+section('At the end of a lap the dot does not send you across the ring');
+
+{
+  /*
+   * The sweep-direction walk took the first column needing work, up to a full
+   * circle away. During the main sweep that is right. At the end, with a few
+   * stragglers scattered round the ring, the nearest is often BEHIND and going
+   * forward costs most of a lap. On the 2026-09-03 capture there were exactly
+   * two target jumps over 25° in the whole session, both in the last quarter,
+   * of 174° and 170°.
+   */
+  const plan = new ColumnPlan({ vfovDeg: VFOV, binCount: 180 });
+  plan.setHorizontalFieldOfView(44.5);
+  for (let i = 0; i < 180; i++) plan.bandsRequired[i] = 1;
+  for (let i = 0; i < 180; i++) {
+    for (let k = 0; k < 6; k++) {
+      plan.observe({ headingDeg: plan.bearingOf(i), elevationDeg: 0, quality: 1, hfovDeg: 1 });
+    }
+  }
+  const here = plan.indexOf(180);
+  const behind = (here + 3) % 180;              // 6° the wrong way
+  const farAhead = (here - 50 + 180) % 180;     // 100° the sweep way
+  for (const i of [behind, farAhead]) {
+    plan.score[plan.cell(i, 0)] = 0;
+    plan.frames[plan.cell(i, 0)] = 0;
+  }
+  const t = plan.nextTarget(180, 0, { direction: -1 });
+  const travel = Math.abs(angDiff(t.bearingDeg, 180));
+  check('it turns round for work six degrees away rather than walking a hundred',
+    travel < 20, `${travel.toFixed(0)}° of travel, action "${t.action}"`);
+  check('and says that is what it did', t.action === 'nearest-work', t.action);
 }
 
 console.log(failures ? `\n${failures} FAILED` : '\nall column-plan checks passed');

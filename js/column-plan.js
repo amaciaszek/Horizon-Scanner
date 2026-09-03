@@ -77,8 +77,47 @@ export const COLUMN_TUNING = {
    *  frame rather than an unmeasured horizon. */
   bandThreshold: 0.62,
 
-  /** Independent frames a band needs regardless of quality. */
-  minBandFrames: 2,
+  /**
+   * Independent LOOKS a band needs — frames aimed near it, not merely frames
+   * that happened to include it at the edge of a wide picture.
+   *
+   * MEASURED, 2026-09-03. `observe` credits every bin within half the usable
+   * field, which for a 44° lens at 2° bins is nine columns either side, with the
+   * credit falling off to about 0.1 at the outermost. The comment beside it said
+   * "an edge-of-frame glimpse cannot complete a band" — and then the frame
+   * counter was incremented for every one of those nineteen bins, edge glimpses
+   * included. Thirteen glimpses at 0.05 apiece reach the 0.62 score threshold,
+   * and the count of two was satisfied by the first two of them.
+   *
+   * The consequence, on that capture: **83 of 180 columns were marked complete
+   * with ZERO photographs ever aimed at them**, and 41 more with exactly one.
+   * 207 photographs were declared to have filled 813 required cells — a quarter
+   * of a frame per cell. The plan reported 97.4% done.
+   *
+   * That is why the operator reported the dot "constantly ahead of me" and
+   * doubted "if it is actually checking the quality of the measurements along
+   * the way": it was not. The dot moved on because the column behind it claimed
+   * to be finished on the strength of pictures pointed somewhere else.
+   *
+   * Raised from 2, and the count now only admits frames that actually looked
+   * here — see `centreWeight`.
+   */
+  minBandFrames: 3,
+
+  /**
+   * How near the middle of a frame a column has to fall for that frame to count
+   * as a LOOK at it, as a fraction of the falloff weight.
+   *
+   * Edge credit still accumulates into `score`, because a wide lens genuinely
+   * does see 44° of horizon and the outer parts of it are real observations.
+   * What an edge glimpse may not do is satisfy the independent-look count, which
+   * is the term that is supposed to mean somebody pointed the camera here.
+   *
+   * 0.6 of full weight is roughly the middle 40% of the frame — comfortably
+   * inside the usable field, away from the worst distortion, and reached by any
+   * frame whose own column is within about 7° on a 44° lens.
+   */
+  centreWeight: 0.6,
 
   /** How far off a band's centre a frame may be aimed and still credit it, as a
    *  fraction of the band step. Beyond this the frame is crediting the next
@@ -342,7 +381,11 @@ export class ColumnPlan {
       const c = this.cell(i, band);
       const before = this._bandFilled(i, band);
       this.score[c] = Math.min(1, this.score[c] + quality * w * 0.5);
-      if (this.frames[c] < 65535) this.frames[c]++;
+      // The count is of LOOKS, not of pictures that happened to include this
+      // bearing somewhere near their edge. Without this test the falloff above
+      // is decorative: the outermost bin, credited 0.05 of a look, ticked the
+      // counter exactly as hard as the bin dead centre.
+      if (w >= this.tuning.centreWeight && this.frames[c] < 65535) this.frames[c]++;
       if (!before && this._bandFilled(i, band)) { filled = true; this.generation++; }
     }
     return filled;
@@ -424,15 +467,61 @@ export class ColumnPlan {
     //    owner of the decision, when a column actually completes.
     //    `direction` is -1 for the counter-clockwise sweep the app asks for.
     const step = Math.max(1, Math.round(this.columnStepDeg() / this.binSizeDeg));
+
+    /*
+     * THE SWEEP DIRECTION FIRST — BUT NOT ALL THE WAY ROUND THE WORLD.
+     *
+     * This walked only in the sweep direction, up to a full circle, and took the
+     * first column that still needed work. During the main sweep that is exactly
+     * right: the next work is a step ahead and the serpentine keeps its order.
+     *
+     * At the end of a survey it is badly wrong. A handful of stragglers are left
+     * scattered round the ring, the nearest one is often BEHIND, and walking
+     * forward to reach it means most of a lap. On the 2026-09-03 capture that
+     * produced exactly two target jumps over 25° in the whole session, both in
+     * the last quarter, of 174° and 170° — the operator sent to the far side of
+     * the ring and then straight back. Their words: "at the end it had me
+     * bouncing around real far."
+     *
+     * So the sweep direction still wins whenever its candidate is anywhere near
+     * as close as the nearest one in either direction. Only when going forward
+     * would cost dramatically more than turning round does the near one win.
+     */
+    let forward = null, forwardK = 0;
     for (let k = 1; k <= this.binCount; k++) {
       const i = (here + direction * step * k + this.binCount * 2) % this.binCount;
       if (!needsWork(i)) continue;
-      // The next column is entered at the height the camera is already holding,
-      // which is what makes the step sideways a step and not a plunge.
-      return this._target(i, this.gapBand(i, { fromElevationDeg: elevationDeg }),
-        k === 1 ? 'next-column' : 'skip-to-work');
+      forward = i; forwardK = k;
+      break;
     }
-    return { complete: true, bearingDeg: null, elevationDeg: null, band: -1, action: 'complete' };
+    // The nearest work in either direction, measured in bins rather than steps
+    // so a straggler that does not sit on the step grid is still found.
+    let nearest = null, nearestBins = Infinity;
+    for (let d = 1; d <= this.binCount / 2; d++) {
+      for (const cand of [(here + d) % this.binCount,
+        (here - d + this.binCount) % this.binCount]) {
+        if (!needsWork(cand)) continue;
+        if (d < nearestBins) { nearest = cand; nearestBins = d; }
+      }
+      if (nearest !== null) break;
+    }
+    if (forward === null && nearest === null) {
+      return { complete: true, bearingDeg: null, elevationDeg: null, band: -1, action: 'complete' };
+    }
+
+    const forwardBins = forward === null ? Infinity
+      : Math.min((forward - here + this.binCount) % this.binCount,
+        (here - forward + this.binCount) % this.binCount);
+    // Generous, because the serpentine's order is worth preserving: the sweep
+    // direction has to be more than three times further AND more than a quarter
+    // of the ring away before turning round is preferred.
+    const turnAround = forward === null
+      || (forwardBins > nearestBins * 3 && forwardBins * this.binSizeDeg > 90);
+    const chosen = turnAround ? nearest : forward;
+    const action = turnAround ? 'nearest-work' : (forwardK === 1 ? 'next-column' : 'skip-to-work');
+    // The next column is entered at the height the camera is already holding,
+    // which is what makes the step sideways a step and not a plunge.
+    return this._target(chosen, this.gapBand(chosen, { fromElevationDeg: elevationDeg }), action);
   }
 
   /**

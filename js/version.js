@@ -13,16 +13,16 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.25.0';
-export const BUILD_DATE = '2026-09-02';
+export const VERSION = '0.26.0';
+export const BUILD_DATE = '2026-09-03';
 
 /**
- * The vertical half of the lens has to earn its place.
+ * The dot waits for looks, not for glimpses.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'The lens is measured twice, sideways against the gyroscope and up-and-down against gravity, and on a square-pixel sensor the two must agree. When they did not the app said so in the log and then used the disagreeing vertical anyway: on the phone that recorded a vertical field 16 percent too tall, which scales every altitude, the column heights and the stitcher geometry with it. A contradicted vertical is now discarded and derived from the sideways measurement instead. Builds also report where their time went, by stage.';
+  'A wide photograph credited every bearing it could see, and the count of independent looks was ticked by the very edge of the picture as hard as by the middle. So columns finished without anyone pointing at them: on the last capture, 83 of 180 were marked complete with zero photographs aimed at them, and the dot moved on regardless. A look now has to land near the middle of the frame to count. And at the end of a lap, when a few stragglers are left scattered round the ring, the dot turns round for the nearest one instead of walking most of a circle to reach the next in sweep order.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {
