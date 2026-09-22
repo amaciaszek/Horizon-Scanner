@@ -27,13 +27,36 @@
  * make the time estimate wrong, because that is measured per stage.
  */
 
-/** Fraction of total build time each stage typically occupies. */
+/**
+ * Fraction of total build time each stage typically occupies.
+ *
+ * REPLACED WITH A MEASUREMENT, 2026-09-21. These were decoding 0.18, features
+ * 0.34, matching 0.36, solving 0.06, rendering 0.06 — a guess from a 91-frame
+ * reference capture, and wrong by more than an order of magnitude in the one
+ * place it mattered. The first build ever to record its own stages, 380
+ * photographs in 2307 seconds, spent:
+ *
+ *     choosing seams        976.9 s   42%   *     painting the panorama 895.4 s   39%  /  rendering: 81%
+ *     matching              236.9 s   10%
+ *     prune and re-solve     66.8 s    3%
+ *     features               62.8 s    3%
+ *     solving                54.0 s    2%
+ *
+ * Rendering is not 6% of a build, it is four fifths of one. Nobody would have
+ * found that by reading the code, and the old weights would have driven a
+ * progress bar that sat at 94% for twenty-five minutes.
+ *
+ * NOTE: nothing imports this class yet — `js/main.js` drives its progress bar
+ * straight from the worker's own messages. The weights are corrected rather
+ * than deleted because a dead table of wrong constants is a trap for whoever
+ * wires it up next; `js/build-profile.js` is what actually records this now.
+ */
 const STAGE_WEIGHT = {
-  decoding: 0.18,
-  features: 0.34,
-  matching: 0.36,
-  solving: 0.06,
-  rendering: 0.06
+  decoding: 0.02,
+  features: 0.03,
+  matching: 0.10,
+  solving: 0.05,
+  rendering: 0.80
 };
 
 const STAGE_ORDER = ['decoding', 'features', 'matching', 'solving', 'rendering'];

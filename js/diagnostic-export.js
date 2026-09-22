@@ -269,7 +269,7 @@ export async function buildCaptureDebugZip({
   captureAudit = null, panoramaOptimization = null,
   scanCoverage = null, coverageImage = null,
   stitchReport = null, stitchLog = null, stitchOptions = null,
-  columnPlan = null, overlapAudit = null
+  columnPlan = null, overlapAudit = null, buildProfile = null
 }) {
   const exportedAt = new Date();
   const photoMap = photos instanceof Map ? photos : new Map();
@@ -372,6 +372,14 @@ export async function buildCaptureDebugZip({
     { name: 'metadata/scan-coverage.json', data: json(scanCoverage), modifiedAt: exportedAt },
     { name: 'metadata/column-plan.json', data: json(columnPlan), modifiedAt: exportedAt },
     { name: 'metadata/overlap-audit.json', data: json(overlapAudit), modifiedAt: exportedAt },
+    /*
+     * Where the build spent its time, what it cost the device, and what the
+     * device is. Carried because "it is ten times slower on Android" cannot be
+     * investigated from a single elapsed figure — the first run that recorded
+     * stages showed 81% of a 2307-second build was rendering, against a prior
+     * estimate of 6%, and no amount of re-reading the code would have found it.
+     */
+    { name: 'metadata/build-profile.json', data: json(buildProfile), modifiedAt: exportedAt },
     { name: 'metadata/project.horizon-project', data: json(project), modifiedAt: exportedAt },
     { name: 'logs/field-log.txt', data: `${logText || '(empty)'}\n`, modifiedAt: exportedAt },
     { name: 'logs/debug-bundle.txt', data: `${debugText || '(empty)'}\n`, modifiedAt: exportedAt }

@@ -24,6 +24,7 @@ import { captureGapReport } from './capture-gaps.js';
 import { keyframeStepDeg, keyframeMotionAccepted, pass2CaptureAccepted, overlapFloor, pass1OverTravel, keyframeSpacingReached, captureDemand } from './capture-policy.js';
 import { SurveyRates, estimateSurvey, describeSurveyPlan, roughMinutes } from './survey-estimate.js';
 import { LensStore } from './lens-store.js';
+import { BuildProfile } from './build-profile.js';
 import { disagreementByBin, pixelToAzAlt, landmarkResiduals } from './panorama.js';
 import { PyodideStitcher, stitcherAvailability } from './pyodide-stitch.js';
 import { bearingCoverage, frameCoverage, stitchVerdict } from './coverage-table.js';
@@ -2868,9 +2869,16 @@ function captureThumb(kf, capturedFrame = null) {
 /* ------------------------------------------------------ diagnostic panorama */
 
 let panoBuilt = false;
-/** Wall-clock spent in each named build stage, so a slow build can say which
- *  part was slow instead of only that it was. Reset at the start of a build. */
-const buildStageTimes = { current: null, startedAt: 0, spent: {} };
+/**
+ * Where the last build spent its time and what it cost the device.
+ *
+ * Kept at module scope rather than inside `buildPanorama` so the debug export
+ * can carry it long after the build finished — the archive is written minutes
+ * later, by hand, and the whole value of the measurement is comparing it
+ * against the same measurement from another device.
+ */
+const buildProfile = new BuildProfile();
+let lastBuildProfile = null;
 
 /**
  * Decode the stored keyframe JPEGs into raw pixel buffers, aligned to the
@@ -3001,16 +3009,7 @@ function getStitcher() {
        * next report into a measurement. The stage names come from the Python
        * side, so nothing here has to know what they will be.
        */
-      const stage = String(text || '').trim();
-      if (stage && stage !== buildStageTimes.current) {
-        const now = performance.now();
-        if (buildStageTimes.current) {
-          buildStageTimes.spent[buildStageTimes.current] =
-            (buildStageTimes.spent[buildStageTimes.current] || 0) + (now - buildStageTimes.startedAt);
-        }
-        buildStageTimes.current = stage;
-        buildStageTimes.startedAt = now;
-      }
+      buildProfile.enter(text);
     },
     onLog: (line, isStderr) => {
       const el = $('stitchLog');
@@ -3125,9 +3124,7 @@ async function buildPanorama() {
   await new Promise(r => requestAnimationFrame(() => r()));
 
   const t0 = performance.now();
-  buildStageTimes.current = null;
-  buildStageTimes.startedAt = t0;
-  buildStageTimes.spent = {};
+  buildProfile.start(kfs.length);
   try {
     const photos = await loadKeyframeBlobs({ waitForPending: true });
     const withPhoto = kfs.filter(kf => photos.has(kf.index)).length;
@@ -3193,19 +3190,14 @@ async function buildPanorama() {
       + `solved panorama, ${(report.render?.paintedFraction * 100 || 0).toFixed(0)}% of the panel `
       + `painted, ${(ms / 1000).toFixed(1)} s.`;
     surveyRates.recordBuild(report.frames, ms / 1000);
-    // Close the final stage and report the breakdown, worst first.
-    if (buildStageTimes.current) {
-      buildStageTimes.spent[buildStageTimes.current] =
-        (buildStageTimes.spent[buildStageTimes.current] || 0)
-        + (performance.now() - buildStageTimes.startedAt);
-      buildStageTimes.current = null;
-    }
-    const stageSec = Object.fromEntries(Object.entries(buildStageTimes.spent)
-      .sort((a, b) => b[1] - a[1])
-      .map(([k, v]) => [k, Number((v / 1000).toFixed(1))]));
+    // Close the profile and say where the time went, worst first.
+    lastBuildProfile = buildProfile.finish().snapshot();
+    const peak = lastBuildProfile.memory.peakHeapMb;
     log('info', `Build took ${(ms / 1000).toFixed(0)} s for ${report.frames} photographs `
-      + `(${(ms / 1000 / Math.max(1, report.frames)).toFixed(1)} s each). Time by stage, slowest first.`,
-      { totalSec: Number((ms / 1000).toFixed(1)), frames: report.frames, stageSec });
+      + `(${lastBuildProfile.secPerFrame} s each). Slowest stage: `
+      + `${lastBuildProfile.slowestStage} at ${lastBuildProfile.slowestStagePercent}% of the build`
+      + `${peak === null ? '' : `; peak heap ${peak} MB`}.`,
+      lastBuildProfile);
     /*
      * LEARN THE LENS FROM THE SOLVE.
      *
@@ -3768,6 +3760,10 @@ function captureArchivePayload(photos, { includeCoverageImage = null } = {}) {
     stitchReport: state.pano?.report || null,
     stitchLog: state.pano?.log || null,
     stitchOptions: state.pano?.options || null,
+    // Where the build spent its time and what it cost this device. Null until a
+    // panorama has been built in this session, which is honest: a capture
+    // exported before the build has nothing to say about the build.
+    buildProfile: lastBuildProfile,
     debugText: buildDebugBundle(),
     logText: L.dump()
   };

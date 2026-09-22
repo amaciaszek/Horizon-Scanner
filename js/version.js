@@ -13,16 +13,16 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.26.0';
-export const BUILD_DATE = '2026-09-03';
+export const VERSION = '0.27.0';
+export const BUILD_DATE = '2026-09-22';
 
 /**
- * The dot waits for looks, not for glimpses.
+ * The build says where its time went.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'A wide photograph credited every bearing it could see, and the count of independent looks was ticked by the very edge of the picture as hard as by the middle. So columns finished without anyone pointing at them: on the last capture, 83 of 180 were marked complete with zero photographs aimed at them, and the dot moved on regardless. A look now has to land near the middle of the frame to count. And at the end of a lap, when a few stragglers are left scattered round the ring, the dot turns round for the nearest one instead of walking most of a circle to reach the next in sweep order.';
+  'Builds now record how long each stage took, how much memory they used, and what the device is, and all of it goes into the debug archive so two devices can be compared instead of argued about. The first run to do this found 81 percent of a 38-minute build was rendering — choosing seams and painting — where the only previous estimate in the code assumed rendering was 6 percent. That estimate has been replaced with the measurement.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {
