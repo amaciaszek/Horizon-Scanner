@@ -126,5 +126,74 @@ section('The environment answers whether threads are even possible');
     || typeof crossOriginIsolated === 'boolean');
 }
 
+section('A build the browser suspended says so, instead of claiming a time');
+
+{
+  /*
+   * MEASURED, 2026-09-22. The Pixel handed 330 photographs to the stitcher at
+   * 22:10:33 and logged nothing until the export fifty-one minutes later, whose
+   * first line was "the database connection is closing" — a page the browser
+   * had frozen or discarded. Chrome on Android suspends backgrounded tabs. The
+   * operator switched apps; the build did not slow down, it stopped.
+   */
+  const now = fakeClock();
+  const p = new BuildProfile({ now, env: {} });
+  p.start(330);
+  p.enter('Matching overlapping photos');
+  now.advance(4000);
+  p.noteVisibility(true);          // the operator switches apps
+  now.advance(51 * 60 * 1000);     // fifty-one minutes of nothing
+  p.noteVisibility(false);
+  p.finish();
+
+  const s = p.snapshot();
+  check('the hidden time is recorded', s.interrupted.hiddenSec === 3060,
+    `${s.interrupted.hiddenSec} s hidden`);
+  check('and how many times it happened', s.interrupted.timesHidden === 1);
+  check('the verdict warns the elapsed time is not the work',
+    /not the work/.test(s.interrupted.verdict), s.interrupted.verdict);
+}
+
+section('The sampler doubles as a freeze detector, where heap figures do not exist');
+
+{
+  /*
+   * Safari has no performance.memory, so peak heap is null on exactly the
+   * device this most needed measuring. But samples are taken on a fixed
+   * interval, so a gap of minutes between consecutive samples means the timer
+   * did not fire — which is what a suspended tab looks like from the inside,
+   * and needs no API at all.
+   */
+  const now = fakeClock();
+  const p = new BuildProfile({ now, env: {} });
+  p.start(10);
+  p.enter('Choosing seams');
+  now.advance(2000); p.sample();
+  now.advance(2000); p.sample();
+  now.advance(600000); p.sample();      // the timer stopped firing for ten minutes
+  p.finish();
+  const s = p.snapshot();
+  check('the longest sampler gap is reported', s.interrupted.longestSamplerGapSec === 600,
+    `${s.interrupted.longestSamplerGapSec} s`);
+  check('and a gap that large is called a stall', s.interrupted.stalled === true);
+  check('even though no heap figure was ever available',
+    s.memory.available === false);
+}
+
+section('An uninterrupted build says so plainly');
+
+{
+  const now = fakeClock();
+  const p = new BuildProfile({ now, env: {} });
+  p.start(50);
+  p.enter('Choosing seams');
+  for (let i = 0; i < 5; i++) { now.advance(2000); p.sample(); }
+  p.finish();
+  const s = p.snapshot();
+  check('no hiding, no stall', s.interrupted.timesHidden === 0 && s.interrupted.stalled === false);
+  check('and the verdict says the number can be trusted',
+    /foreground/.test(s.interrupted.verdict), s.interrupted.verdict);
+}
+
 console.log(failures ? `\n${failures} FAILED` : '\nall build-profile checks passed');
 process.exitCode = failures ? 1 : 0;

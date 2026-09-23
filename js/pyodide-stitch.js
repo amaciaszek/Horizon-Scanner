@@ -16,23 +16,82 @@
 
 import { VERSION } from './version.js';
 
-/* Fraction of the wall clock each stage is worth on a typical capture, measured
- * on the 200-frame iPad set: matching dominates, the solve is second, rendering
- * is cheap. These only steer a bar, so being roughly right beats being exact. */
+/*
+ * WHAT EACH STAGE IS WORTH, MEASURED RATHER THAN GUESSED.
+ *
+ * These were hand-written on a 200-frame set with the note "matching dominates,
+ * the solve is second, rendering is cheap", and every part of that was wrong.
+ * The first build to time its own stages — 380 photographs, 2307 seconds —
+ * spent 42% choosing seams and 39% painting. Rendering is four fifths of a
+ * build, and the old table gave all of it the span 0.90 to 0.98.
+ *
+ * So the bar reached 90% and then did not move for twenty-five minutes, which
+ * is indistinguishable from a hang. That is the whole reason an operator asks
+ * whether the app is stuck.
+ *
+ * `share` is the fraction of the build this stage occupies. `key` ties a stage
+ * to the fine-grained progress the Python now emits, so the bar advances WITHIN
+ * a stage rather than only when one ends.
+ */
 const PHASES = [
-  { re: /^Loading /, at: 0.36, label: 'Reading the capture' },
-  { re: /^Detecting features/, at: 0.40, label: 'Finding features' },
-  { re: /^\s+features: /, at: 0.46, label: 'Features found' },
-  { re: /^Matching/, at: 0.48, label: 'Matching overlapping photos' },
-  { re: /^\s+pairs: /, at: 0.68, label: 'Overlaps matched' },
-  { re: /^\s+verified: /, at: 0.72, label: 'Overlaps verified' },
-  { re: /^Solving rotations/, at: 0.75, label: 'Solving every camera angle' },
-  { re: /^Pruning and re-solving/, at: 0.84, label: 'Discarding bad matches, solving again' },
-  { re: /^\s+perspective correction/, at: 0.88, label: 'Fitting the residual correction' },
-  { re: /^Rendering/, at: 0.90, label: 'Painting the panorama' },
-  { re: /^\s+finding seams/, at: 0.93, label: 'Choosing seams' },
-  { re: /^\s+painted /, at: 0.98, label: 'Panorama painted' }
+  { re: /^Loading /, label: 'Reading the capture', share: 0.02, key: null },
+  { re: /^Detecting features/, label: 'Finding features', share: 0.03, key: 'features' },
+  { re: /^Matching/, label: 'Matching overlapping photos', share: 0.11, key: 'matching' },
+  { re: /^\s+verified: /, label: 'Overlaps verified', share: 0.01, key: null },
+  { re: /^Solving rotations/, label: 'Solving every camera angle', share: 0.03, key: null },
+  { re: /^Pruning and re-solving/, label: 'Discarding bad matches, solving again', share: 0.03, key: null },
+  { re: /^\s+perspective correction/, label: 'Fitting the residual correction', share: 0.01, key: null },
+  { re: /^Rendering/, label: 'Preparing to paint', share: 0.01, key: null },
+  { re: /^\s+finding seams/, label: 'Choosing seams', share: 0.36, key: 'seams' },
+  { re: /^\s+painted /, label: 'Painting the panorama', share: 0.39, key: 'painting' }
 ];
+
+/** Where each stage starts on the overall bar, from the shares above. */
+const PHASE_START = (() => {
+  let at = 0;
+  return PHASES.map(p => { const start = at; at += p.share; return start; });
+})();
+
+/** Lines the Python emits for sub-stage progress: `@@PROGRESS|stage|done|total`. */
+const PROGRESS_RE = /^@@PROGRESS\|([a-z]+)\|(\d+)\|(\d+)$/;
+
+/**
+ * A remaining-time estimate for one stage, from the rate it is actually
+ * achieving.
+ *
+ * Measured, never tabulated: the same rule `js/build-progress.js` was written
+ * with and for the same reason. A phone and a tablet differ by four times on
+ * this work, so any constant would be wrong on one of them.
+ *
+ * Smoothed, because an estimate that jitters between four and eleven minutes
+ * reads as broken even when its average is right.
+ */
+class StageEta {
+  constructor() { this.reset(); }
+
+  reset() {
+    this.startedAt = null;
+    this.smoothedSec = null;
+    this.lastDone = 0;
+  }
+
+  /** Returns seconds remaining in this stage, or null while it is too early. */
+  update(done, total, nowMs) {
+    if (this.startedAt === null || done < this.lastDone) {
+      this.startedAt = nowMs;
+      this.smoothedSec = null;
+    }
+    this.lastDone = done;
+    const elapsed = (nowMs - this.startedAt) / 1000;
+    // Four units and a second of wall clock before quoting a rate: anything
+    // less is measuring the first iteration's warm-up.
+    if (done < 4 || elapsed < 1 || total <= 0) return this.smoothedSec;
+    const remaining = elapsed / done * Math.max(0, total - done);
+    this.smoothedSec = this.smoothedSec === null
+      ? remaining : this.smoothedSec * 0.7 + remaining * 0.3;
+    return this.smoothedSec;
+  }
+}
 
 export class PyodideStitcher {
   constructor({ onStatus = null, onLog = null } = {}) {
@@ -43,6 +102,8 @@ export class PyodideStitcher {
     this.ready = false;
     this.runtimeVersion = null;
     this.logLines = [];
+    this.phase = -1;
+    this.eta = new StageEta();
   }
 
   /** True once the runtime is resident and a rebuild will start immediately. */
@@ -62,10 +123,12 @@ export class PyodideStitcher {
     if (data.type === 'status') {
       this.onStatus?.({ text: data.text, fraction: data.progress ?? null });
     } else if (data.type === 'log') {
+      const step = PROGRESS_RE.exec(data.line);
+      if (step) { this._step(step[1], Number(step[2]), Number(step[3])); return; }
       this.logLines.push(data.line);
       this.onLog?.(data.line, !!data.stderr);
-      const hit = PHASES.find(p => p.re.test(data.line));
-      if (hit) this.onStatus?.({ text: hit.label, fraction: hit.at, detail: data.line.trim() });
+      const index = PHASES.findIndex(p => p.re.test(data.line));
+      if (index >= 0) this._enterPhase(index, data.line.trim());
     } else if (data.type === 'ready') {
       this.ready = true;
       this.runtimeVersion = data.version;
@@ -82,6 +145,69 @@ export class PyodideStitcher {
     } else if (data.type === 'error') {
       this._fail(Object.assign(new Error(data.message), { pythonStack: data.stack }));
     }
+  }
+
+  /** A named stage began. */
+  _enterPhase(index, detail) {
+    if (index === this.phase) return;
+    this.phase = index;
+    this.eta.reset();
+    this._emit(0, detail);
+  }
+
+  /** One unit of work inside the current stage finished. */
+  _step(key, done, total) {
+    const index = PHASES.findIndex(p => p.key === key);
+    if (index < 0) return;
+    if (index !== this.phase) { this.phase = index; this.eta.reset(); }
+    const within = total > 0 ? Math.min(1, done / total) : 0;
+    this._emit(within, `${done} of ${total}`, done, total);
+  }
+
+  /**
+   * Publish where the build is.
+   *
+   * The fraction is the stage's own progress placed inside the stage's measured
+   * share of the whole, so the bar moves continuously rather than in ten jumps.
+   * It is deliberately NOT clamped to monotonic: a stage that reruns — the
+   * solve does, after pruning — should be honest about going back rather than
+   * freezing at a high-water mark.
+   */
+  _emit(within, detail, done = null, total = null) {
+    const p = PHASES[this.phase];
+    if (!p) return;
+    const fraction = PHASE_START[this.phase] + p.share * within;
+    const stageRemainingSec = done !== null
+      ? this.eta.update(done, total, performance.now()) : null;
+    /*
+     * The whole build's estimate, from the rate THIS stage is achieving.
+     *
+     * The stage covers `share` of the bar and has `1 - within` of its own span
+     * left, so its observed seconds buy a known number of bar-units. Everything
+     * not yet started is costed at that same rate, scaled by the measured
+     * shares — which is the only honest projection across work that has not
+     * begun: this device's own throughput, in proportions measured over real
+     * builds rather than assumed.
+     */
+    let remainingSec = null;
+    if (Number.isFinite(stageRemainingSec) && within < 1) {
+      const barUnitsLeftInStage = p.share * (1 - within);
+      if (barUnitsLeftInStage > 1e-9) {
+        const secPerBarUnit = stageRemainingSec / barUnitsLeftInStage;
+        remainingSec = secPerBarUnit * Math.max(0, 1 - fraction);
+      }
+    }
+    this.onStatus?.({
+      text: p.label,
+      fraction,
+      detail,
+      stage: p.key || p.label,
+      stageFraction: within,
+      stageRemainingSec,
+      remainingSec,
+      done,
+      total
+    });
   }
 
   _fail(error) {

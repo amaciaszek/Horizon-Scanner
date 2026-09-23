@@ -437,6 +437,21 @@ details[open] > *:not(summary) { margin-top: 14px; }
 }
 .build-progress-label #buildEta { color: var(--signal); white-space: nowrap; }
 .build-progress .directive-bar { margin-top: 4px; }
+/* The percentage is the thing the eye returns to, so it gets a fixed width and
+   tabular figures: a readout whose digits shuffle sideways as they change is
+   harder to read as "moving" than one that ticks in place. */
+.build-percent {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+  color: var(--signal);
+  margin-left: auto;
+  padding: 0 8px;
+}
+.build-substage { margin-top: 7px; opacity: .72; font-size: 11px; }
+.build-substage #buildStageEta { color: var(--signal); white-space: nowrap; }
+/* The stage bar is quieter than the overall one: it is a liveness indicator,
+   not the headline. */
+.build-progress #buildStageBar { background: var(--rule-strong, var(--signal)); opacity: .55; }
 #buildNote { margin-top: 6px; }
 
 /* ------------------------------------------------------------- stitch verdict

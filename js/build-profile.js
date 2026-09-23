@@ -109,6 +109,11 @@ export class BuildProfile {
     this.startedAt = this.nowFn();
     this.stage = null;
     this.stageStartedAt = this.startedAt;
+    /** Milliseconds the page spent hidden while the build ran, and how many
+     *  times it went away. See noteVisibility below. */
+    this.hiddenMs = 0;
+    this.hiddenSince = null;
+    this.hiddenCount = 0;
     /** stage label -> milliseconds spent with that label showing. */
     this.spent = {};
     /** The order labels first appeared, which is the only record of sequence. */
@@ -129,6 +134,34 @@ export class BuildProfile {
       this._timer = setInterval(() => this.sample(), SAMPLE_INTERVAL_MS);
     }
     return this;
+  }
+
+  /**
+   * The page went away, or came back.
+   *
+   * MEASURED, 2026-09-22, and this is the whole explanation for a build that
+   * "never completed". The Pixel handed 330 photographs to the stitcher at
+   * 22:10:33 and then logged NOTHING for fifty-one minutes, until the export at
+   * 23:01:33 — whose first line was "Could not read stored keyframe thumbnails:
+   * the database connection is closing", which is what a page says when the
+   * browser has frozen or discarded it.
+   *
+   * Chrome on Android suspends a backgrounded tab: timers are clamped, workers
+   * are frozen, and under memory pressure the page is discarded outright. The
+   * operator switched apps. The build did not run slowly; it stopped.
+   *
+   * Recording this turns "Android is ten times slower" — which was chased for
+   * weeks through photograph sizes, feature counts and SIFT thresholds, all of
+   * them dead ends — into a number the archive simply states.
+   */
+  noteVisibility(hidden, atMs = null) {
+    const at = Number.isFinite(atMs) ? atMs : this.nowFn();
+    if (hidden) {
+      if (this.hiddenSince === null) { this.hiddenSince = at; this.hiddenCount++; }
+    } else if (this.hiddenSince !== null) {
+      this.hiddenMs += at - this.hiddenSince;
+      this.hiddenSince = null;
+    }
   }
 
   /** One memory reading, tagged with the stage it happened in. */
@@ -170,6 +203,7 @@ export class BuildProfile {
       this.spent[this.stage] = (this.spent[this.stage] || 0) + (at - this.stageStartedAt);
       this.stage = null;
     }
+    this.noteVisibility(false, at);
     this.totalMs = at - this.startedAt;
     if (this._timer !== null && typeof clearInterval === 'function') {
       clearInterval(this._timer);
@@ -194,6 +228,21 @@ export class BuildProfile {
   snapshot() {
     const heaps = this.samples.map(s => s.usedHeapMb).filter(Number.isFinite);
     const stages = this.stagesBySlowest();
+    /*
+     * THE SAMPLER IS ALSO THE FREEZE DETECTOR.
+     *
+     * Samples are taken on a two-second interval, so the gap between
+     * consecutive samples is normally two seconds. A gap of minutes means the
+     * timer did not fire — which is precisely what a suspended tab looks like
+     * from inside, and needs no API that Safari lacks. It catches the case the
+     * heap figures cannot, on the devices where there are no heap figures.
+     */
+    let longestGapSec = 0;
+    for (let i = 1; i < this.samples.length; i++) {
+      const gap = this.samples[i].atSec - this.samples[i - 1].atSec;
+      if (gap > longestGapSec) longestGapSec = gap;
+    }
+    const stalled = longestGapSec > SAMPLE_INTERVAL_MS / 1000 * 5;
     return {
       totalSec: Number((this.totalMs / 1000).toFixed(1)),
       frames: this.frames,
@@ -205,6 +254,23 @@ export class BuildProfile {
       slowestStagePercent: stages[0]?.percent ?? null,
       stages,
       stageOrder: this.order,
+      /**
+       * Whether the browser let this build run. A hidden page, a long sampler
+       * gap, or both, mean the elapsed time above is not a measure of how hard
+       * the work was — it is a measure of how long the page was asleep.
+       */
+      interrupted: {
+        hiddenSec: Number((this.hiddenMs / 1000).toFixed(1)),
+        timesHidden: this.hiddenCount,
+        longestSamplerGapSec: Number(longestGapSec.toFixed(1)),
+        expectedSamplerGapSec: SAMPLE_INTERVAL_MS / 1000,
+        stalled,
+        /** The one sentence a reader needs before trusting `totalSec`. */
+        verdict: this.hiddenCount === 0 && !stalled
+          ? 'ran in the foreground throughout'
+          : 'the page was hidden or suspended during this build; the elapsed '
+            + 'time measures the interruption, not the work'
+      },
       memory: {
         peakHeapMb: heaps.length ? Math.max(...heaps) : null,
         startHeapMb: heaps.length ? heaps[0] : null,

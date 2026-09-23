@@ -118,6 +118,12 @@ async function runCapture(message) {
 import gc, shutil, sys
 from pathlib import Path
 
+# Progress goes straight to stdout, which this worker already forwards line by
+# line. A build runs for tens of minutes and the operator could previously see
+# only a handful of milestones, the last of which arrived with four fifths of
+# the work still to do.
+stitch_lab.set_progress_sink(lambda line: print(line, flush=True))
+
 out = Path('/tmp/stitch-out')
 if out.exists():
     shutil.rmtree(out)

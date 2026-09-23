@@ -28,6 +28,20 @@ failure that nothing else could have caught:
 | `serpentine-hold.test.mjs` | A column pinning the dot forever, and the opposite — the dot abandoning a column it should have waited for |
 | `import-map.test.mjs` | A version bump that busts `main.js` and nothing it imports, so the device runs a mixture of builds |
 
+One test is Python rather than Node, because what it checks lives in the
+stitcher:
+
+```bash
+.venv-stitch/Scripts/python.exe tests/seam-window.test.py
+```
+
+`seam-window.test.py` asserts that enlarging a crop of the seam mask is
+bit-identical to cropping an enlargement, over six hundred random slices
+including the ones that wrap the back of the panorama. That optimisation removes
+about 97% of the work in the stage that cost 895 s of a 2307 s build, and it is
+exactly the kind of change that looks harmless and shifts every frame edge by a
+pixel, so it is asserted rather than eyeballed.
+
 `tools/replay-guidance.mjs` is not a test but belongs beside them: it replays a
 real capture's recorded poses through the current guidance and prints what the
 dot would have done differently. A synthetic operator does what the test author

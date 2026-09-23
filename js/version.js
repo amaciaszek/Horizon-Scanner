@@ -13,16 +13,16 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.27.0';
-export const BUILD_DATE = '2026-09-22';
+export const VERSION = '0.29.0';
+export const BUILD_DATE = '2026-09-23';
 
 /**
- * The build says where its time went.
+ * The stitcher stops doing work it throws away.
  * Kept short deliberately: it is read on a phone, in daylight, by someone who
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'Builds now record how long each stage took, how much memory they used, and what the device is, and all of it goes into the debug archive so two devices can be compared instead of argued about. The first run to do this found 81 percent of a 38-minute build was rendering — choosing seams and painting — where the only previous estimate in the code assumed rendering was 6 percent. That estimate has been replaced with the measurement.';
+  'The seam finder was told every photograph covered the whole sky, so it compared all 57,000 possible pairs instead of the 5,000 that really overlap, on tiles that were mostly black padding. And every frame enlarged its seam mask to the full panorama before keeping a fortieth of it. Both are fixed: a 340-photograph build that had not finished its seam stage in twenty-two minutes now completes end to end in thirteen. The progress bar is rebuilt on measured stage weights, reports to three decimals so it visibly ticks, and carries a live estimate for the step and for the whole build.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {

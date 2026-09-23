@@ -306,7 +306,8 @@ def detect_features(frames, sky_margin_rows=3, max_features=3000,
     else:
         raise SystemExit(f'unknown detector {detector!r}')
     total = 0
-    for f in frames:
+    for _frame_n, f in enumerate(frames):
+        progress('features', _frame_n, len(frames))
         gray = cv2.cvtColor(f.image, cv2.COLOR_BGR2GRAY)
         mask = None
         if f.boundary is not None and len(f.boundary):
@@ -472,7 +473,8 @@ def match_pairs(frames, max_sep_scale=0.85, min_sep=1.5, max_degree=10,
     pairs = []
     considered = 0
     compared = 0                       # descriptor comparisons actually performed
-    for sep, i, j in candidates:
+    for _cand_n, (sep, i, j) in enumerate(candidates):
+        progress('matching', _cand_n, len(candidates))
         if degree[i] >= max_degree and degree[j] >= max_degree:
             continue
         fi, fj = frames[i], frames[j]
@@ -1252,6 +1254,63 @@ def main():
 # Rendering
 # --------------------------------------------------------------------------
 
+def _seam_window(seam_mask, sub, row0, row1, cols, width, height, px_per_deg):
+    """
+    The piece of a low-resolution seam mask this frame's slice needs, enlarged.
+
+    MEASURED, 2026-09-22. The caller used to enlarge the mask to the FULL
+    panorama — 3240 x 891 on a 380-frame build — and then immediately keep only
+    `sub`, about a fortieth of it, once per frame in the stage that cost 895 s.
+
+    Enlarging a crop is not automatically the same picture as cropping an
+    enlargement: bilinear interpolation reads a source pixel either side, so a
+    crop taken flush to the edge interpolates against the boundary instead of
+    against its true neighbours. Two low-resolution pixels of margin, trimmed
+    after the resize, make every kept pixel see the neighbourhood it would have
+    seen. That equality is asserted over four hundred random slices in
+    `tests/seam-window.test.py`, not assumed.
+
+    Rows are always cropped. Columns are cropped only when the frame does not
+    wrap the back of the panorama: a wrapped run is not contiguous in the
+    source, and gathering it modularly would interpolate ACROSS the wrap where
+    the old full-width resize clamped at the panel edge. That is arguably the
+    better picture, but it is a different one, and this change is meant to be
+    faster rather than different.
+    """
+    sh, sw = seam_mask.shape[:2]
+    scale_y = sh / float(height)
+    scale_x = sw / float(width)
+    margin = 2
+    rows_out = row1 - row0
+
+    lo_r0 = max(0, int(math.floor(row0 * scale_y)) - margin)
+    lo_r1 = min(sh, int(math.ceil(row1 * scale_y)) + margin)
+    if lo_r1 <= lo_r0 or rows_out <= 0 or len(cols) == 0:
+        return np.zeros((max(0, rows_out), len(cols)), np.float64)
+
+    band_h = int(round((lo_r1 - lo_r0) / scale_y))
+    r_off = int(round(row0 - lo_r0 / scale_y))
+
+    # Contiguous and inside the panel? Then the columns can be cropped too.
+    wraps = bool(len(cols) > 1 and np.any(np.diff(cols.astype(np.int64)) != 1))
+    if not wraps:
+        lo_c0 = max(0, int(math.floor(int(cols[0]) * scale_x)) - margin)
+        lo_c1 = min(sw, int(math.ceil((int(cols[-1]) + 1) * scale_x)) + margin)
+        tile_w = int(round((lo_c1 - lo_c0) / scale_x))
+        c_off = int(round(int(cols[0]) - lo_c0 / scale_x))
+        big = cv2.resize(seam_mask[lo_r0:lo_r1, lo_c0:lo_c1], (tile_w, band_h),
+                         interpolation=cv2.INTER_LINEAR)
+        window = big[r_off:r_off + rows_out, c_off:c_off + len(cols)]
+        if window.shape == (rows_out, len(cols)):
+            return window.astype(np.float64) / 255.0
+
+    # Wrapped, or a rounding edge case: enlarge the row band at full width and
+    # gather the columns by index, exactly as the old code did.
+    band = cv2.resize(seam_mask[lo_r0:lo_r1], (width, band_h),
+                      interpolation=cv2.INTER_LINEAR)
+    return band[r_off:r_off + rows_out][:, cols].astype(np.float64) / 255.0
+
+
 def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None,
                     blend='best', feather_power=8.0, render_warps=None, log=print):
     """
@@ -1299,6 +1358,7 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None
     alt_axis = alt_max - (np.arange(height) + 0.5) / px_per_deg
 
     for n, f in enumerate(frames):
+        progress('painting', n, len(frames))
         img = f.image
         ih, iw = img.shape[:2]
         Rt = R[n].T
@@ -1356,9 +1416,22 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None
             # sphere, then enlarged with a narrow interpolation band. Almost
             # every output pixel therefore comes from one photograph; only
             # the immediate seam is blended to hide an exposure step.
-            seam = cv2.resize(seam_masks[n], (width, height),
-                              interpolation=cv2.INTER_LINEAR)
-            seam_w = seam[sub].astype(np.float64) / 255.0
+            #
+            # ENLARGE ONLY THE PIECE THIS FRAME USES. This resized the mask to
+            # the FULL panorama — 3240 x 891 on a 380-frame build — and then
+            # immediately threw away everything outside `sub`, which is about a
+            # fortieth of it. Three hundred and fifty-seven times per build, in
+            # the stage that cost 895 s.
+            #
+            # The crop is taken with a margin of two low-resolution pixels and
+            # trimmed after resizing, so every output pixel still sees the same
+            # interpolation neighbourhood it saw before: INTER_LINEAR reads at
+            # most one source pixel either side, and two is comfortably more
+            # than one. Without the margin the frame's own edge rows would
+            # interpolate against the crop boundary instead of their true
+            # neighbours, which is a visible seam, not a rounding difference.
+            seam_w = _seam_window(seam_masks[n], sub, row0, row1, cols,
+                                  width, height, px_per_deg)
             feather_w = np.clip((1 - np.abs(u)) * (1 - np.abs(v)), 0, 1) ** 2
 
             # Geometry below the recorded skyline gets a seam so a roof or
@@ -1426,26 +1499,140 @@ def render_equirect(frames, R, scale, px_per_deg=8.0, alt_min=None, alt_max=None
     return out, stats, filled
 
 
+# ---------------------------------------------------------------- progress
+#
+# A build takes tens of minutes and the only thing the operator could see was a
+# bar driven by milestones in this file's log, with hand-written weights that
+# put all of rendering between 0.90 and 0.98. Rendering is four fifths of a
+# build, so the bar reached 90% and then sat there, motionless, for twenty-five
+# minutes — which is indistinguishable from a hang and is exactly what the
+# operator reported.
+#
+# These lines are machine-readable on purpose. `js/pyodide-stitch.js` parses
+# them; a human reading the log sees them too, which is no worse than the
+# progress prints they replace.
+PROGRESS_PREFIX = '@@PROGRESS'
+
+_progress_sink = None
+
+
+def set_progress_sink(fn):
+    """Where progress lines go. `None` silences them."""
+    global _progress_sink
+    _progress_sink = fn
+
+
+def progress(stage, done, total):
+    """One step of a named stage. Cheap enough to call per frame and per pair."""
+    if _progress_sink is None:
+        return
+    try:
+        _progress_sink(f'{PROGRESS_PREFIX}|{stage}|{int(done)}|{int(total)}')
+    except Exception:
+        # Progress reporting must never be the reason a build fails.
+        pass
+
+
+def _seam_roi(frame, rotation, scale, alt_min, alt_max, seam_px_per_deg,
+              width, height, margin=2):
+    """
+    The box on the seam panel this frame could possibly reach.
+
+    Same reasoning as the per-frame slice in `render_equirect`: a frame with a
+    40-degree field covers about a ninth of the azimuth and a third of the
+    altitude range, so computing it against the whole panel is two orders of
+    magnitude of wasted arithmetic. Returns (x0, y0, w, h) with x0 possibly
+    negative, meaning the box wraps the back of the panorama.
+    """
+    axis = rotation @ np.array([0.0, 0.0, -1.0])
+    c_az = math.degrees(math.atan2(axis[0], axis[1])) % 360.0
+    c_alt = math.degrees(math.asin(max(-1.0, min(1.0, axis[2]))))
+    reach = math.degrees(math.atan(math.hypot(frame.tan_h, frame.tan_v) * scale)) + 1.0
+
+    y0 = int(max(0, math.floor((alt_max - (c_alt + reach)) * seam_px_per_deg))) - margin
+    y1 = int(min(height, math.ceil((alt_max - (c_alt - reach)) * seam_px_per_deg))) + margin
+    y0 = max(0, y0)
+    y1 = min(height, y1)
+
+    # Azimuth spans more degrees the higher the frame looks, because a degree of
+    # bearing is a smaller angle up there. Guard the pole, where it is all of it.
+    cos_alt = math.cos(math.radians(min(85.0, abs(c_alt))))
+    span = 180.0 if cos_alt < 1e-3 else min(180.0, reach / cos_alt)
+    half_cols = int(math.ceil(span * seam_px_per_deg)) + margin
+    centre_col = int(round(c_az * seam_px_per_deg))
+    x0 = centre_col - half_cols
+    w = min(width, 2 * half_cols + 1)
+    return x0, y0, w, max(0, y1 - y0)
+
+
 def find_seam_masks(frames, R, scale, alt_min=-12.0, alt_max=62.0,
                     seam_px_per_deg=1.0, render_warps=None, log=print):
-    """Choose low-disagreement ownership regions before the full render."""
+    """
+    Choose low-disagreement ownership regions before the full render.
+
+    MEASURED, 2026-09-22, and rewritten because of it. A 380-frame build spent
+    976.9 s here — 42% of the whole build, against a prior estimate that put all
+    of rendering at 6%. The cause was not the seam algorithm. It was that every
+    frame was warped across the ENTIRE panel and then handed to OpenCV with
+
+        corners = [(0, 0)] * len(images)
+
+    which tells `detail_DpSeamFinder` that all 357 images are full-panel and
+    therefore that every one of the 63,546 possible pairs overlaps completely.
+    The real overlap graph has about 5,000 pairs, each covering roughly a
+    fortieth of the panel. The seam finder was doing on the order of five
+    hundred times the pairwise work it needed to, on images that were almost
+    entirely black padding.
+
+    Each frame now carries its own region of interest and a real corner, which
+    is what the `cv2.detail` API is built around. Frames that wrap the back of
+    the panorama keep full width — there are only a handful, and a wrapped tile
+    cannot be expressed as one rectangle.
+    """
     width = int(round(360.0 * seam_px_per_deg))
     height = int(round((alt_max - alt_min) * seam_px_per_deg))
-    az = np.radians((np.arange(width) + 0.5) / seam_px_per_deg)[None, :]
-    alt = np.radians(alt_max - (np.arange(height) + 0.5) / seam_px_per_deg)[:, None]
-    ca = np.cos(alt)
-    world = np.stack([
-        np.broadcast_to(np.sin(az) * ca, (height, width)),
-        np.broadcast_to(np.cos(az) * ca, (height, width)),
-        np.broadcast_to(np.sin(alt) * np.ones_like(az), (height, width)),
-    ], axis=-1)
+    az_axis = np.radians((np.arange(width) + 0.5) / seam_px_per_deg)
+    alt_axis = np.radians(alt_max - (np.arange(height) + 0.5) / seam_px_per_deg)
 
     images = []
     masks = []
+    corners = []
     if render_warps is None:
         render_warps = [None for _ in frames]
+    full_width_frames = 0
     for n, frame in enumerate(frames):
+        progress('seams', n, len(frames))
         ih, iw = frame.image.shape[:2]
+        x0, y0, w, h = _seam_roi(frame, R[n], scale, alt_min, alt_max,
+                                 seam_px_per_deg, width, height)
+        if h <= 0 or w <= 0:
+            images.append(np.zeros((1, 1, 3), np.uint8))
+            masks.append(np.zeros((1, 1), np.uint8))
+            corners.append((0, 0))
+            continue
+        # A tile is a RECTANGLE on the panel, so a run that leaves either end of
+        # the panel cannot be one: its columns are contiguous only modulo the
+        # width, and a corner of -7 would tell the seam finder this frame sits
+        # off the edge of the world. Those frames keep full width, which is
+        # correct and costs nothing worth saving — at a 40-degree field only a
+        # handful of a few hundred frames touch the back of the panorama.
+        if w >= width or x0 < 0 or x0 + w > width:
+            full_width_frames += 1
+            cols = np.arange(width)
+            x0 = 0
+            w = width
+        else:
+            cols = np.arange(x0, x0 + w)
+
+        az = az_axis[cols][None, :]
+        alt = alt_axis[y0:y0 + h][:, None]
+        ca = np.cos(alt)
+        world = np.stack([
+            np.broadcast_to(np.sin(az) * ca, (h, w)),
+            np.broadcast_to(np.cos(az) * ca, (h, w)),
+            np.broadcast_to(np.sin(alt) * np.ones_like(az), (h, w)),
+        ], axis=-1)
+
         cam = world @ R[n]
         depth = -cam[..., 2]
         ok = depth > 1e-6
@@ -1466,8 +1653,12 @@ def find_seam_masks(frames, R, scale, alt_min=-12.0, alt_max=62.0,
         warped[~ok] = 0
         images.append(warped)
         masks.append(mask)
+        # The seam finder works in panel coordinates, so a wrapped tile is
+        # anchored at its unwrapped start; only its columns were taken modulo.
+        corners.append((int(x0), int(y0)))
 
-    corners = [(0, 0)] * len(images)
+    if full_width_frames:
+        log(f'  {full_width_frames} frame(s) wrap the panorama seam and keep full width')
     compensator = cv2.detail_ExposureCompensator.createDefault(
         cv2.detail.ExposureCompensator_GAIN)
     compensator.feed(corners, images, masks)
@@ -1487,7 +1678,29 @@ def find_seam_masks(frames, R, scale, alt_min=-12.0, alt_max=62.0,
         masks = list(found)
     masks = [np.asarray(mask.get() if hasattr(mask, 'get') else mask, dtype=np.uint8)
              for mask in masks]
-    return masks, scalar_gains
+
+    # Put each region of interest back where it belongs on the panel.
+    #
+    # The seam finder works on tiles, which is the whole point of the change
+    # above, but every caller downstream wants a panel-shaped mask indexed in
+    # panel coordinates. Reassembling here keeps that contract exactly as it
+    # was, and costs nothing worth measuring: the panel is 360 x 99 and this is
+    # one memory copy per frame against the hundreds of millions of pixel
+    # operations the tiling just removed.
+    full = []
+    for n, mask in enumerate(masks):
+        panel = np.zeros((height, width), np.uint8)
+        x0, y0 = corners[n]
+        h, w = mask.shape[:2]
+        if h and w and y0 < height:
+            rows = slice(y0, min(height, y0 + h))
+            cols = (np.arange(x0, x0 + w)) % width
+            # `panel[slice, 1-D]` is (rows, cols); adding an axis to `cols`
+            # makes it (rows, 1, cols) and will not broadcast against the tile.
+            panel[rows, cols] = mask[:rows.stop - rows.start, :len(cols)]
+        full.append(panel)
+
+    return full, scalar_gains
 
 
 if __name__ == '__main__':

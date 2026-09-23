@@ -168,6 +168,31 @@ const PROCESS_INTERVAL_MS = 110;
 const RENDER_INTERVAL_MS = 55;
 const VISUAL_YAW_MAX_ELEVATION = 65;
 const ELEVATION_WARN_DEG = 70;
+/**
+ * Below this mean frame brightness the picture is not a picture.
+ *
+ * LOWERED FROM 26, MEASURED 2026-09-22. `tooDark` does not merely discount a
+ * frame — it sets `frameStatus`, which refuses the keyframe outright and earns
+ * zero coverage. At 26 that is far too eager at dusk, which is when this survey
+ * is most often run: the iPad capture of 2026-09-21 refused **425 frames** for
+ * darkness, its single largest quality rejection, against a scene whose fifth
+ * percentile brightness was 25.6 — i.e. the threshold sat almost exactly on the
+ * middle of the distribution it was judging.
+ *
+ * The same scene on the Pixel, whose camera lifts shadows harder, had a minimum
+ * brightness of 47 and refused none at all. A gate that rejects a quarter of
+ * one device's evening and none of another's is measuring the camera's tone
+ * curve, not the light.
+ *
+ * 12 is where a frame stops containing a resolvable skyline at all. Between 12
+ * and 26 the picture is dim but real: SIFT matches it perfectly well, so it is
+ * worth photographing, and its skyline trace — the thing darkness actually
+ * threatens — is already judged on its own merits by `minSkylineConfidence` in
+ * `js/coverage.js`. That ramp is the right place for "dim", and this constant
+ * is the right place for "black".
+ */
+const TOO_DARK_LUMA = 12;
+
 const ELEVATION_HARD_LIMIT_DEG = 78;
 
 /* ------------------------------------------------------------------ helpers */
@@ -661,7 +686,7 @@ async function processFrame() {
       }
       state.frameStatus = Math.abs(att.elevation) > ELEVATION_HARD_LIMIT_DEG ? 'tooHigh'
       : state.trackingLost ? 'trackingLost'
-      : (state.sceneLuma !== null && state.sceneLuma < 26) ? 'tooDark'
+      : (state.sceneLuma !== null && state.sceneLuma < TOO_DARK_LUMA) ? 'tooDark'
         : seg.noSky ? 'noSky'
         : seg.allSky ? 'allSky'
           : (clippedTop / seg.flags.length > 0.22) ? 'clippedTop' : 'ok';
@@ -2880,6 +2905,77 @@ let panoBuilt = false;
 const buildProfile = new BuildProfile();
 let lastBuildProfile = null;
 
+/*
+ * KEEP THE PAGE ALIVE WHILE IT BUILDS.
+ *
+ * MEASURED, 2026-09-22. The Pixel handed 330 photographs to the stitcher at
+ * 22:10:33 and logged nothing at all until the export fifty-one minutes later,
+ * whose first line was "the database connection is closing" — a page that has
+ * been frozen or discarded. Chrome on Android suspends backgrounded tabs:
+ * timers clamped, workers frozen, and the whole page thrown away under memory
+ * pressure. The operator switched apps and the build did not slow down, it
+ * stopped.
+ *
+ * A screen wake lock stops the most common route into that state, which is the
+ * screen turning itself off. It cannot stop a deliberate app switch — nothing
+ * can, from inside a web page — so the build also WATCHES for the page being
+ * hidden, records it, and says so afterwards rather than presenting a
+ * fifty-one minute nap as a build time.
+ */
+let wakeLock = null;
+/** True only while a panorama build is in flight. */
+let buildRunning = false;
+
+/**
+ * Seconds as a person would say them.
+ *
+ * Never "0s" while work remains, and coarser the further out it is: the
+ * difference between 23 and 24 minutes is not information, and quoting it only
+ * invites the reader to notice the number was wrong.
+ */
+function formatEta(seconds) {
+  const s = Math.max(0, Number(seconds) || 0);
+  if (s < 45) return `${Math.max(1, Math.round(s))}s`;
+  const m = s / 60;
+  if (m < 10) return `${Math.round(m)}m`;
+  return `${Math.round(m / 5) * 5}m`;
+}
+
+async function acquireWakeLock(why) {
+  if (!('wakeLock' in navigator)) return false;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    // The browser drops the lock whenever the page is hidden, so it has to be
+    // taken again on the way back rather than assumed to persist.
+    wakeLock.addEventListener?.('release', () => { wakeLock = null; });
+    log('info', `Screen kept awake for ${why}.`);
+    return true;
+  } catch (err) {
+    // Refused on an insecure origin, in a background tab, or on a platform that
+    // does not implement it. Not fatal, and worth saying once.
+    log('warn', `Could not keep the screen awake for ${why}: ${err?.message || err}. `
+      + 'Set the screen timeout by hand, and do not switch apps.');
+    return false;
+  }
+}
+
+function releaseWakeLock() {
+  try { wakeLock?.release?.(); } catch { /* already gone */ }
+  wakeLock = null;
+}
+
+/*
+ * The page going away mid-build is the thing worth recording, and the only
+ * moment it can be recorded is while it happens.
+ */
+if (typeof document !== 'undefined') {
+  document.addEventListener('visibilitychange', () => {
+    const hidden = document.visibilityState === 'hidden';
+    buildProfile.noteVisibility(hidden);
+    if (!hidden && wakeLock === null && buildRunning) acquireWakeLock('the panorama build');
+  });
+}
+
 /**
  * Decode the stored keyframe JPEGs into raw pixel buffers, aligned to the
  * survey's keyframe array by index. Missing thumbnails become nulls; the
@@ -2988,10 +3084,35 @@ let stitcher = null;
 function getStitcher() {
   if (stitcher) return stitcher;
   stitcher = new PyodideStitcher({
-    onStatus: ({ text, fraction, detail }) => {
+    onStatus: ({ text, fraction, detail, stageFraction, stageRemainingSec,
+      remainingSec, done, total }) => {
       $('buildStage').textContent = text;
-      $('buildEta').textContent = '';
-      if (Number.isFinite(fraction)) $('buildBar').style.width = `${(fraction * 100).toFixed(1)}%`;
+      /*
+       * THREE DECIMALS, AND A PERCENTAGE ALLOWED TO CRAWL.
+       *
+       * Four fifths of a build happens inside two stages, so a whole-number
+       * readout sits unchanged for half a minute at a stretch — and a figure
+       * that never moves is precisely what makes an operator ask whether the
+       * thing has hung. At 340 frames one painted frame is 0.115% of the build,
+       * so three decimals is the resolution at which every unit of real work
+       * becomes visible.
+       */
+      if (Number.isFinite(fraction)) {
+        const pct = Math.max(0, Math.min(1, fraction)) * 100;
+        $('buildBar').style.width = `${pct.toFixed(3)}%`;
+        $('buildPercent').textContent = `${pct.toFixed(3)}%`;
+      }
+      // The stage bar answers a different question from the overall one: not
+      // "how much is left" but "is this piece of work moving at all".
+      if (Number.isFinite(stageFraction)) {
+        $('buildStageBar').style.width = `${(stageFraction * 100).toFixed(3)}%`;
+      }
+      $('buildStageDetail').textContent = Number.isFinite(done) && total
+        ? `${done} of ${total}` : (detail || '');
+      $('buildStageEta').textContent = Number.isFinite(stageRemainingSec)
+        ? `${formatEta(stageRemainingSec)} left in this step` : '';
+      $('buildEta').textContent = Number.isFinite(remainingSec)
+        ? `about ${formatEta(remainingSec)} to go` : '';
       if (detail) $('panoStatus').textContent = detail;
       /*
        * TIME EACH STAGE, BECAUSE "IT IS SLOW ON ANDROID" IS NOT A BUG REPORT.
@@ -3125,6 +3246,14 @@ async function buildPanorama() {
 
   const t0 = performance.now();
   buildProfile.start(kfs.length);
+  buildRunning = true;
+  buildProfile.noteVisibility(typeof document !== 'undefined'
+    && document.visibilityState === 'hidden');
+  await acquireWakeLock('the panorama build');
+  log('warn', 'Do not switch apps or lock the phone while this builds. '
+    + 'A backgrounded tab is suspended by the browser — timers stop, the worker '
+    + 'freezes, and the page can be discarded outright. A build interrupted that '
+    + 'way does not resume; it is simply gone.');
   try {
     const photos = await loadKeyframeBlobs({ waitForPending: true });
     const withPhoto = kfs.filter(kf => photos.has(kf.index)).length;
@@ -3193,6 +3322,14 @@ async function buildPanorama() {
     // Close the profile and say where the time went, worst first.
     lastBuildProfile = buildProfile.finish().snapshot();
     const peak = lastBuildProfile.memory.peakHeapMb;
+    const interrupted = lastBuildProfile.interrupted;
+    if (interrupted.timesHidden > 0 || interrupted.stalled) {
+      log('warn', `This build was interrupted: the page was hidden `
+        + `${interrupted.timesHidden} time(s) for ${interrupted.hiddenSec} s, and the `
+        + `longest gap between memory samples was ${interrupted.longestSamplerGapSec} s `
+        + `against an expected ${interrupted.expectedSamplerGapSec} s. `
+        + 'The elapsed time below measures the interruption, not the work.', interrupted);
+    }
     log('info', `Build took ${(ms / 1000).toFixed(0)} s for ${report.frames} photographs `
       + `(${lastBuildProfile.secPerFrame} s each). Slowest stage: `
       + `${lastBuildProfile.slowestStage} at ${lastBuildProfile.slowestStagePercent}% of the build`
@@ -3238,6 +3375,8 @@ async function buildPanorama() {
     setRuntimeChip('runtime failed', 'bad');
     log('error', 'Panorama build failed', { error: String((e && e.stack) || e) });
   } finally {
+    buildRunning = false;
+    releaseWakeLock();
     btn.disabled = false; btn.textContent = label;
     $('buildProgress').hidden = true;
     // Whatever happened, give the operator their camera back. Leaving it paused
