@@ -59,5 +59,17 @@ check('the entry script still carries the version query',
 check('and so does the stylesheet, for the same reason',
   html.includes(`styles.css?v=${version}`));
 
+// Links to our other entry points. sky/skyline-align.html is a second page with
+// its own module graph and its own worker, and an unstamped link to it served a
+// stale copy twice while it was being worked on.
+{
+  const links = [...html.matchAll(/<a[^>]*\shref="([^"]+\.html[^"]*)"/g)].map(m => m[1]);
+  const ours = links.filter(h => !/^[a-z]+:|^\/\//i.test(h));
+  const unstamped = ours.filter(h => !h.includes(`?v=${version}`));
+  check('every link to one of our own pages carries the version query',
+    unstamped.length === 0,
+    unstamped.length ? `unstamped: ${unstamped.join(', ')}` : `${ours.length} link(s) at v${version}`);
+}
+
 console.log(failures ? `\n${failures} FAILED` : '\nall import-map checks passed');
 process.exitCode = failures ? 1 : 0;

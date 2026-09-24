@@ -399,12 +399,41 @@ and 6.4% of the rows below the content top are holes INSIDE the terrain, which
 render transparent and look exactly like an over-aggressive cut. The toggle
 paints them so the cut stops being blamed for the solver's dropped frames.
 
+THE CUT MAY NOT CROSS THE HORIZON. Reported from the field as "large chunk
+missing but rest of horizon done very well" on the 2026-09-23 dusk capture. The
+detector's traced skyline, as a fraction of the way down the image:
+
+    az  90    74%          az 135    90%
+    az 105    98%          az 150    69%
+    az 120    97%
+
+Between 105 and 135 degrees it called the whole column sky, down to the bottom
+edge, and the cut deleted the horizon there. That is sunset glow standing over a
+dark, low, distant treeline: the blueness and texture cues both collapse and no
+per-column detector recovers it. But a skyline BELOW the horizon is not a hard
+case, it is a wrong answer — `js/survey.js` already clamps every profile sample
+to `clamp(alt, 0, 90)` — so the cut is clamped the same way. It is a floor and
+never a ceiling, because cutting LESS is always the safe direction.
+
+Measured after: 273 of 1440 columns (13% of the circle) clamped on that capture,
+247 (12%) on the daylight one, and the missing chunk fills in. The count is
+reported in the panel, because a detector failure the operator cannot see is one
+they will go on blaming the cut for.
+
+LINKS TO OUR OWN PAGES ARE VERSION-STAMPED NOW. `sky/skyline-align.html` is a
+second entry point with its own module graph and its own worker, and nothing
+versioned it: while working on the clamp the browser served the previous copy
+twice, and the symptom was a fix that "did not work", which sends you back to
+re-read code that was already correct. `build-importmap.mjs` stamps same-origin
+`<a href="*.html">` alongside the entry script and the stylesheet, and
+`tests/import-map.test.mjs` fails if any is missing.
+
 KNOWN LIMIT, not yet addressed: the detector is tuned for 384x288 camera frames
-and is only fair on a panorama. Re-detect, the cut-line overlay and the margin
-slider are all exposed so the operator can see and correct what it did. A better
-route exists and is not built: the 720-bin profile in a `.horizon-project` IS
-the measured skyline, and using it instead of re-detecting would be both exact
-and free.
+and is only fair on a panorama. Re-detect, the cut-line overlay, the margin
+slider and the horizon clamp all limit the damage, but they do not make it
+right. A better route exists and is not built: the 720-bin profile in a
+`.horizon-project` IS the measured skyline, and using it instead of re-detecting
+would be both exact and free — and would have made every failure above moot.
 
 ## 10. State right now
 

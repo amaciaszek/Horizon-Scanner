@@ -92,6 +92,21 @@ export function stampEntryPoints(html, version) {
     .replace(/(<script\b[^>]*\bsrc=")([^"?]+)(?:\?v=[^"]*)?(")/g,
       (whole, a, src, b) => (ours(src) ? `${a}${src}?v=${version}${b}` : whole))
     .replace(/(<link\b[^>]*\bhref=")([^"?]+\.css)(?:\?v=[^"]*)?(")/g,
+      (whole, a, href, b) => (ours(href) ? `${a}${href}?v=${version}${b}` : whole))
+    /*
+     * Links to our OTHER pages get the stamp too.
+     *
+     * `sky/skyline-align.html` is a second entry point with its own module and
+     * its own worker, and nothing versioned it. Caught 2026-09-23 while testing
+     * a change to it: the browser served the previous copy twice in a row, and
+     * the symptom was a fix that "did not work" — the most expensive kind of
+     * stale, because it sends you back to re-read code that was already right.
+     *
+     * Only .html, and only ours. The anchor's query does not reach the page's
+     * own subresources, but it does force the document itself to be re-fetched,
+     * which is where the module graph and the worker URL come from.
+     */
+    .replace(/(<a\b[^>]*\bhref=")([^"?#]+\.html)(?:\?v=[^"]*)?(")/g,
       (whole, a, href, b) => (ours(href) ? `${a}${href}?v=${version}${b}` : whole));
 }
 

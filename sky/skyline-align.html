@@ -985,8 +985,10 @@ async function processPanorama(img) {
 
   note.textContent = `skyline traced over ${workW} columns, `
     + `${(result.skyFraction * 100).toFixed(0)}% sky`
-    + (unpainted ? `, ${(unpainted * 100).toFixed(1)}% of the panel unpainted` : '');
-  if (result.noSky) { note.className = 'note warn'; note.textContent += ' — almost no sky found, so the cut may be wrong'; }
+    + (unpainted ? `, ${(unpainted * 100).toFixed(1)}% of the panel unpainted` : '') + '.';
+  if (result.noSky) { note.className = 'note warn'; note.textContent += ' Almost no sky found, so the cut may be wrong.'; }
+  state.segMessage = note.textContent;
+  state.segClass = note.className;
 
   state.boundary = boundary;
   state.boundaryWidth = workW;
@@ -1131,6 +1133,38 @@ function buildTexture(img) {
      */
     const marginPx = Math.max(0, state.skyMarginDeg / Math.max(1, state.spanDeg) * h);
     const fade = Math.max(2, marginPx * 0.55);
+
+    /*
+     * THE CUT MAY NOT CROSS THE HORIZON, WHATEVER THE DETECTOR SAYS.
+     *
+     * MEASURED on the 2026-09-23 dusk capture, which the operator reported as
+     * "large chunk missing but rest of horizon done very well". The detector's
+     * traced skyline, as a fraction of the way down the image:
+     *
+     *     az  90    74%          az 135    90%
+     *     az 105    98%          az 150    69%
+     *     az 120    97%
+     *
+     * Between 105 and 135 degrees it declared the entire column sky, down to
+     * the bottom edge, and the cut duly deleted the horizon there. That is the
+     * sunset glow standing over a dark, low, distant treeline: the blueness and
+     * texture cues both collapse, and nothing in a per-column detector can
+     * recover it.
+     *
+     * But a skyline BELOW the horizon is not a hard case, it is a wrong answer.
+     * The operator is standing on the ground; the obstruction they are
+     * surveying is above them. `js/survey.js` already takes this position, and
+     * clamps every profile sample to `clamp(alt, 0, 90)`. So the cut is
+     * clamped the same way, and a detector failure of this kind now costs a few
+     * degrees of treetop instead of the whole bearing.
+     *
+     * It is a floor, never a ceiling: a column tracing a roofline at 60 degrees
+     * is left entirely alone, because cutting LESS is always the safe
+     * direction and a tall obstruction is exactly what this survey is for.
+     */
+    const horizonRow = clamp(state.topDeg / Math.max(1, state.spanDeg), 0, 1) * h;
+    let clamped = 0;
+
     for (let x = 0; x < w; x++) {
       // The boundary is sampled in the detector's column space; interpolate.
       const bx = x / w * bw;
@@ -1138,7 +1172,9 @@ function buildTexture(img) {
       const i1 = Math.min(bw - 1, i0 + 1);
       const t = bx - i0;
       const rowWork = state.boundary[i0] * (1 - t) + state.boundary[i1] * t;
-      const cut = rowWork / bh * h - marginPx;
+      let traced = rowWork / bh * h;
+      if (traced > horizonRow) { traced = horizonRow; clamped++; }
+      const cut = traced - marginPx;
       for (let y = 0; y < h; y++) {
         const p = (y * w + x) * 4;
         if (d[p + 3] === 0) continue;                       // already unpainted
@@ -1148,6 +1184,7 @@ function buildTexture(img) {
         }
       }
     }
+    reportClamp(clamped, w);
   }
   ctx.putImageData(px, 0, 0);
 
@@ -1156,6 +1193,30 @@ function buildTexture(img) {
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
   state.texReady = true;
   requestDraw();
+}
+
+/**
+ * Say how many columns the detector traced below the horizon.
+ *
+ * Silently correcting a bad trace would leave the operator looking at a
+ * mysteriously short skyline and blaming the cut — which is exactly what
+ * happened before the clamp existed. Name it.
+ */
+function reportClamp(clamped, width) {
+  const el = $('segNote');
+  const base = state.segMessage || el.textContent || '';
+  if (!clamped) { el.textContent = base; el.className = state.segClass || 'note'; return; }
+  const pct = (100 * clamped / width).toFixed(0);
+  el.textContent = `${base} ${clamped} column(s) — ${pct}% of the circle — traced BELOW the `
+    + 'horizon and were clamped to it; the detector failed there, most likely against a bright '
+    + 'sky over a dark low skyline. Raise "Keep this much sky" if a treetop is still missing.';
+  el.className = 'note warn';
+}
+
+/** The band drives the horizon clamp, so a change to it re-cuts the panorama. */
+function afterBandChange() {
+  showBand();
+  if (state.image) buildTexture(state.image);
 }
 
 /** Say, in words, what band the two numbers add up to. */
@@ -1194,7 +1255,7 @@ async function loadReport(file) {
       bits.push('site position too');
     }
     if (!bits.length) throw new Error('no altitudeMin/altitudeMax in that file');
-    showBand();
+    afterBandChange();
     note.className = 'note';
     note.textContent = bits.join(', ') + '.';
     save();
@@ -1303,8 +1364,11 @@ function wireUp() {
     if (f) loadPanorama(f);
   });
 
-  bindSlider('span', 'spanVal', 'spanDeg', v => `${v.toFixed(1)}°`, showBand);
-  bindSlider('top', 'topVal', 'topDeg', v => `${v.toFixed(1)}°`, showBand);
+  // The band is no longer cosmetic: the horizon clamp is computed from it, so
+  // moving either number changes where the cut lands and the texture has to be
+  // rebuilt, not merely redrawn.
+  bindSlider('span', 'spanVal', 'spanDeg', v => `${v.toFixed(1)}°`, afterBandChange);
+  bindSlider('top', 'topVal', 'topDeg', v => `${v.toFixed(1)}°`, afterBandChange);
   $('reportBtn').addEventListener('click', () => $('reportFile').click());
   $('reportFile').addEventListener('change', e => {
     if (e.target.files[0]) loadReport(e.target.files[0]);
