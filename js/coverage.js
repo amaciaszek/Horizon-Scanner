@@ -184,6 +184,43 @@ export const COVERAGE_TUNING = {
    *  catch a branch against the sky and say nothing about the roof behind it. */
   minMeasuredFractionForTop: 0.15,
 
+  /**
+   * How closely a second frame must agree before a new high for a bearing is
+   * believed, in degrees.
+   *
+   * MEASURED, 2026-09-23 back-yard capture, against the app's OWN 720-bin
+   * profile built from the same segmentation:
+   *
+   *   over 180 bearings   profile   measuredTop   obstructionTop
+   *   median                 27.0          68.5             37.1
+   *   minimum                 9.9          46.4              0.0
+   *   maximum                46.8          71.9             74.0
+   *
+   * `measuredTop` exceeded the solved skyline at ALL 180 bearings, by a median
+   * of 36.9 degrees, and claimed a 46-degree minimum for a garden whose real
+   * skyline bottoms out at 10. It was a running maximum with nothing guarding
+   * it, so every bearing ended the session pinned to the single worst
+   * segmentation that ever pointed near it — one cloud edge traced as a
+   * roofline holds a bearing at 68 degrees forever.
+   *
+   * The cost was not cosmetic. `ColumnPlan.syncRequirements` takes the max of
+   * this and `obstructionTop`, so 155 of 180 columns demanded the full
+   * six-band stack to 60 degrees when the measured heights justify it at 53.
+   * That is roughly 130 photographs taken of empty sky, and matching cost grows
+   * faster than the frame count.
+   *
+   * A new high now has to be seen twice. The first sighting is held as a
+   * candidate and changes nothing; a second frame within this tolerance
+   * promotes the LOWER of the two, so a wild reading cannot pull the bearing up
+   * even when it is confirmed by another wild reading. This is the same
+   * remedy, for the same reason, as `minBandFrames` in `column-plan.js`: one
+   * look is not evidence.
+   *
+   * 4 degrees is about a third of a band step, so a genuine roofline seen twice
+   * from slightly different elevations still confirms on the second frame.
+   */
+  confirmTopToleranceDeg: 4,
+
   /** Where in the frame the top of an obstruction should sit once found, as a
    *  fraction of the vertical field below the top edge. Asking for it dead
    *  centre would throw the horizon out of the bottom of the picture. */
@@ -287,6 +324,7 @@ export class CoverageMap {
     const world = keepWorld && this.obstructionTop ? {
       obstructionTop: this.obstructionTop.slice(),
       measuredTop: this.measuredTop.slice(),
+      measuredTopCandidate: this.measuredTopCandidate.slice(),
       topSeen: this.topSeen.slice(),
       requiredElevation: this.requiredElevation.slice(),
       satisfiedElevation: this.satisfiedElevation.slice(),
@@ -310,6 +348,10 @@ export class CoverageMap {
      *  to contain it. Unlike `obstructionTop` this is a measurement, not a
      *  bound, and it is what the lift request is computed from. */
     this.measuredTop = new Float32Array(this.binCount);
+    /** A new high waiting for a second frame to agree with it. Holding the
+     *  candidate separately is what stops one bad trace from ratcheting a
+     *  bearing — see `confirmTopToleranceDeg`. */
+    this.measuredTopCandidate = new Float32Array(this.binCount);
     /**
      * Has the top here been CAPTURED — seen with clear space beneath the frame's
      * top edge, not merely glimpsed at the boundary?
@@ -345,6 +387,7 @@ export class CoverageMap {
     if (world) {
       this.obstructionTop.set(world.obstructionTop);
       this.measuredTop.set(world.measuredTop);
+      if (world.measuredTopCandidate) this.measuredTopCandidate.set(world.measuredTopCandidate);
       this.topSeen.set(world.topSeen);
       this.requiredElevation.set(world.requiredElevation);
       this.satisfiedElevation.set(world.satisfiedElevation);
@@ -654,7 +697,25 @@ export class CoverageMap {
         const frameTop = elevationDeg + vfovDeg / 2;
         if (Number.isFinite(measured) && measuredFraction >= t.minMeasuredFractionForTop
             && clippedFraction <= t.clippedFractionForLift) {
-          if (measured > this.measuredTop[index]) this.measuredTop[index] = measured;
+          /*
+           * A NEW HIGH HAS TO BE SEEN TWICE. See `confirmTopToleranceDeg` for
+           * the measurement that forced this: as a bare running maximum, this
+           * line put every one of 180 bearings above the app's own solved
+           * skyline, by a median of 36.9 degrees.
+           *
+           * The first sighting only becomes a candidate. A later frame within
+           * the tolerance promotes the LOWER of the two, so two independently
+           * wrong traces cannot lift a bearing between them either.
+           */
+          if (measured > this.measuredTop[index]) {
+            const candidate = this.measuredTopCandidate[index];
+            if (candidate > 0 && Math.abs(measured - candidate) <= t.confirmTopToleranceDeg) {
+              this.measuredTop[index] = Math.min(measured, candidate);
+              this.measuredTopCandidate[index] = 0;
+            } else {
+              this.measuredTopCandidate[index] = measured;
+            }
+          }
           // Framed with headroom, so a top sitting on the very edge does not
           // count. This is the test the old code should have been making.
           if (this.topIsFramed(measured, elevationDeg, vfovDeg) && quality > 0) {
@@ -972,6 +1033,10 @@ export class CoverageMap {
        */
       obstructionTop: Array.from(this.obstructionTop, v => Number(v.toFixed(2))),
       measuredTop: Array.from(this.measuredTop, v => Number(v.toFixed(2))),
+      // The unconfirmed sightings, so an archive shows what was rejected as
+      // well as what was believed. A bearing whose candidate sits far above its
+      // confirmed top is one the segmenter kept disagreeing with itself about.
+      measuredTopCandidate: Array.from(this.measuredTopCandidate, v => Number(v.toFixed(2))),
       topSeen: Array.from(this.topSeen),
       requiredElevation: Array.from(this.requiredElevation, v => Number(v.toFixed(2))),
       satisfiedElevation: Array.from(this.satisfiedElevation, v => Number(v.toFixed(2))),

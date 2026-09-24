@@ -13,7 +13,7 @@
  * archive, so a capture can always be tied back to the code that produced it.
  * `BUILD_DATE` is the date of that change, not of the deployment.
  */
-export const VERSION = '0.29.0';
+export const VERSION = '0.30.0';
 export const BUILD_DATE = '2026-09-23';
 
 /**
@@ -22,7 +22,22 @@ export const BUILD_DATE = '2026-09-23';
  * wants to know whether to trust what they are holding.
  */
 export const RELEASE_NOTE =
-  'The seam finder was told every photograph covered the whole sky, so it compared all 57,000 possible pairs instead of the 5,000 that really overlap, on tiles that were mostly black padding. And every frame enlarged its seam mask to the full panorama before keeping a fortieth of it. Both are fixed, and the same 340-photograph build went from 4564 seconds to 802 — five and a half times faster, with the identical solve and a slightly BETTER picture: overlap disagreement 19.0 down to 14.9. The progress bar is rebuilt on measured stage weights, reports to three decimals so it visibly ticks, and carries a live estimate for the step and for the whole build.';
+  'Four measured fixes. Hamming distance is now one matrix multiply instead of a lookup table, '
+  + 'bit-identical and roughly twice as fast end to end on the reference capture. The quality presets '
+  + 'named feature counts the runtime silently capped at 1500, so all three expensive ones were the '
+  + 'same detector; they now say what they do. The lens the app proves during the walk finally reaches '
+  + 'the stitcher, which had been matching a 47-degree lens as if it were 38 and returning a broken '
+  + 'graph. And the height each bearing was scanned to came from a running maximum that overshot the '
+  + "app's own skyline at all 180 bearings by a median of 37 degrees, putting 155 of 180 columns on a "
+  + 'full six-band stack; a new high must now be seen twice. A band of open sky is added above the '
+  + 'skyline, because the top frame of a column was being dropped from the panorama five times as '
+  + 'often as a low one, and bearings whose measurements disagree now earn extra looks instead of a '
+  + 'step sideways. '
+  + 'And a new page: Skyline Align, linked from the Export card. Load a panorama and it '
+  + 'cuts the sky out, wraps the rest onto a dome and draws the real stars, Sun, Moon and '
+  + 'planets over it for your position and the moment. Two sliders turn the picture until '
+  + 'it matches the sky; the azimuth offset you land on is the survey bearing error the '
+  + 'magnetometer could not give you.';
 
 /** One line for the header, the log and the archives. */
 export function versionLabel() {

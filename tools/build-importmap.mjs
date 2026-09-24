@@ -67,6 +67,34 @@ export function renderImportMap(version, files) {
   ].join('\n');
 }
 
+/**
+ * Stamp the version onto the two URLs the import map cannot reach.
+ *
+ * MEASURED, 2026-09-23, while checking that a bump to 0.30.0 had landed. It had
+ * not. The page still ran 0.29.0.
+ *
+ * The map rewrites module specifiers, and `js/main.js?v=0.29.0` in the entry
+ * `<script>` tag is not the specifier `./js/main.js` — it is already a
+ * different URL, so the map never applies to it. The entry point and the
+ * stylesheet therefore kept whatever version they were last hand-edited to,
+ * while all thirty modules behind them moved. The device runs the new graph
+ * through the old front door, which is the exact failure this tool was written
+ * to end, surviving inside the tool itself.
+ *
+ * The stale-build check in main.js still catches the symptom. This removes the
+ * cause.
+ */
+export function stampEntryPoints(html, version) {
+  // Only our own files. A cache-busting query on a third-party URL is at best
+  // useless and at worst a cache miss someone else pays for.
+  const ours = src => !/^[a-z]+:|^\/\//i.test(src);
+  return html
+    .replace(/(<script\b[^>]*\bsrc=")([^"?]+)(?:\?v=[^"]*)?(")/g,
+      (whole, a, src, b) => (ours(src) ? `${a}${src}?v=${version}${b}` : whole))
+    .replace(/(<link\b[^>]*\bhref=")([^"?]+\.css)(?:\?v=[^"]*)?(")/g,
+      (whole, a, href, b) => (ours(href) ? `${a}${href}?v=${version}${b}` : whole));
+}
+
 /** Replace the block in index.html, or insert it just before </head>. */
 export function applyTo(html, block) {
   const start = html.indexOf(BEGIN);
@@ -85,6 +113,8 @@ if (import.meta.url === `file://${process.argv[1]}`.replace(/\\/g, '/')
   const files = moduleFiles();
   const page = join(root, 'index.html');
   const html = readFileSync(page, 'utf8');
-  writeFileSync(page, applyTo(html, renderImportMap(version, files)), 'utf8');
-  console.log(`import map rewritten: ${files.length} modules at v${version}`);
+  const next = stampEntryPoints(applyTo(html, renderImportMap(version, files)), version);
+  writeFileSync(page, next, 'utf8');
+  console.log(`import map rewritten: ${files.length} modules at v${version}, `
+    + 'entry script and stylesheet stamped to match');
 }

@@ -63,6 +63,44 @@ export const COLUMN_TUNING = {
   /** Never step less than this, whatever a very narrow lens claims. */
   minBandStepDeg: 6,
 
+  /**
+   * Bands of open sky asked for ABOVE what the skyline needs.
+   *
+   * MEASURED, 2026-09-23 back-yard capture, 384 photographs. The stitcher
+   * dropped 29 of them for want of verified overlap, and which ones it dropped
+   * was not random:
+   *
+   *     elevation   frames   dropped
+   *      0 - 30       202        5   (2%)
+   *     30 - 40        75        7   (9%)
+   *     40 - 50        62       11  (18%)
+   *     50 - 70        40        6  (15%)
+   *
+   * The top of a column is structurally the weakest place in the graph. Every
+   * other frame has a neighbour above it and below it; the topmost frame has
+   * only the one below, so a single bad match strands it, and a stranded frame
+   * is a hole in the panorama exactly over the roof the survey went out to
+   * measure.
+   *
+   * One band of plain sky above the skyline costs little — sky is where the
+   * camera is already pointing at the top of a climb — and it gives the highest
+   * frame that actually contains something a partner on both sides. It is not
+   * photographed for its own sake, and nothing asks for the zenith: this is one
+   * step, and `maxAskElevationDeg` still caps the whole stack.
+   *
+   * It is affordable now because it is paid for several times over by the two
+   * fixes beside it. Required cells across this capture's 180 bearings:
+   *
+   *     as shipped (unconfirmed tops, lens 29.6 deg)          1049
+   *     confirmed tops only                                    662
+   *     confirmed tops + corrected lens (36.2 deg)              585
+   *     confirmed tops + corrected lens + this band             714
+   *
+   * Still a third fewer frames than the capture that produced the measurement
+   * above, with the band that was losing frames now covered.
+   */
+  skyHeadroomBands: 1,
+
   /** Elevation the horizon row sits at. The bottom band is centred here. */
   restElevationDeg: 0,
 
@@ -103,6 +141,24 @@ export const COLUMN_TUNING = {
    * here — see `centreWeight`.
    */
   minBandFrames: 3,
+
+  /**
+   * Extra frames a band needs at a bearing whose height evidence contradicts
+   * itself.
+   *
+   * The operator's standing complaint about this app has always been the same
+   * shape — the dot moves on before the bearing is actually done. Every fix so
+   * far has been about credit that was never earned (`minBandFrames`,
+   * `centreWeight`). This is the other half: a bearing where the credit IS
+   * earned but the measurements disagree with each other.
+   *
+   * Two extra frames, and only that. It cannot deadlock a column the way a
+   * raised height requirement can, because it asks for more of a motion the
+   * operator is already making rather than for a tilt the guidance may not be
+   * willing to request. Worst case a troubled band wants five frames instead of
+   * three, which at the measured capture rate is about two more seconds.
+   */
+  lingerExtraFrames: 2,
 
   /**
    * How near the middle of a frame a column has to fall for that frame to count
@@ -271,6 +327,9 @@ export class ColumnPlan {
      *  the archive can say "this obstruction is taller than we could ask for"
      *  instead of silently pretending it was never that tall. */
     this.bandsWanted = new Uint8Array(this.binCount).fill(1);
+    /** Bearings whose height evidence contradicts itself, which earn extra
+     *  looks rather than extra tilt. See `setTroubled`. */
+    this.troubled = new Uint8Array(this.binCount);
     /** Which way the serpentine is currently travelling in elevation. */
     this.ascending = true;
     this.generation = 0;
@@ -318,7 +377,12 @@ export class ColumnPlan {
   requireHeight(index, obstructionTopDeg) {
     if (!Number.isFinite(obstructionTopDeg) || obstructionTopDeg <= 0) return;
     const aim = Math.max(0, obstructionTopDeg - this.vfovDeg * 0.4);
-    const bands = clamp(Math.ceil(aim / this.bandStepDeg) + 1, 1, this.bandCount);
+    // The +1 turns a band INDEX into a count; `skyHeadroomBands` is the extra
+    // step of open sky that keeps the topmost useful frame from being the end
+    // of its own column. See the constant for the drop rates that justify it.
+    const bands = clamp(
+      Math.ceil(aim / this.bandStepDeg) + 1 + this.tuning.skyHeadroomBands,
+      1, this.bandCount);
     if (bands > this.bandsWanted[index]) this.bandsWanted[index] = bands;
     // The cap is the whole point. Above the tilt ceiling the app will not ask
     // the operator to aim, so it must not demand the result either; the excess
@@ -356,7 +420,42 @@ export class ColumnPlan {
     for (let i = 0; i < n; i++) {
       const top = Math.max(coverage.obstructionTop[i] || 0, coverage.measuredTop?.[i] || 0);
       this.requireHeight(i, top);
+      /*
+       * A BEARING THE SEGMENTER KEEPS CHANGING ITS MIND ABOUT IS A BEARING TO
+       * STAY ON.
+       *
+       * `measuredTopCandidate` holds a height that was seen once and never
+       * confirmed. When it sits well above the confirmed top, two frames looked
+       * at the same skyline and disagreed by more than a band — a glare edge, a
+       * branch against cloud, a roofline the segmentation lost. The evidence
+       * here is contradictory, and the right response to contradictory evidence
+       * is another look, not a shrug and a step sideways.
+       *
+       * This is deliberately a SOFT signal: it asks for extra frames, it never
+       * raises the height requirement. Asking for height on the strength of an
+       * unconfirmed reading is exactly the mistake that put 155 of 180 columns
+       * on a six-band stack.
+       */
+      const candidate = coverage.measuredTopCandidate?.[i] || 0;
+      const confirmed = coverage.measuredTop?.[i] || 0;
+      this.setTroubled(i, candidate > confirmed + this.bandStepDeg);
     }
+  }
+
+  /**
+   * Mark a bearing as one to linger on, or stop lingering.
+   *
+   * Bounded on purpose. It adds `lingerExtraFrames` to what a band needs and
+   * nothing else: the operator is already standing here, so a couple more
+   * frames is a second or two, and the requirement stays one the same motion
+   * can satisfy. It cannot deadlock the way a raised HEIGHT requirement can,
+   * because it never asks for a tilt the app will not also guide.
+   */
+  setTroubled(index, troubled) {
+    const value = troubled ? 1 : 0;
+    if (this.troubled[index] === value) return;
+    this.troubled[index] = value;
+    this.generation++;
   }
 
   /**
@@ -393,8 +492,11 @@ export class ColumnPlan {
 
   _bandFilled(index, band) {
     const c = this.cell(index, band);
-    return this.score[c] >= this.tuning.bandThreshold
-      && this.frames[c] >= this.tuning.minBandFrames;
+    // A troubled bearing wants more looks before it is believed — the only
+    // thing `troubled` does. See `setTroubled`.
+    const need = this.tuning.minBandFrames
+      + (this.troubled[index] ? this.tuning.lingerExtraFrames : 0);
+    return this.score[c] >= this.tuning.bandThreshold && this.frames[c] >= need;
   }
 
   /** Has this one band at this bearing been filled? Public because the
@@ -724,6 +826,9 @@ export class ColumnPlan {
         bandsRequired: this.bandsRequired[i],
         bandsWanted: this.bandsWanted[i],
         beyondReach: this.beyondReach(i),
+        // Recorded so an archive can answer "did the app linger here, and did
+        // lingering help?" without having to infer it from frame counts.
+        troubled: !!this.troubled[i],
         bandsFilled: Array.from({ length: this.bandsRequired[i] },
           (_, b) => this._bandFilled(i, b)).filter(Boolean).length,
         complete: this.columnComplete(i)

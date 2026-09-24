@@ -3164,11 +3164,32 @@ function stitchOptions() {
    * This is a survey run once and relied on for years. Minutes are the cheapest
    * thing it can spend.
    */
+  /*
+   * THE FEATURE COUNTS USED TO BE FICTION. MEASURED 2026-09-23.
+   *
+   * The worker clamps this number to 1500 for the memory budget, so `normal`,
+   * `fine` and `reference` all handed the solver the same 1500 and differed
+   * only in search radius and degree. The operator picking "reference" and
+   * waiting was choosing between three identical detectors.
+   *
+   * The ceiling is real anyway. SIFT asked for 5000 on the 2026-09-23 back-yard
+   * capture returns a median of 2047 keypoints per frame at 640x480 — the scene
+   * does not contain more above the contrast threshold. And guided matching
+   * costs roughly N^2: every feature is looked for among the candidates inside
+   * its search box, so 2047 features is 5.2x the comparisons of 900, spent
+   * entirely on the weakest corners in the picture. Those are the ones that
+   * match siding to siding and leaf to leaf, which is ghosting.
+   *
+   * So the presets now name numbers the runtime will really use, and the
+   * expensive end of the dial buys a wider search and more neighbours per
+   * frame — which is what actually found the missing 23 photographs in the
+   * 2026-08-20 measurement above — rather than more marginal corners.
+   */
   const table = {
     fast: { detector: 'orb', features: 900, search: 64, degree: 20 },
-    normal: { detector: 'sift', features: 2000, search: 88, degree: 24 },
-    fine: { detector: 'sift', features: 3000, search: 96, degree: 28 },
-    reference: { detector: 'sift', features: 5000, search: 112, degree: 32 }
+    normal: { detector: 'sift', features: 1200, search: 88, degree: 24 },
+    fine: { detector: 'sift', features: 1500, search: 96, degree: 28 },
+    reference: { detector: 'sift', features: 1500, search: 112, degree: 32 }
   };
   return {
     ...(table[preset] || table.normal),

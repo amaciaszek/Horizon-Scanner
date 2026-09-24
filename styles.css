@@ -66,6 +66,14 @@ p  { margin: 0; }
   border-bottom: 1px solid var(--rule);
 }
 .bar-id { display: flex; align-items: center; gap: 11px; }
+/* The title does not wrap; the chips beside it do.
+   MEASURED at 375x812 when the Sky align link was added. Three chips instead of
+   two squeezed "Horizon Survey" onto two lines and pushed the header to 119px —
+   on the phone this app is actually used on, a third of the usable height gone
+   to a title that already fitted. Letting the title hold its line and the chips
+   take a second row instead gives an 84px header, SHORTER than the two-chip
+   version it replaced. */
+.bar-id h1 { white-space: nowrap; }
 .mark {
   width: 26px; height: 26px; border-radius: 50%;
   border: 1.5px solid var(--signal);
@@ -89,6 +97,22 @@ p  { margin: 0; }
 .chip.quiet { color: var(--ink-3); background: transparent; }
 .chip.warn  { color: var(--amber); background: rgba(224,163,60,.12); border-color: rgba(224,163,60,.4); }
 .chip.bad   { color: var(--coral); background: rgba(255,122,89,.12); border-color: rgba(255,122,89,.4); }
+
+/* A chip that GOES somewhere, rather than one that reports something.
+   Every other chip in this bar is a readout, so this one has to look like it
+   can be pressed without shouting over the state it sits beside: the violet
+   says "not a status", and the border brightening on hover and focus says
+   "a control". Focus is visible because this is the only keyboard-reachable
+   thing in the header. */
+a.chip.link {
+  color: var(--violet);
+  background: rgba(180, 140, 242, 0.12);
+  border-color: rgba(180, 140, 242, 0.42);
+  text-decoration: none;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+a.chip.link:hover { border-color: var(--violet); background: rgba(180, 140, 242, 0.2); }
+a.chip.link:focus-visible { outline: 2px solid var(--violet); outline-offset: 2px; }
 
 /* ----------------------------------------------------------------- layout */
 

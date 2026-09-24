@@ -64,16 +64,41 @@ function projectedSkyline(kf, yawDatumDeg, azimuthOffsetDeg) {
  * with the uncorrected optics while believing it had reproduced the app.
  */
 function renderCameraOf(kf) {
-  const scale = Number(kf.bundleFocalScale);
-  if (!Number.isFinite(scale) || scale === 1) return null;
+  /*
+   * TWO CORRECTIONS CAN APPLY, AND BOTH HAVE TO REACH THE ARCHIVE.
+   *
+   * `lensCorrectionScale` comes from loop closure during the walk — a lap
+   * logged as 548 degrees instead of 720 measures the optics, not just the
+   * gyroscope. `bundleFocalScale` comes from the cross-lap elevation
+   * regression after a build. They multiply.
+   *
+   * Only the second one used to be recorded, which is how the 2026-09-23
+   * capture handed the stitcher 38.82 degrees twenty minutes after its own log
+   * announced the true figure was 49.7.
+   */
+  const loop = Number(kf.lensCorrectionScale);
+  const bundle = Number(kf.bundleFocalScale);
+  const parts = [];
+  let scale = 1;
+  if (Number.isFinite(loop) && loop > 0 && loop !== 1) { scale *= loop; parts.push('loop-closure'); }
+  if (Number.isFinite(bundle) && bundle > 0 && bundle !== 1) { scale *= bundle; parts.push('cross-lap-elevation-regression'); }
+  if (!parts.length || scale === 1) return null;
   return {
-    source: 'cross-lap-elevation-regression',
+    source: parts.join('+'),
     appliedFocalScale: round(scale, 6),
     tanHalfHorizontal: round(kf.tanHalfH * scale, 9),
     tanHalfVertical: round(kf.tanHalfV * scale, 9),
     focalPx: Number.isFinite(kf.focalPx) ? round(kf.focalPx / scale) : null,
-    appliesTo: 'browser panorama render only; the 720-bin profile used the capture-time camera block',
-    note: 'Post-capture diagnostic correction measured from repeat views of the same bearing on different laps. See metadata/panorama-optimization.json for the pairs and residuals.'
+    // Which products used this matters, and the two corrections differ. The
+    // loop-closure scale is applied when the survey reprojects, so the 720-bin
+    // profile is built through it; the cross-lap regression lands after the
+    // profile is already computed and moves the panorama only.
+    appliesTo: parts.includes('loop-closure')
+      ? 'the 720-bin profile and the panorama render; use these tangents to reproduce either'
+      : 'browser panorama render only; the 720-bin profile used the capture-time camera block',
+    note: 'Post-capture correction. "loop-closure" is measured from the ratio between a physical lap '
+      + 'and the lap the gyroscope logged; "cross-lap-elevation-regression" from repeat views of the '
+      + 'same bearing on different laps. See metadata/panorama-optimization.json for the pairs and residuals.'
   };
 }
 

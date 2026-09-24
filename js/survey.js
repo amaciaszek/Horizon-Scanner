@@ -127,7 +127,31 @@ export class Survey {
     const fAssumed = 0.5 / Math.tan(assumedHfovDeg / 2 * DEG);   // per unit width
     const fTrue = fAssumed / scale;
     const hfovDeg = 2 * Math.atan(0.5 / fTrue) * RAD;
-    return { scale, hfovDeg };
+
+    /*
+     * CARRY THE CORRECTION ONTO THE FRAMES THAT WERE ALREADY TAKEN.
+     *
+     * MEASURED, 2026-09-23 back-yard capture. This method worked out that the
+     * true field of view was 49.7 degrees against the 38.8 the survey had been
+     * running on, the log said so, and `camera.setHfov` adopted it — for
+     * frames taken from then on. All 384 photographs were already in the bag.
+     * Every one of them went into the archive stating 38.82 degrees, the 720-
+     * bin profile was reprojected through 38.82 degrees, and the stitcher, which
+     * reads the same field, aimed its guided search with a focal length 21%
+     * wrong. Its match graph came back in two pieces; restated at the solved
+     * lens the same capture matches into one piece with every frame in it.
+     *
+     * The photograph's own optics are NOT rewritten — a capture record that
+     * changes when a later step disagrees with it is not a capture record.
+     * The correction rides alongside as a scale, and everything downstream
+     * that wants the corrected lens asks for it by name.
+     */
+    const lensScale = Math.tan(hfovDeg / 2 * DEG) / Math.tan(assumedHfovDeg / 2 * DEG);
+    if (Number.isFinite(lensScale) && lensScale > 0 && Math.abs(lensScale - 1) > 1e-6) {
+      for (const kf of this.keyframes) kf.lensCorrectionScale = lensScale;
+      this.lensCorrection = { scale: lensScale, hfovDeg, source: 'loop closure' };
+    }
+    return { scale, hfovDeg, lensScale };
   }
 
   applyLoopClosure(residualDeg) {
@@ -243,8 +267,13 @@ export class Survey {
     // lenses, the platform may change lens mid-scan without changing deviceId
     // or resolution, so a single global focal length would silently misproject
     // every frame on the far side of the swap.
-    const tanH = kf.tanHalfH ?? intrinsics.tanHalfH;
-    const tanV = kf.tanHalfV ?? intrinsics.tanHalfV;
+    // A post-capture measurement may have disproved the lens this frame was
+    // taken through — see `calibrateScaleFromLoop`. Both tangents scale
+    // together so the pixels stay square.
+    const lens = Number(kf.lensCorrectionScale);
+    const lensScale = Number.isFinite(lens) && lens > 0 ? lens : 1;
+    const tanH = (kf.tanHalfH ?? intrinsics.tanHalfH) * lensScale;
+    const tanV = (kf.tanHalfV ?? intrinsics.tanHalfV) * lensScale;
     const total = (kf.yawBase || 0) + (kf.yawCorrection || 0) + (this.yawDatum || 0);
     const q = total ? quatMul(yawQuat(total), kf.quat) : kf.quat;
     const n = kf.boundary.length;

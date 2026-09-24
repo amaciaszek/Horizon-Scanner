@@ -107,6 +107,14 @@ async function runCapture(message) {
     // cached page could be serving, and an out-of-range value fails deep inside
     // the solve where the message means nothing to an operator.
     const features = Math.max(100, Math.min(1500, Number(options.features) || 500));
+    // Clamping in silence is how three quality presets came to mean the same
+    // thing: the UI offered 2000, 3000 and 5000 features and every one of them
+    // arrived here as 1500, for months, with nothing said. A limit the operator
+    // cannot see is a limit they cannot reason about.
+    if (Number(options.features) > features) {
+      post({ type: 'log', line: `note: ${Number(options.features)} features requested, `
+        + `capped at ${features} — above this the descriptors crowd the WebAssembly heap.` });
+    }
     const search = Math.max(24, Math.min(120, Number(options.search) || 64));
     const degree = Math.max(6, Math.min(32, Number(options.degree) || 24));
     const pxPerDeg = Math.max(2, Math.min(12, Number(options.pxPerDeg) || 6));

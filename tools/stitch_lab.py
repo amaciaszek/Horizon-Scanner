@@ -210,6 +210,7 @@ def load_capture(zip_path: Path, k1: float = DEFAULT_K1):
         session = json.loads(z.read('metadata/session.json')) if 'metadata/session.json' in names else {}
 
         frames = []
+        corrected = 0                      # frames using a proven lens, not an assumed one
         for rec in records:
             photo = rec.get('photo') or {}
             path = photo.get('path')
@@ -223,6 +224,28 @@ def load_capture(zip_path: Path, k1: float = DEFAULT_K1):
             cam = rec['camera']
             orient = rec['orientation']
             point = rec['pointing']
+
+            # PREFER THE LENS THE APP PROVED OVER THE ONE IT ASSUMED.
+            #
+            # `camera` is the optics the photograph was taken through and is
+            # never rewritten, by design. `renderCamera` is present only when a
+            # later measurement — loop closure during the walk, or the cross-lap
+            # elevation regression after a build — disproved it.
+            #
+            # This block read `camera` and ignored `renderCamera` entirely. On
+            # the 2026-09-23 back-yard capture that meant matching at 38.82
+            # degrees against a true 47: the guided search predicts where a
+            # feature lands and looks in a 64 px box around it, and a 21% focal
+            # error puts the prediction further away than the box is wide. The
+            # graph came back in two pieces with a frame isolated. Restated at
+            # the solved lens, the same photographs match into ONE component
+            # containing all 384.
+            render_cam = rec.get('renderCamera') or {}
+            tan_h = render_cam.get('tanHalfHorizontal') or cam['tanHalfHorizontal']
+            tan_v = render_cam.get('tanHalfVertical') or cam['tanHalfVertical']
+            if render_cam.get('tanHalfHorizontal'):
+                corrected += 1
+                lens_source = render_cam.get('source') or 'renderCamera'
 
             # The placed pose: sensor attitude carried into the survey's own
             # azimuth frame. This is what the app draws with, so it is what an
@@ -242,13 +265,17 @@ def load_capture(zip_path: Path, k1: float = DEFAULT_K1):
                 azimuth=point['stitchedAzimuthDeg'],
                 altitude=point['centerAltitudeDeg'],
                 roll=point.get('rollDeg') or 0.0,
-                tan_h=cam['tanHalfHorizontal'],
-                tan_v=cam['tanHalfVertical'],
+                tan_h=tan_h,
+                tan_v=tan_v,
                 k1=k1,
                 timestamp=rec.get('timestampMs') or 0.0,
                 boundary=np.asarray(boundary, dtype=np.float32) if boundary else None,
             ))
     frames.sort(key=lambda f: f.timestamp)
+    if corrected:
+        session = dict(session)
+        session['_lensCorrectedFrames'] = corrected
+        session['_lensCorrectionSource'] = lens_source
     return frames, session
 
 
@@ -347,20 +374,50 @@ class Pair:
     sep: float
 
 
-POPCOUNT = np.unpackbits(
-    np.arange(256, dtype=np.uint8)[:, None], axis=1).sum(1).astype(np.float32)
+def _prepare_descriptors(desc):
+    """
+    Descriptors in the form the distance kernel wants, prepared once per frame.
+
+    ORB CODES BECOME BIT PLANES, AND HAMMING BECOMES A MATRIX MULTIPLY. Over
+    vectors of zeros and ones, popcount(a XOR b) is |a| + |b| - 2a.b, so the
+    whole distance matrix is one GEMM — the same call the float path has always
+    made — instead of a full-size XOR broadcast pushed through a lookup table
+    and summed.
+
+    MEASURED, 2026-09-23, on this project's own descriptors. The broadcast form
+    ran at 7.1 M comparisons a second against 66.7 M for the float path. ORB is
+    in this file FOR its matching cost — `detect_features` says so, on the
+    grounds that a comparison is four XORs and four popcounts against 128
+    multiply-adds. That is true of C and false of NumPy, where the XOR form
+    materialises three arrays the size of the whole comparison block and the
+    float form dispatches to BLAS. In the runtime that actually matters, the
+    cheap descriptor was costing ten times the expensive one.
+
+    Including the unpacking, at the block shapes the guided matcher really
+    calls with, this is 1.4x to 14x faster and bit-exact against the old
+    result — a 0.0 maximum difference, not a small one.
+    """
+    if desc.dtype == np.uint8:
+        bits = np.unpackbits(desc, axis=1).astype(np.float32)
+        return bits, bits.sum(1), True
+    return desc, (desc * desc).sum(1), False
+
+
+def _distances_prepared(q, q_norm, c, c_norm, hamming):
+    """Distance matrix from prepared descriptors. One GEMM either way."""
+    d = q_norm[:, None] + c_norm[None, :] - 2.0 * (q @ c.T)
+    if hamming:
+        return d
+    # The float branch has always returned L2 and not its square, and the Lowe
+    # ratio is applied to whatever comes back, so the square root stays.
+    return np.sqrt(np.maximum(d, 0.0, out=d))
 
 
 def _distances(qd, cd):
     """Descriptor distance matrix: Hamming for uint8 codes, L2 for floats."""
-    if qd.dtype == np.uint8:
-        out = np.empty((len(qd), len(cd)), np.float32)
-        for s in range(0, len(qd), 256):        # keep the XOR broadcast bounded
-            e = min(s + 256, len(qd))
-            out[s:e] = POPCOUNT[np.bitwise_xor(qd[s:e, None, :], cd[None, :, :])].sum(2)
-        return out
-    d2 = (qd * qd).sum(1)[:, None] + (cd * cd).sum(1)[None, :] - 2.0 * (qd @ cd.T)
-    return np.sqrt(np.maximum(d2, 0.0, out=d2))
+    q, q_norm, hamming = _prepare_descriptors(qd)
+    c, c_norm, _ = _prepare_descriptors(cd)
+    return _distances_prepared(q, q_norm, c, c_norm, hamming)
 
 
 def _two_nearest(dist):
@@ -400,6 +457,13 @@ def _guided_knn(pred, ok, qdesc, cpts, cdesc, search_px):
     if n == 0 or len(cpts) == 0:
         return vals, idx, compared
 
+    # Prepared once for the pair, not once per grid cell. A frame's descriptors
+    # are re-indexed by every cell that falls inside it, and unpacking the same
+    # codes eighty times over was most of what the bit-plane form would have
+    # saved.
+    qprep, qnorm, hamming = _prepare_descriptors(qdesc)
+    cprep, cnorm, _ = _prepare_descriptors(cdesc)
+
     cell = max(float(search_px), 1.0)
     buckets = {}
     for k, (cx, cy) in enumerate(np.floor(cpts / cell).astype(np.int64)):
@@ -418,7 +482,7 @@ def _guided_knn(pred, ok, qdesc, cpts, cdesc, search_px):
             continue
         cand = np.asarray(cand, np.int32)
         qi = np.asarray(qlist, np.int32)
-        dist = _distances(qdesc[qi], cdesc[cand])
+        dist = _distances_prepared(qprep[qi], qnorm[qi], cprep[cand], cnorm[cand], hamming)
         compared += dist.size
         off = np.abs(cpts[cand][None, :, :] - pred[qi][:, None, :])
         dist[(off[:, :, 0] > search_px) | (off[:, :, 1] > search_px)] = np.inf
@@ -432,9 +496,12 @@ def _brute_knn(qdesc, cdesc):
     """Every query against every candidate. The control, not the method."""
     vals = np.full((len(qdesc), 2), np.inf, np.float32)
     idx = np.full((len(qdesc), 2), -1, np.int32)
+    qprep, qnorm, hamming = _prepare_descriptors(qdesc)
+    cprep, cnorm, _ = _prepare_descriptors(cdesc)
     for s in range(0, len(qdesc), 512):
         e = min(s + 512, len(qdesc))
-        v, o = _two_nearest(_distances(qdesc[s:e], cdesc))
+        v, o = _two_nearest(
+            _distances_prepared(qprep[s:e], qnorm[s:e], cprep, cnorm, hamming))
         vals[s:e], idx[s:e] = v, o
     return vals, idx
 
@@ -1081,7 +1148,10 @@ def main():
     print(f'  {len(frames)} photos, app {session.get("appVersion")}')
     hfov = 2 * math.atan(frames[0].tan_h) * RAD
     vfov = 2 * math.atan(frames[0].tan_v) * RAD
-    print(f'  stated lens {hfov:.2f}° x {vfov:.2f}°, '
+    n_corrected = session.get('_lensCorrectedFrames') or 0
+    lens_note = (f' (measured by {session.get("_lensCorrectionSource")}, '
+                 f'{n_corrected}/{len(frames)} frames)' if n_corrected else ' (as stated at capture)')
+    print(f'  lens {hfov:.2f}° x {vfov:.2f}°{lens_note}, '
           f'elevation {min(f.altitude for f in frames):.1f}° to '
           f'{max(f.altitude for f in frames):.1f}°')
 

@@ -12,6 +12,16 @@
       "port": 8642
     },
     {
+      "name": "horizon-scanner-alt",
+      "runtimeExecutable": "python",
+      "runtimeArgs": [
+        "-m",
+        "http.server",
+        "8643"
+      ],
+      "port": 8643
+    },
+    {
       "name": "stitch-lab",
       "runtimeExecutable": ".venv-stitch/Scripts/python.exe",
       "runtimeArgs": [
