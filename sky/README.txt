@@ -1,5 +1,16 @@
-sky/ — Skyline Align
-====================
+sky/ — Skyline Align, and the Planetarium
+=========================================
+
+TWO PAGES, IN ORDER. Align first, then observe.
+
+  skyline-align.html  measures the two offsets that put the survey's bearings
+                      on the real sky.
+  planetarium.html    uses them: your measured horizon, the real sky behind it,
+                      a search box and a scrub bar through the night.
+
+They share one renderer (skyview.js), one skyline detector (panorama-sky.js)
+and one saved alignment, so the horizon drawn on the second page is the horizon
+as corrected on the first. Two copies of any of that would be two answers.
 
 Open sky/skyline-align.html. Load a panorama, set your position, and turn the
 two offset sliders until the stars sit where the real ones are. The azimuth
@@ -81,6 +92,49 @@ it, which should stay on unless you are checking geometry rather than sky.
 This is not an ephemeris and must not be used to point a telescope.
 
 
+THE PLANETARIUM
+---------------
+Open sky/planetarium.html after you have an alignment.
+
+WHY IT EXISTS. Every planetarium on earth will tell you M33 rises at 19:40.
+None of them know about the barn. The question an owner of a fixed telescope
+actually has is "when does M33 clear MY roofline, and how long do I get", and
+answering it needs a measured horizon -- which is what this whole project
+produces. Rise and set here are computed against the survey's 720-bin profile,
+never against a flat horizon nobody has.
+
+WHAT YOU FEED IT. Either a `.horizon-project` (small, carries the measured
+profile and the site position outright) or the panorama PNG (bigger, gives you
+the picture too, and the skyline is re-detected from it with the same worker).
+Both at once is best, and that they draw the same edge is a free check that
+they agree. The profile is remembered between visits; the panorama is not,
+because a multi-megabyte image in localStorage is a page that fails to open.
+
+WHAT IT ANSWERS, for whatever you select:
+
+    now      az  71.0 deg   alt  26.1 deg
+    skyline  59.8 deg here  ->  -33.7 deg
+    highest  01:16 at 78.4 deg (az 180 deg)
+    clears   23:17
+    7.0 hours above your skyline
+
+The track is drawn across the sky with an hour tick on it, solid where the
+object is in the clear and dotted where the skyline is in the way. The bar
+under the sky spans civil dusk to civil dawn rather than midnight to midnight,
+because every pixel of it should be a minute someone could observe in; a
+24-hour bar spends over half its length in daylight.
+
+THE DEEP-SKY CATALOGUE. sky/dso-catalog.json, 570 objects: all 110 Messier
+whatever their magnitude, and everything else to magnitude 10. Built by
+tools/build-dso-catalog.py from OpenNGC -- see below. M102 has never been
+settled and OpenNGC does not carry it; it is aliased here to NGC 5866 and
+labelled as disputed rather than quietly merged.
+
+NOT A POINTING MODEL. Rise and set are good to well under a minute given the
+profile, and the profile is good to whatever the survey measured. The planets
+are good to a few arcminutes and no better. Do not drive a mount from this.
+
+
 DATA, AND ITS LICENCES
 ----------------------
 Both datasets are third-party and both are CC BY-SA 4.0. They are vendored into
@@ -95,6 +149,14 @@ not open where it is needed. It works in aeroplane mode.
            8,969 stars to magnitude 6.5, plus 49 fainter ones that a
            constellation figure needs. Positions J2000.0.
 
+  Deep sky OpenNGC
+           https://github.com/mattiaverga/OpenNGC
+           database_files/NGC.csv and database_files/addendum.csv
+           CC BY-SA 4.0
+           570 objects. Positions J2000.0, magnitudes V where OpenNGC has
+           one and estimated from B - 0.4 where it does not, which the
+           catalogue marks so the page can say so.
+
   Figures  Stellarium, skycultures/modern/index.json
            https://github.com/Stellarium/stellarium
            Text and data CC BY-SA 4.0
@@ -107,6 +169,12 @@ Rebuild after updating either source:
     curl -L -o index.json \
       https://raw.githubusercontent.com/Stellarium/stellarium/master/skycultures/modern/index.json
     python tools/build-star-catalog.py hygdata_v40.csv.gz index.json
+
+And for the deep-sky catalogue:
+
+    curl -L -o NGC.csv       https://raw.githubusercontent.com/mattiaverga/OpenNGC/master/database_files/NGC.csv
+    curl -L -o addendum.csv       https://raw.githubusercontent.com/mattiaverga/OpenNGC/master/database_files/addendum.csv
+    python tools/build-dso-catalog.py NGC.csv addendum.csv
 
 The builder resolves every figure vertex to a catalogue index at build time, so
 the page never looks a HIP number up at runtime. Vertices it cannot resolve —
@@ -142,5 +210,10 @@ KNOWN LIMITS
   is a guess for a panorama from anywhere else. The slider is there for that.
 - The detector assumes sky is above ground everywhere. A panorama containing a
   tall thin object against a bright overcast can lose it.
-- Deep-sky objects are not drawn. Nothing naked-eye is missing except the
-  Milky Way, M31 and the Magellanic Clouds.
+- Skyline Align does not draw deep-sky objects; the planetarium does. Nothing
+  naked-eye is missing from either except the Milky Way and the Magellanic
+  Clouds.
+- A bin the survey never reached is a HOLE in the planetarium's silhouette and
+  reads as "not surveyed at this bearing" rather than as a rise time. A missing
+  bin drawn as flat ground would promise open sky where there may be a wall,
+  and buildHzn2 writes 255 for the same reason.

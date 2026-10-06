@@ -69,6 +69,8 @@
     font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 999px;
     border: 1px solid var(--rule-2); color: var(--ink-2); white-space: nowrap;
   }
+  a.chip { text-decoration: none; }
+  a.chip:hover { border-color: var(--signal); color: var(--signal); }
   .chip.live { border-color: var(--signal); color: var(--signal); }
   .chip.warn { border-color: var(--amber); color: var(--amber); }
   .chip.bad { border-color: var(--coral); color: var(--coral); }
@@ -145,6 +147,7 @@
   <h1>Skyline Align</h1>
   <span class="sub" id="ver">—</span>
   <span class="spacer"></span>
+  <a class="chip" href="./planetarium.html">Planetarium</a>
   <span class="chip" id="twilightChip">no position</span>
   <span class="chip" id="clockChip">—</span>
 </header>
@@ -298,8 +301,9 @@ import {
   julianDay, precess, lstDeg, equatorialToHorizontal, refractionDeg,
   sunPosition, moonPosition, planetPosition, PLANET_NAMES, twilight, wrap360, wrap180
 } from './astro.js';
+import { SkyView, dirOf, colourOf, compassMarks, CARDINALS } from './skyview.js';
+import { detectSkyline, cutSkyTexture } from './panorama-sky.js';
 
-const D = Math.PI / 180;
 const $ = id => document.getElementById(id);
 const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
 
@@ -323,15 +327,18 @@ const state = {
   starSize: 1.6,
   skyMarginDeg: 6,
   fov: 70,
-  lookAz: 0,
-  lookAlt: 10,
   nextUpdateAt: 0,
   lastComputeJd: 0
 };
 
 /* Persisted, because a position typed in the dark once should not have to be
  * typed again, and the offsets are the ANSWER this page exists to produce --
- * losing them to a page refresh would be losing the session's work. */
+ * losing them to a page refresh would be losing the session's work.
+ *
+ * `sky/planetarium.html` reads the same key. That is the point: the offsets
+ * measured here are what place the horizon there, and making the operator copy
+ * two numbers between two pages on the same phone would be a way to get one of
+ * them wrong in the dark. */
 const SAVE_KEY = 'skyline-align/v1';
 function save() {
   try {
@@ -355,261 +362,43 @@ function restore() {
   } catch { /* ditto */ }
 }
 
-/* ------------------------------------------------------------------- WebGL
- *
- * Raw GL, no library, for the same reason js/dome-view.js gives: this is one
- * textured sphere, a few thousand points and a few hundred lines, which is
- * less code than a wrapper around a scene graph would be and has no download.
- */
+/* ----------------------------------------------------------- the renderer */
 
 const canvas = $('view');
-const gl = canvas.getContext('webgl', { antialias: true, alpha: false, preserveDrawingBuffer: false });
+const view = new SkyView(canvas, { onOverlay: drawLabels, onCameraChange: syncCamera });
+view.camera.altDeg = 10;
+view.setLines('grid', compassMarks(), 'static');
 
-function compile(type, src) {
-  const sh = gl.createShader(type);
-  gl.shaderSource(sh, src);
-  gl.compileShader(sh);
-  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-    throw new Error(gl.getShaderInfoLog(sh) + '\n' + src);
-  }
-  return sh;
-}
-function program(vs, fs) {
-  const p = gl.createProgram();
-  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs));
-  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
-  gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
-  return p;
-}
-
-/* Stars. One point each, sized and dimmed by magnitude. `aMag` rather than a
- * precomputed size so the magnitude cut-off is a uniform and changing it costs
- * nothing -- the buffer is only rebuilt when the TIME changes. */
-const starProg = program(`
-attribute vec3 aDir;
-attribute float aMag;
-attribute vec3 aColor;
-uniform mat4 uProj, uView;
-uniform float uMagLimit, uScale, uStarSize;
-varying vec3 vColor;
-varying float vAlpha;
-void main() {
-  gl_Position = uProj * uView * vec4(aDir, 1.0);
-  float room = uMagLimit - aMag;
-  // Below the cut-off the point is pushed off-screen rather than drawn at zero
-  // size: a zero-size GL point is not reliably culled on every driver.
-  if (room < 0.0) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); }
-  /*
-   * SIZED TO BE SEEN, NOT TO BE PHOTOMETRICALLY HONEST.
-   *
-   * The first version started a faintest-magnitude star at 1.1 pixels and the
-   * operator's verdict was simply that the stars were too small. They were: a
-   * one-pixel dot at a quarter alpha is invisible against a panorama on a phone
-   * held at arm's length outdoors, and this page is USED outdoors. A star chart
-   * that cannot be read beside the real sky fails at its only job.
-   *
-   * The floor is now a shade under two pixels, the slope is steeper, and the
-   * faintest star keeps a third of its alpha instead of a quarter, so the
-   * brightness ORDER still reads while nothing drops below the visible. The
-   * size slider multiplies all of it, because how big is big enough depends on
-   * the screen, the darkness and the eyes.
-   */
-  gl_PointSize = clamp(1.8 + room * 1.3, 1.4, 26.0) * uScale * uStarSize;
-  vAlpha = clamp(0.36 + room * 0.24, 0.0, 1.0);
-  vColor = aColor;
-}`, `
-precision mediump float;
-varying vec3 vColor;
-varying float vAlpha;
-void main() {
-  // A round star with a soft edge. Square stars read as pixels, and the eye is
-  // being asked to compare this against real ones.
-  vec2 d = gl_PointCoord - vec2(0.5);
-  float r = length(d) * 2.0;
-  float a = smoothstep(1.0, 0.25, r) * vAlpha;
-  if (a < 0.01) discard;
-  gl_FragColor = vec4(vColor, a);
-}`);
-
-/* Figure lines and the compass graticule share one flat-colour program. */
-const lineProg = program(`
-attribute vec3 aDir;
-uniform mat4 uProj, uView;
-void main() { gl_Position = uProj * uView * vec4(aDir, 1.0); }`, `
-precision mediump float;
-uniform vec4 uColor;
-void main() { gl_FragColor = uColor; }`);
-
-/*
- * The panorama, as the inside of a sphere.
- *
- * UV IS COMPUTED FROM THE DIRECTION IN THE FRAGMENT SHADER, not baked into the
- * mesh the way js/dome-view.js does it. That is the whole trick that makes the
- * two offset sliders free: turning the panorama is a change to one uniform, not
- * a rebuild of a 128x64 mesh sixty times a second while a finger is moving.
- */
-const domeProg = program(`
-attribute vec3 aPos;
-uniform mat4 uProj, uView;
-varying vec3 vDir;
-void main() { vDir = aPos; gl_Position = uProj * uView * vec4(aPos, 1.0); }`, `
-#ifdef GL_FRAGMENT_PRECISION_HIGH
-precision highp float;
-#else
-precision mediump float;
-#endif
-varying vec3 vDir;
-uniform sampler2D uTex;
-uniform float uAzOffset, uAltOffset, uAltMin, uAltMax;
-uniform float uShowCut;
-uniform vec4 uGround;
-void main() {
-  vec3 d = normalize(vDir);
-  float alt = degrees(asin(clamp(d.y, -1.0, 1.0)));
-  float az = degrees(atan(d.x, d.z));
-  // The offsets move the PICTURE, so they are subtracted from the direction
-  // being looked up rather than added to it.
-  float u = fract((az - uAzOffset) / 360.0 + 1.0);
-  float v = (uAltMax - (alt - uAltOffset)) / (uAltMax - uAltMin);
-  if (v < 0.0) { discard; }                       // above the picture: open sky
-  if (v > 1.0) { gl_FragColor = uGround; return; } // below it: ground, not sky
-  vec4 c = texture2D(uTex, vec2(u, v));
-  if (uShowCut > 0.5) {
-    // Mark the cut itself: the first opaque texel below a transparent one.
-    float above = texture2D(uTex, vec2(u, v - 0.004)).a;
-    if (c.a > 0.5 && above < 0.5) { gl_FragColor = vec4(0.18, 0.78, 0.90, 1.0); return; }
-  }
-  if (c.a < 0.02) discard;
-  gl_FragColor = vec4(c.rgb, c.a);
-}`);
-
-/** Full sphere, positions only. Direction-based UV means nothing else is needed. */
-function buildSphere(cols = 192, rows = 96) {
-  const pos = [], idx = [];
-  for (let r = 0; r <= rows; r++) {
-    const alt = 90 - (r / rows) * 180;
-    const ca = Math.cos(alt * D), sa = Math.sin(alt * D);
-    for (let c = 0; c <= cols; c++) {
-      const az = (c / cols) * 360;
-      pos.push(Math.sin(az * D) * ca, sa, Math.cos(az * D) * ca);
-    }
-  }
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      const a = r * (cols + 1) + c, b = a + cols + 1;
-      idx.push(a, b, a + 1, b, b + 1, a + 1);
-    }
-  }
-  return { pos: new Float32Array(pos), idx: new Uint16Array(idx), count: idx.length };
-}
-
-const sphere = buildSphere();
-const buf = {
-  spherePos: gl.createBuffer(), sphereIdx: gl.createBuffer(),
-  starDir: gl.createBuffer(), starMag: gl.createBuffer(), starColor: gl.createBuffer(),
-  figure: gl.createBuffer(), grid: gl.createBuffer(), bodies: gl.createBuffer(),
-  bodyMag: gl.createBuffer(), bodyColor: gl.createBuffer()
-};
-gl.bindBuffer(gl.ARRAY_BUFFER, buf.spherePos);
-gl.bufferData(gl.ARRAY_BUFFER, sphere.pos, gl.STATIC_DRAW);
-gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf.sphereIdx);
-gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, sphere.idx, gl.STATIC_DRAW);
-
-const texture = gl.createTexture();
-gl.bindTexture(gl.TEXTURE_2D, texture);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-
-let starCount = 0, figureCount = 0, gridCount = 0, bodyCount = 0;
 let bodyLabels = [];      // [{name, az, alt}] for the 2D label pass
 
-/*
- * Bind exactly the attributes a draw needs, and turn every other one OFF.
- *
- * MEASURED THE HARD WAY. The star pass enables three attribute arrays; the
- * panorama pass needs one. Leaving the other two enabled leaves them pointed at
- * the star buffers, which hold 9,018 vertices, while the sphere draws 18,721 —
- * so the driver is asked to read an attribute array off its end. The spec calls
- * that undefined and the driver here simply DROPPED THE DRAW: a full sky, no
- * panorama, no GL error, nothing in the console. The stars were fine, so
- * everything pointed at the panorama code, which was correct all along.
- *
- * Attribute state is global to the context, not to the program. Anything that
- * switches programs has to reset it, so no draw can inherit the last one's.
- */
-function useAttribs(prog, spec) {
-  const wanted = new Set();
-  for (const [name, buffer, size] of spec) {
-    const loc = gl.getAttribLocation(prog, name);
-    if (loc < 0) continue;
-    wanted.add(loc);
-    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
-  }
-  for (let i = 0; i < maxVertexAttribs; i++) {
-    if (!wanted.has(i)) gl.disableVertexAttribArray(i);
-  }
-}
-const maxVertexAttribs = gl.getParameter(gl.MAX_VERTEX_ATTRIBS);
-
-function perspective(fovDeg, aspect, near, far) {
-  const f = 1 / Math.tan(fovDeg * D / 2);
-  return new Float32Array([
-    f / aspect, 0, 0, 0, 0, f, 0, 0,
-    0, 0, (far + near) / (near - far), -1,
-    0, 0, (2 * far * near) / (near - far), 0
-  ]);
+function syncCamera() {
+  state.fov = view.camera.fovDeg;
+  $('fov').value = state.fov;
+  $('fovVal').textContent = `${state.fov.toFixed(0)}°`;
+  updateReadout();
 }
 
-/** Look-direction matrix, same convention as js/dome-view.js. */
-function viewMatrix(azDeg, altDeg) {
-  const ca = Math.cos(altDeg * D), sa = Math.sin(altDeg * D);
-  const cz = Math.cos(azDeg * D), sz = Math.sin(azDeg * D);
-  const fx = sz * ca, fy = sa, fz = cz * ca;
-  const rx = cz, ry = 0, rz = -sz;
-  const ux = fy * rz - fz * ry, uy = fz * rx - fx * rz, uz = fx * ry - fy * rx;
-  return new Float32Array([
-    rx, ux, -fx, 0, ry, uy, -fy, 0, rz, uz, -fz, 0, 0, 0, 0, 1
-  ]);
+/** The composition, in drawing order: marks behind figures behind stars, and
+ *  the panorama LAST so its opaque ground covers the stars below it. */
+function layers() {
+  const out = [];
+  if ($('showGrid').checked) out.push({ type: 'lines', name: 'grid', color: [0.18, 0.78, 0.90, 0.30] });
+  out.push({ type: 'lines', name: 'figures', color: [0.42, 0.58, 0.78, 0.42] });
+  out.push({ type: 'points', name: 'stars', magLimit: state.magLimit });
+  out.push({ type: 'points', name: 'bodies', magLimit: state.magLimit, scale: 1.5 });
+  out.push({ type: 'dome' });
+  return out;
 }
 
-/** A direction on the unit sphere from horizontal coordinates. */
-const dirOf = (azDeg, altDeg) => {
-  const ca = Math.cos(altDeg * D);
-  return [Math.sin(azDeg * D) * ca, Math.sin(altDeg * D), Math.cos(azDeg * D) * ca];
-};
-
-/*
- * Star colour from the B-V index.
- *
- * Not a blackbody fit -- a piecewise ramp through the colours the eye actually
- * reports for the few stars whose colour is obvious at all: Rigel blue-white,
- * Vega white, Capella yellow, Betelgeuse and Antares orange-red. Everything
- * fainter than about magnitude 2 looks white to a dark-adapted eye anyway, so
- * accuracy past that would be dishonest.
- */
-function colourOf(ci) {
-  const t = clamp((ci + 0.35) / 2.1, 0, 1);
-  const stops = [
-    [0.00, [0.61, 0.72, 1.00]],
-    [0.22, [0.79, 0.86, 1.00]],
-    [0.36, [1.00, 1.00, 1.00]],
-    [0.52, [1.00, 0.96, 0.82]],
-    [0.72, [1.00, 0.84, 0.62]],
-    [1.00, [1.00, 0.68, 0.50]]
-  ];
-  for (let i = 1; i < stops.length; i++) {
-    if (t <= stops[i][0]) {
-      const [a, ca] = stops[i - 1], [b, cb] = stops[i];
-      const k = (t - a) / (b - a || 1);
-      return [0, 1, 2].map(j => ca[j] + (cb[j] - ca[j]) * k);
-    }
-  }
-  return stops[stops.length - 1][1];
+function requestDraw() {
+  view.starSize = state.starSize;
+  view.camera.fovDeg = state.fov;
+  Object.assign(view.dome, {
+    azOffset: state.azOffset, altOffset: state.altOffset,
+    topDeg: state.topDeg, spanDeg: state.spanDeg, showCut: $('showCut').checked
+  });
+  view.setLayers(layers());
+  view.requestDraw();
 }
 
 /* -------------------------------------------------------- the sky, computed */
@@ -653,10 +442,7 @@ function computeSky() {
     cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
   }
   state.altAz = altAz;
-  starCount = n;
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.starDir); gl.bufferData(gl.ARRAY_BUFFER, dirs, gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.starMag); gl.bufferData(gl.ARRAY_BUFFER, mags, gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.starColor); gl.bufferData(gl.ARRAY_BUFFER, cols, gl.DYNAMIC_DRAW);
+  view.setPoints('stars', { dirs, mags, colors: cols });
 
   buildFigures();
   buildBodies(jd, lst, doRefract);
@@ -672,6 +458,7 @@ function computeSky() {
 /** Constellation and asterism lines, from the star directions just computed. */
 function buildFigures() {
   const cat = state.catalogue, aa = state.altAz;
+  if (!cat || !aa) return;
   const verts = [];
   const push = groups => {
     for (const g of groups) {
@@ -687,9 +474,7 @@ function buildFigures() {
   };
   if ($('showCon').checked) push(cat.constellations);
   if ($('showAst').checked) push(cat.asterisms);
-  figureCount = verts.length / 3;
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.figure);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.DYNAMIC_DRAW);
+  view.setLines('figures', new Float32Array(verts));
 }
 
 /**
@@ -702,7 +487,10 @@ function buildFigures() {
  */
 function buildBodies(jd, lst, doRefract) {
   bodyLabels = [];
-  if (!$('showBodies').checked) { bodyCount = 0; return; }
+  if (!$('showBodies').checked) {
+    view.setPoints('bodies', { dirs: new Float32Array(0), mags: new Float32Array(0), colors: new Float32Array(0) });
+    return;
+  }
   const dirs = [], mags = [], cols = [];
   const add = (name, raDec, mag, colour) => {
     const h = equatorialToHorizontal(raDec.raDeg, raDec.decDeg, lst, state.lat);
@@ -721,161 +509,25 @@ function buildBodies(jd, lst, doRefract) {
     const p = planetPosition(name, jd);
     if (p) add(name, p, p.magnitude, name === 'Mars' ? [1.0, 0.62, 0.48] : [1.0, 0.97, 0.85]);
   }
-  bodyCount = mags.length;
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.bodies); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(dirs), gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.bodyMag); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(mags), gl.DYNAMIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.bodyColor); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(cols), gl.DYNAMIC_DRAW);
+  view.setPoints('bodies', {
+    dirs: new Float32Array(dirs), mags: new Float32Array(mags), colors: new Float32Array(cols)
+  });
 }
 
-/** Compass marks: a vertical line at every 10°, taller at the cardinals. */
-function buildGrid() {
-  const v = [];
-  for (let az = 0; az < 360; az += 10) {
-    const cardinal = az % 90 === 0;
-    const top = cardinal ? 12 : 4;
-    for (let a = -6; a < top; a += 2) {
-      const d1 = dirOf(az, a), d2 = dirOf(az, a + 2);
-      v.push(d1[0], d1[1], d1[2], d2[0], d2[1], d2[2]);
-    }
-  }
-  // A horizon ring, which is the line the panorama's own horizon should land on.
-  for (let az = 0; az < 360; az += 1) {
-    const d1 = dirOf(az, 0), d2 = dirOf(az + 1, 0);
-    v.push(d1[0], d1[1], d1[2], d2[0], d2[1], d2[2]);
-  }
-  gridCount = v.length / 3;
-  gl.bindBuffer(gl.ARRAY_BUFFER, buf.grid);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(v), gl.STATIC_DRAW);
-}
-buildGrid();
+/* ------------------------------------------------------------- the labels */
 
-/* ------------------------------------------------------------------- draw */
-
-const labelCanvas = document.createElement('canvas');
-let labelCtx = null;
-
-function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-  const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
-  if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w; canvas.height = h;
-  }
-}
-
-function draw() {
-  resize();
-  gl.viewport(0, 0, canvas.width, canvas.height);
-  gl.clearColor(0.004, 0.012, 0.024, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  gl.disable(gl.DEPTH_TEST);
-  gl.enable(gl.BLEND);
-  gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
-  const proj = perspective(state.fov, canvas.width / canvas.height, 0.01, 10);
-  const view = viewMatrix(state.lookAz, state.lookAlt);
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-
-  // 1. Compass marks, behind everything.
-  if ($('showGrid').checked && gridCount) {
-    gl.useProgram(lineProg);
-    gl.uniformMatrix4fv(gl.getUniformLocation(lineProg, 'uProj'), false, proj);
-    gl.uniformMatrix4fv(gl.getUniformLocation(lineProg, 'uView'), false, view);
-    gl.uniform4f(gl.getUniformLocation(lineProg, 'uColor'), 0.18, 0.78, 0.90, 0.30);
-    useAttribs(lineProg, [['aDir', buf.grid, 3]]);
-    gl.drawArrays(gl.LINES, 0, gridCount);
-  }
-
-  // 2. Figure lines, then 3. stars on top of them.
-  if (figureCount) {
-    gl.useProgram(lineProg);
-    gl.uniformMatrix4fv(gl.getUniformLocation(lineProg, 'uProj'), false, proj);
-    gl.uniformMatrix4fv(gl.getUniformLocation(lineProg, 'uView'), false, view);
-    gl.uniform4f(gl.getUniformLocation(lineProg, 'uColor'), 0.42, 0.58, 0.78, 0.42);
-    useAttribs(lineProg, [['aDir', buf.figure, 3]]);
-    gl.drawArrays(gl.LINES, 0, figureCount);
-  }
-
-  const drawPoints = (dirBuf, magBuf, colBuf, count, magLimit, scale) => {
-    if (!count) return;
-    gl.useProgram(starProg);
-    gl.uniformMatrix4fv(gl.getUniformLocation(starProg, 'uProj'), false, proj);
-    gl.uniformMatrix4fv(gl.getUniformLocation(starProg, 'uView'), false, view);
-    gl.uniform1f(gl.getUniformLocation(starProg, 'uMagLimit'), magLimit);
-    gl.uniform1f(gl.getUniformLocation(starProg, 'uScale'), scale);
-    gl.uniform1f(gl.getUniformLocation(starProg, 'uStarSize'), state.starSize);
-    useAttribs(starProg, [['aDir', dirBuf, 3], ['aMag', magBuf, 1], ['aColor', colBuf, 3]]);
-    gl.drawArrays(gl.POINTS, 0, count);
-  };
-  // A narrow field means the eye is closer in, so the points grow with the zoom
-  // — otherwise a 15-degree view shows the same speck sizes as a 120-degree one.
-  const zoomScale = clamp(70 / state.fov, 0.7, 2.4) * dpr;
-  drawPoints(buf.starDir, buf.starMag, buf.starColor, starCount, state.magLimit, zoomScale);
-  drawPoints(buf.bodies, buf.bodyMag, buf.bodyColor, bodyCount, state.magLimit, zoomScale * 1.5);
-
-  // 4. The panorama last, so its opaque ground covers the stars below it.
-  if (state.texReady) {
-    gl.useProgram(domeProg);
-    gl.uniformMatrix4fv(gl.getUniformLocation(domeProg, 'uProj'), false, proj);
-    gl.uniformMatrix4fv(gl.getUniformLocation(domeProg, 'uView'), false, view);
-    gl.uniform1f(gl.getUniformLocation(domeProg, 'uAzOffset'), state.azOffset);
-    gl.uniform1f(gl.getUniformLocation(domeProg, 'uAltOffset'), state.altOffset);
-    gl.uniform1f(gl.getUniformLocation(domeProg, 'uAltMin'), state.topDeg - state.spanDeg);
-    gl.uniform1f(gl.getUniformLocation(domeProg, 'uAltMax'), state.topDeg);
-    gl.uniform1f(gl.getUniformLocation(domeProg, 'uShowCut'), $('showCut').checked ? 1 : 0);
-    gl.uniform4f(gl.getUniformLocation(domeProg, 'uGround'), 0.02, 0.035, 0.045, 1.0);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.uniform1i(gl.getUniformLocation(domeProg, 'uTex'), 0);
-    useAttribs(domeProg, [['aPos', buf.spherePos, 3]]);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, buf.sphereIdx);
-    gl.drawElements(gl.TRIANGLES, sphere.count, gl.UNSIGNED_SHORT, 0);
-  }
-
-  drawLabels(proj, view);
-  updateReadout();
-}
-
-/*
- * Labels in 2D over the GL canvas.
- *
- * Text in WebGL means a glyph atlas, and there is no reason to build one for a
- * few dozen names. A second canvas stacked on top, projected with the same two
- * matrices, costs nothing and reads better.
- */
-function drawLabels(proj, view) {
-  if (!labelCtx) {
-    labelCanvas.style.cssText = 'position:absolute;inset:0;pointer-events:none;width:100%;height:100%';
-    canvas.parentElement.insertBefore(labelCanvas, $('readout'));
-    labelCtx = labelCanvas.getContext('2d');
-  }
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  labelCanvas.width = canvas.width; labelCanvas.height = canvas.height;
-  const ctx = labelCtx;
-  ctx.clearRect(0, 0, labelCanvas.width, labelCanvas.height);
+function drawLabels(ctx, { project, dpr }) {
   ctx.font = `${11 * dpr}px ui-monospace, monospace`;
   ctx.textBaseline = 'middle';
-
-  const project = (az, alt) => {
-    const d = dirOf(az, alt);
-    // view * dir, then proj. Only the pieces that matter.
-    const vx = view[0] * d[0] + view[4] * d[1] + view[8] * d[2];
-    const vy = view[1] * d[0] + view[5] * d[1] + view[9] * d[2];
-    const vz = view[2] * d[0] + view[6] * d[1] + view[10] * d[2];
-    if (vz > -0.001) return null;                 // behind the camera
-    const cx = proj[0] * vx / -vz, cy = proj[5] * vy / -vz;
-    if (Math.abs(cx) > 1.05 || Math.abs(cy) > 1.05) return null;
-    return [(cx * 0.5 + 0.5) * labelCanvas.width, (0.5 - cy * 0.5) * labelCanvas.height];
-  };
 
   // Cardinal points on the horizon ring. These are the ground truth the whole
   // exercise is against, so they are drawn brightest.
   if ($('showGrid').checked) {
     ctx.fillStyle = 'rgba(46,199,230,0.92)';
-    for (const [az, name] of [[0, 'N'], [45, 'NE'], [90, 'E'], [135, 'SE'],
-      [180, 'S'], [225, 'SW'], [270, 'W'], [315, 'NW']]) {
+    ctx.textAlign = 'center';
+    for (const [az, name] of CARDINALS) {
       const p = project(az, 0);
-      if (p) { ctx.textAlign = 'center'; ctx.fillText(name, p[0], p[1] - 14 * dpr); }
+      if (p) ctx.fillText(name, p[0], p[1] - 14 * dpr);
     }
   }
 
@@ -898,11 +550,14 @@ function drawLabels(proj, view) {
       if (p) ctx.fillText(name, p[0] + 8 * dpr, p[1]);
     }
   }
+  // The readout rides the frame, not the camera: the offsets and the position
+  // change it too, and those arrive without the camera moving at all.
+  updateReadout();
 }
 
 function updateReadout() {
   const lines = [];
-  lines.push(`look   az ${wrap360(state.lookAz).toFixed(1).padStart(5)}°  alt ${state.lookAlt.toFixed(1).padStart(5)}°`);
+  lines.push(`look   az ${wrap360(view.camera.azDeg).toFixed(1).padStart(5)}°  alt ${view.camera.altDeg.toFixed(1).padStart(5)}°`);
   lines.push(`offset az ${state.azOffset >= 0 ? '+' : ''}${state.azOffset.toFixed(2)}°  alt ${state.altOffset >= 0 ? '+' : ''}${state.altOffset.toFixed(2)}°`);
   if (state.lat !== null) {
     lines.push(`site   ${state.lat.toFixed(4)}, ${state.lon.toFixed(4)}`);
@@ -912,66 +567,19 @@ function updateReadout() {
   $('readout').textContent = lines.join('\n');
 }
 
-let frameQueued = false;
-function requestDraw() {
-  if (frameQueued) return;
-  frameQueued = true;
-  requestAnimationFrame(() => { frameQueued = false; draw(); });
-}
-
 /* ------------------------------------------------- panorama and sky cut-out */
 
-/**
- * Detect the skyline and punch the sky out of the image.
- *
- * The detector is `workers/segment.worker.js` — the SAME one the capture app
- * runs on every frame at 10 Hz. Writing a second one for this page would mean
- * two different answers to "where is the skyline", and the entire value of this
- * tool is that it shows you the app's own answer next to the real sky.
- *
- * Two things have to be done to a panorama that a camera frame does not need:
- *
- * WRAP. A panorama's left and right edges are the same bearing. The segmenter
- * works column by column with a continuity prior, so it has no idea, and the
- * skyline can step at the seam. The image is fed to it with a slice of each end
- * wrapped onto the other, and the padding is cut off the answer.
- *
- * UNPAINTED BLACK. A stitched panorama has black where no photograph reached.
- * The detector's sky cue is blueness and smoothness, and black is neither, so
- * it reads unpainted panel as GROUND and traces the boundary along the top of
- * the black instead of along the roofline. Those pixels are filled with the
- * column's own sky colour before detection, and punched out afterwards.
- */
 async function processPanorama(img) {
   const note = $('segNote');
   note.className = 'note';
   note.textContent = 'detecting the skyline…';
 
-  const srcW = img.width, srcH = img.height;
-  // The detector's cost is per column times per row, and a 3240-wide panorama
-  // is far more columns than the skyline has detail. 1440 is one column per
-  // quarter degree, which is finer than the 720-bin profile the app produces.
-  const workW = Math.min(1440, srcW);
-  const workH = Math.max(32, Math.round(srcH * workW / srcW));
-  const pad = Math.round(workW * 0.04);
-
-  const c = document.createElement('canvas');
-  c.width = workW + pad * 2; c.height = workH;
-  const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.drawImage(img, 0, 0, srcW, srcH, pad, 0, workW, workH);
-  // The wrap: right end onto the left margin, left end onto the right.
-  ctx.drawImage(img, srcW - srcW * pad / workW, 0, srcW * pad / workW, srcH, 0, 0, pad, workH);
-  ctx.drawImage(img, 0, 0, srcW * pad / workW, srcH, pad + workW, 0, pad, workH);
-
-  const padded = ctx.getImageData(0, 0, c.width, c.height);
-  const unpainted = fillUnpainted(padded);
-
-  // A detector that cannot start must not leave the operator watching the word
-  // "detecting" forever. The panorama is still worth showing uncut.
   let result;
   try {
-    result = await segment(padded);
+    result = await detectSkyline(img);
   } catch (err) {
+    // A detector that cannot start must not leave the operator watching the
+    // word "detecting" forever. The panorama is still worth showing uncut.
     note.className = 'note bad';
     note.textContent = `the skyline detector did not run: ${err.message}. `
       + 'Showing the panorama with the sky left in.';
@@ -979,219 +587,36 @@ async function processPanorama(img) {
     buildTexture(img);
     return;
   }
-  // Trim the wrap padding back off.
-  const boundary = new Float32Array(workW);
-  for (let x = 0; x < workW; x++) boundary[x] = result.boundary[x + pad];
 
-  note.textContent = `skyline traced over ${workW} columns, `
+  note.textContent = `skyline traced over ${result.width} columns, `
     + `${(result.skyFraction * 100).toFixed(0)}% sky`
-    + (unpainted ? `, ${(unpainted * 100).toFixed(1)}% of the panel unpainted` : '') + '.';
+    + (result.unpaintedFraction ? `, ${(result.unpaintedFraction * 100).toFixed(1)}% of the panel unpainted` : '') + '.';
   if (result.noSky) { note.className = 'note warn'; note.textContent += ' Almost no sky found, so the cut may be wrong.'; }
   state.segMessage = note.textContent;
   state.segClass = note.className;
 
-  state.boundary = boundary;
-  state.boundaryWidth = workW;
-  state.boundaryHeight = workH;
+  state.boundary = result.boundary;
+  state.boundaryWidth = result.width;
+  state.boundaryHeight = result.height;
   buildTexture(img);
 }
 
-/** Paint unpainted black with a plausible sky, and report how much there was. */
-function fillUnpainted(imageData) {
-  const { width: w, height: h, data } = imageData;
-  let black = 0;
-  for (let x = 0; x < w; x++) {
-    // Walk down from the top; everything black before the first real pixel is
-    // panel that was never photographed.
-    let firstReal = -1;
-    for (let y = 0; y < h; y++) {
-      const p = (y * w + x) * 4;
-      if (data[p] + data[p + 1] + data[p + 2] > 24) { firstReal = y; break; }
-    }
-    if (firstReal <= 0) continue;
-    const q = (firstReal * w + x) * 4;
-    const r = data[q], g = data[q + 1], b = data[q + 2];
-    for (let y = 0; y < firstReal; y++) {
-      const p = (y * w + x) * 4;
-      data[p] = r; data[p + 1] = g; data[p + 2] = b;
-      black++;
-    }
-  }
-  return black / (w * h);
-}
-
-let segWorker = null, segSeq = 0;
-function segment(imageData) {
-  if (!segWorker) {
-    try {
-      segWorker = new Worker('../workers/segment.worker.js');
-    } catch (err) {
-      return Promise.reject(new Error(`cannot start ../workers/segment.worker.js (${err.message})`));
-    }
-    // A worker that dies later — a parse error inside it, say — rejects
-    // nothing on its own, so the caller would wait for a message that is never
-    // coming. Turn that into a failure the operator can read.
-    segWorker.addEventListener('error', e => {
-      const dead = segWorker;
-      segWorker = null;
-      dead.dispatchEvent(new CustomEvent('seg-dead', { detail: e.message || 'worker error' }));
-    });
-  }
-  const id = ++segSeq;
-  const worker = segWorker;
-  return new Promise((resolve, reject) => {
-    const done = fn => (...args) => {
-      worker.removeEventListener('message', onMessage);
-      worker.removeEventListener('seg-dead', onDead);
-      fn(...args);
-    };
-    const onMessage = e => {
-      if (e.data.id !== id) return;
-      if (e.data.error) done(reject)(new Error(e.data.error)); else done(resolve)(e.data);
-    };
-    const onDead = e => done(reject)(new Error(e.detail));
-    worker.addEventListener('message', onMessage);
-    worker.addEventListener('seg-dead', onDead);
-    const copy = new Uint8ClampedArray(imageData.data);
-    worker.postMessage({ id, width: imageData.width, height: imageData.height, buffer: copy.buffer },
-      [copy.buffer]);
-  });
-}
-
-/**
- * Build the RGBA texture: the panorama with everything above the skyline made
- * transparent.
- *
- * THE SIZE IS ROUNDED UP TO A POWER OF TWO, AND THAT IS NOT AN OPTIMISATION.
- * WebGL 1 will not wrap a non-power-of-two texture: with `TEXTURE_WRAP_S` set
- * to `REPEAT` such a texture is INCOMPLETE, and an incomplete texture samples
- * as opaque black everywhere. Measured in this page's own context: a 64x64
- * REPEAT texture returned rgba(255,0,0,255); the same content at 1440x388
- * returned rgba(0,0,0,255).
- *
- * The symptom is the reason this is written down. There is no GL error, no
- * console warning and no failed draw — the panorama renders perfectly, in
- * black, over a black sky. It looks exactly like a draw that never happened.
- *
- * REPEAT is worth keeping rather than working around with CLAMP_TO_EDGE,
- * because a panorama's left and right edges are the same bearing and the
- * texture filter has to blend across that seam. Clamping puts a one-texel
- * stripe of stretched edge pixel at due-whatever-azimuth-zero-is, which is a
- * line in the sky exactly where someone is trying to judge an alignment.
- *
- * Resampling does not disturb the geometry: the fragment shader computes v from
- * ALTITUDE rather than from the image's aspect, so the mapping stays linear
- * whatever the texture's height.
- */
 function buildTexture(img) {
-  const maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-  const pot = n => Math.pow(2, Math.ceil(Math.log2(Math.max(1, n))));
-  const w = Math.min(pot(img.width), maxTex);
-  const h = Math.min(pot(img.height), maxTex);
-  const c = state.texCanvas || (state.texCanvas = document.createElement('canvas'));
-  c.width = w; c.height = h;
-  const ctx = c.getContext('2d', { willReadFrequently: true });
-  ctx.clearRect(0, 0, w, h);
-  ctx.drawImage(img, 0, 0, w, h);
-
-  const px = ctx.getImageData(0, 0, w, h);
-  const d = px.data;
-
-  /*
-   * PANEL NOBODY PHOTOGRAPHED IS NOT SKY, AND SAYING SO MATTERS.
-   *
-   * A stitched panorama is full of holes: 13.6% of the 2026-09-23 render is
-   * unpainted, and 6.4% of the rows below the top of the painted content are
-   * gaps INSIDE the terrain, where the solver dropped a frame. Rendered
-   * transparent they look exactly like an over-aggressive sky cut, and the cut
-   * gets blamed for damage it did not do. The toggle paints them instead, so
-   * the two can be told apart in one glance.
-   */
-  const markUnpainted = $('showUnpainted').checked;
-  const isUnpainted = p => d[p] + d[p + 1] + d[p + 2] <= 24;
-  for (let p = 0; p < d.length; p += 4) {
-    if (!isUnpainted(p)) continue;
-    if (markUnpainted) { d[p] = 86; d[p + 1] = 32; d[p + 2] = 58; d[p + 3] = 190; }
-    else d[p + 3] = 0;
-  }
-
-  if ($('cutSky').checked && state.boundary) {
-    const bw = state.boundaryWidth, bh = state.boundaryHeight;
-    /*
-     * THE CUT IS MADE ABOVE THE TRACED SKYLINE, NOT ON IT.
-     *
-     * The detector is tuned for 384x288 camera frames and on a panorama it errs
-     * LOW — it clips rooflines and treetops, and the operator's verdict on the
-     * first version was blunt: it cut out so much that the skyline being
-     * checked was itself damaged. Which is the wrong way round. A band of real
-     * sky left in costs only the stars inside it; a bite taken out of a
-     * roofline destroys the very edge the whole page exists to align.
-     *
-     * So the cut sits `skyMarginDeg` above the trace, and fades in across the
-     * band rather than ending on a hard line — a crisp horizontal edge in open
-     * sky reads as a real object and is precisely the thing not to draw here.
-     */
-    const marginPx = Math.max(0, state.skyMarginDeg / Math.max(1, state.spanDeg) * h);
-    const fade = Math.max(2, marginPx * 0.55);
-
-    /*
-     * THE CUT MAY NOT CROSS THE HORIZON, WHATEVER THE DETECTOR SAYS.
-     *
-     * MEASURED on the 2026-09-23 dusk capture, which the operator reported as
-     * "large chunk missing but rest of horizon done very well". The detector's
-     * traced skyline, as a fraction of the way down the image:
-     *
-     *     az  90    74%          az 135    90%
-     *     az 105    98%          az 150    69%
-     *     az 120    97%
-     *
-     * Between 105 and 135 degrees it declared the entire column sky, down to
-     * the bottom edge, and the cut duly deleted the horizon there. That is the
-     * sunset glow standing over a dark, low, distant treeline: the blueness and
-     * texture cues both collapse, and nothing in a per-column detector can
-     * recover it.
-     *
-     * But a skyline BELOW the horizon is not a hard case, it is a wrong answer.
-     * The operator is standing on the ground; the obstruction they are
-     * surveying is above them. `js/survey.js` already takes this position, and
-     * clamps every profile sample to `clamp(alt, 0, 90)`. So the cut is
-     * clamped the same way, and a detector failure of this kind now costs a few
-     * degrees of treetop instead of the whole bearing.
-     *
-     * It is a floor, never a ceiling: a column tracing a roofline at 60 degrees
-     * is left entirely alone, because cutting LESS is always the safe
-     * direction and a tall obstruction is exactly what this survey is for.
-     */
-    const horizonRow = clamp(state.topDeg / Math.max(1, state.spanDeg), 0, 1) * h;
-    let clamped = 0;
-
-    for (let x = 0; x < w; x++) {
-      // The boundary is sampled in the detector's column space; interpolate.
-      const bx = x / w * bw;
-      const i0 = Math.min(bw - 1, Math.max(0, Math.floor(bx)));
-      const i1 = Math.min(bw - 1, i0 + 1);
-      const t = bx - i0;
-      const rowWork = state.boundary[i0] * (1 - t) + state.boundary[i1] * t;
-      let traced = rowWork / bh * h;
-      if (traced > horizonRow) { traced = horizonRow; clamped++; }
-      const cut = traced - marginPx;
-      for (let y = 0; y < h; y++) {
-        const p = (y * w + x) * 4;
-        if (d[p + 3] === 0) continue;                       // already unpainted
-        if (y < cut) d[p + 3] = 0;
-        else if (y < cut + fade) {
-          d[p + 3] = Math.min(d[p + 3], Math.round(255 * (y - cut) / fade));
-        }
-      }
-    }
-    reportClamp(clamped, w);
-  }
-  ctx.putImageData(px, 0, 0);
-
-  gl.bindTexture(gl.TEXTURE_2D, texture);
-  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
-  state.texReady = true;
+  const cut = cutSkyTexture(img, {
+    boundary: state.boundary,
+    boundaryWidth: state.boundaryWidth,
+    boundaryHeight: state.boundaryHeight,
+    topDeg: state.topDeg,
+    spanDeg: state.spanDeg,
+    skyMarginDeg: state.skyMarginDeg,
+    cutSky: $('cutSky').checked,
+    markUnpainted: $('showUnpainted').checked,
+    maxTexSize: view.maxTexSize,
+    canvas: state.texCanvas
+  });
+  state.texCanvas = cut.canvas;
+  if ($('cutSky').checked && state.boundary) reportClamp(cut.clampedColumns, cut.width);
+  view.setTexture(cut.canvas);
   requestDraw();
 }
 
@@ -1459,36 +884,8 @@ function wireUp() {
       requestDraw();
     });
   }
-  $('lookN').addEventListener('click', () => { state.lookAz = 0; requestDraw(); });
-  $('lookH').addEventListener('click', () => { state.lookAlt = 5; requestDraw(); });
-
-  // Drag to look around. Pointer events so a finger and a mouse are the same code.
-  let dragging = false, lastX = 0, lastY = 0;
-  canvas.addEventListener('pointerdown', e => {
-    dragging = true; lastX = e.clientX; lastY = e.clientY;
-    canvas.setPointerCapture(e.pointerId); canvas.classList.add('dragging');
-  });
-  canvas.addEventListener('pointermove', e => {
-    if (!dragging) return;
-    // Degrees per pixel scales with the field of view, so the drag feels the
-    // same whether zoomed in or out.
-    const k = state.fov / canvas.clientHeight;
-    state.lookAz = wrap360(state.lookAz - (e.clientX - lastX) * k);
-    state.lookAlt = clamp(state.lookAlt + (e.clientY - lastY) * k, -85, 85);
-    lastX = e.clientX; lastY = e.clientY;
-    requestDraw();
-  });
-  const stop = e => { dragging = false; canvas.classList.remove('dragging'); };
-  canvas.addEventListener('pointerup', stop);
-  canvas.addEventListener('pointercancel', stop);
-  canvas.addEventListener('wheel', e => {
-    e.preventDefault();
-    state.fov = clamp(state.fov * (e.deltaY > 0 ? 1.08 : 1 / 1.08), 10, 120);
-    $('fov').value = state.fov; $('fovVal').textContent = `${state.fov.toFixed(0)}°`;
-    requestDraw();
-  }, { passive: false });
-
-  window.addEventListener('resize', requestDraw);
+  $('lookN').addEventListener('click', () => view.lookAt(0, view.camera.altDeg));
+  $('lookH').addEventListener('click', () => view.lookAt(view.camera.azDeg, 5));
 }
 
 function toLocalInput(d) {

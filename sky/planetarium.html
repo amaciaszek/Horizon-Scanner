@@ -1,0 +1,1534 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Planetarium — Horizon Survey</title>
+<!--
+  Your sky, over your skyline, with a handle on time.
+
+  WHAT THIS IS FOR, AND WHY IT IS NOT STELLARIUM. Every planetarium on earth
+  will tell you that M33 rises at 19:40. None of them know about the barn. The
+  question an owner of a fixed telescope actually has is "when does M33 clear
+  MY roofline, and how long do I get", and that question needs a measured
+  horizon -- which is the thing this whole project produces.
+
+  So this page takes the survey's own horizon profile, puts the real sky behind
+  it, and lets you scrub through the night watching a chosen object's track
+  against it. Rise and set are computed against the measured skyline, never
+  against a flat horizon nobody has.
+
+  WHERE THE ALIGNMENT COMES FROM. sky/skyline-align.html measures the two
+  offsets that put the survey's bearings on the real sky, and saves them. This
+  page reads the same saved values, so the horizon drawn here is the horizon as
+  corrected there. Align first; the offsets carry across on their own.
+
+  NO NETWORK, ON PURPOSE. Both catalogues ship with the page (star-catalog.json
+  ~260 KB, dso-catalog.json ~80 KB) and nothing is fetched at runtime beyond
+  them, so it works in aeroplane mode standing in a field.
+
+  NOT AN EPHEMERIS, AND NOT A POINTING MODEL. See sky/astro.js for what is and
+  is not modelled. Rise and set times are good to well under a minute; the
+  planets are good to a few arcminutes and no better. Do not drive a mount
+  from this.
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --ink: #e8f4f8;
+    --ink-2: #a8bfc9;
+    --ink-3: #7d949e;
+    --chassis: #060d11;
+    --panel: #0d171c;
+    --panel-2: #122029;
+    --rule: #1e2f37;
+    --rule-2: #2b414b;
+    --signal: #2ec7e6;
+    --amber: #e0a33c;
+    --coral: #ff7a59;
+    --violet: #b48cf2;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, system-ui, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; height: 100%; }
+  body {
+    background: var(--chassis); color: var(--ink);
+    font-family: var(--sans); font-size: 14px; line-height: 1.45;
+    display: flex; flex-direction: column; overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  header {
+    flex: none; display: flex; align-items: baseline; gap: 12px;
+    padding: 10px 14px; border-bottom: 1px solid var(--rule); background: var(--panel);
+  }
+  header h1 { margin: 0; font-size: 15px; font-weight: 620; letter-spacing: -0.01em; }
+  header .sub { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  header .spacer { flex: 1; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--rule-2); color: var(--ink-2); white-space: nowrap;
+    text-decoration: none;
+  }
+  a.chip:hover { border-color: var(--signal); color: var(--signal); }
+  .chip.live { border-color: var(--signal); color: var(--signal); }
+  .chip.warn { border-color: var(--amber); color: var(--amber); }
+  .chip.bad { border-color: var(--coral); color: var(--coral); }
+
+  main { flex: 1; display: flex; min-height: 0; }
+  #left { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #stage { flex: 1; position: relative; min-height: 0; background: #000; }
+  #view { display: block; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+  #view.dragging { cursor: grabbing; }
+
+  #readout {
+    position: absolute; left: 10px; top: 10px; pointer-events: none;
+    font-family: var(--mono); font-size: 11px; color: var(--ink-2);
+    background: rgba(6,13,17,0.72); border: 1px solid var(--rule);
+    border-radius: 8px; padding: 6px 9px; white-space: pre; line-height: 1.5;
+  }
+  #hint {
+    position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+    pointer-events: none; font-size: 12px; color: var(--ink-3);
+    background: rgba(6,13,17,0.72); border: 1px solid var(--rule);
+    border-radius: 999px; padding: 4px 14px; max-width: 90%; text-align: center;
+  }
+
+  /* The scrub bar. It is the width of the sky on purpose: this is the control
+     the page is built around, and a 180-pixel slider in a side panel would
+     make an hour about four pixels wide. */
+  #scrub {
+    flex: none; border-top: 1px solid var(--rule); background: var(--panel);
+    padding: 7px 12px 9px; display: flex; align-items: center; gap: 10px;
+  }
+  #scrub .when {
+    font-family: var(--mono); font-size: 15px; color: var(--signal);
+    min-width: 72px; text-align: center; font-variant-numeric: tabular-nums;
+  }
+  #scrub .ends { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); white-space: nowrap; }
+  #scrub input[type=range] { flex: 1; min-width: 80px; }
+  #scrub button { width: auto; padding: 5px 10px; }
+
+  aside {
+    flex: none; width: 330px; background: var(--panel); border-left: 1px solid var(--rule);
+    overflow-y: auto; padding: 12px 14px 40px; -webkit-overflow-scrolling: touch;
+  }
+  fieldset { border: 1px solid var(--rule); border-radius: 10px; margin: 0 0 12px; padding: 10px 11px 12px; }
+  legend {
+    font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.09em;
+    color: var(--ink-3); padding: 0 5px;
+  }
+  label.row { display: flex; align-items: center; gap: 8px; margin: 7px 0; font-size: 12.5px; }
+  label.row > span:first-child { flex: 1; color: var(--ink-2); }
+  .val { font-family: var(--mono); font-size: 11.5px; color: var(--signal); min-width: 62px; text-align: right; }
+  input[type=range] { width: 100%; accent-color: var(--signal); margin: 2px 0 0; }
+  input[type=number], input[type=text], input[type=date], input[type=datetime-local], select {
+    background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule-2);
+    border-radius: 7px; padding: 5px 7px; font-family: var(--mono); font-size: 12px; width: 100%;
+  }
+  input[type=checkbox] { accent-color: var(--signal); width: 15px; height: 15px; }
+  button {
+    background: var(--panel-2); color: var(--ink); border: 1px solid var(--rule-2);
+    border-radius: 8px; padding: 7px 10px; font-size: 12.5px; font-family: var(--sans);
+    cursor: pointer; width: 100%;
+  }
+  button:hover:not(:disabled) { border-color: var(--signal); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+  .grid2.tight { gap: 5px; }
+  .note { font-size: 11.5px; color: var(--ink-3); margin: 7px 0 0; }
+  .note.warn { color: var(--amber); }
+  .note.bad { color: var(--coral); }
+  .slider-block { margin: 11px 0 3px; }
+  .slider-block .head { display: flex; align-items: baseline; gap: 8px; }
+  .slider-block .head span:first-child { flex: 1; font-size: 12.5px; color: var(--ink-2); }
+  hr { border: 0; border-top: 1px solid var(--rule); margin: 11px 0; }
+
+  #results { list-style: none; margin: 8px 0 0; padding: 0; max-height: 232px; overflow-y: auto; }
+  #results li {
+    padding: 5px 7px; border-radius: 7px; cursor: pointer; font-size: 12.5px;
+    display: flex; align-items: baseline; gap: 7px;
+  }
+  #results li:hover, #results li.sel { background: var(--panel-2); }
+  #results .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #results .mg { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  #results .up { color: var(--signal); }
+  #results .down { color: var(--ink-3); }
+
+  #card { font-size: 12.5px; }
+  #card .title { font-size: 14px; font-weight: 620; color: var(--amber); }
+  #card .sub2 { color: var(--ink-3); font-size: 11.5px; margin-bottom: 7px; }
+  #card pre {
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-2);
+    margin: 0; white-space: pre-wrap; line-height: 1.6;
+  }
+  #card .verdict { margin-top: 7px; font-size: 12.5px; }
+  #card .verdict.good { color: var(--signal); }
+  #card .verdict.bad { color: var(--coral); }
+  #card .verdict.soon { color: var(--amber); }
+
+  #drop {
+    border: 1px dashed var(--rule-2); border-radius: 10px; padding: 14px 10px;
+    text-align: center; color: var(--ink-3); font-size: 12.5px; cursor: pointer;
+  }
+  #drop.over { border-color: var(--signal); color: var(--signal); }
+  #drop.loaded { border-style: solid; color: var(--ink-2); }
+
+  @media (max-width: 820px) {
+    main { flex-direction: column; }
+    #left { flex: 1 1 56%; min-height: 0; }
+    aside { width: 100%; flex: 1 1 44%; border-left: 0; border-top: 1px solid var(--rule); padding-bottom: 24px; }
+    #scrub .ends { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Planetarium</h1>
+  <span class="sub" id="ver">—</span>
+  <span class="spacer"></span>
+  <a class="chip" href="./skyline-align.html">Skyline Align</a>
+  <span class="chip" id="twilightChip">no position</span>
+  <span class="chip" id="horizonChip">no horizon</span>
+</header>
+
+<main>
+  <div id="left">
+    <div id="stage">
+      <canvas id="view"></canvas>
+      <div id="readout">—</div>
+      <div id="hint">Load your horizon, set your position, then search for something.</div>
+    </div>
+    <div id="scrub">
+      <button id="playBtn" title="Run time forward">▶</button>
+      <span class="ends" id="scrubFrom">—</span>
+      <input type="range" id="scrubBar" min="0" max="1000" step="1" value="500" />
+      <span class="ends" id="scrubTo">—</span>
+      <span class="when" id="scrubWhen">—:—</span>
+      <button id="nowBtn" title="Jump to the current time">now</button>
+    </div>
+  </div>
+
+  <aside>
+    <fieldset>
+      <legend>Find</legend>
+      <input type="text" id="search" placeholder="M33, Andromeda Galaxy, NGC 7000, Vega, Jupiter…"
+             autocomplete="off" spellcheck="false" />
+      <ul id="results"></ul>
+      <p class="note" id="searchNote">Messier and NGC/IC numbers, common names, the named
+        stars, the planets. 570 deep-sky objects to magnitude 10, all 110 Messier.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Tonight</legend>
+      <div id="card"><p class="note">Nothing selected.</p></div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Your horizon</legend>
+      <div id="drop">Tap to choose a panorama PNG or a .horizon-project<br />
+        <span style="font-size:11px">or drop one here</span></div>
+      <input type="file" id="file" accept="image/*,.json,.horizon-project,application/json" hidden />
+      <p class="note" id="horizonNote">Nothing loaded. Either works: the
+        <code>.horizon-project</code> carries the measured 720-bin profile and is small;
+        the panorama gives you the picture as well and the skyline is re-detected
+        from it here.</p>
+
+      <div class="slider-block">
+        <div class="head"><span>Altitude span</span><span class="val" id="spanVal">—</span></div>
+        <input type="range" id="span" min="20" max="180" step="0.5" value="97" />
+      </div>
+      <div class="slider-block">
+        <div class="head"><span>Top edge sits at</span><span class="val" id="topVal">—</span></div>
+        <input type="range" id="top" min="-10" max="90" step="0.5" value="48.5" />
+        <p class="note" id="bandNote"></p>
+      </div>
+      <div class="slider-block">
+        <div class="head"><span>Azimuth offset</span><span class="val" id="azOffVal">0.00°</span></div>
+        <input type="range" id="azOff" min="-180" max="180" step="0.05" value="0" />
+      </div>
+      <div class="slider-block">
+        <div class="head"><span>Elevation offset</span><span class="val" id="altOffVal">0.00°</span></div>
+        <input type="range" id="altOff" min="-30" max="30" step="0.05" value="0" />
+        <p class="note">Measured on <a href="./skyline-align.html" style="color:var(--signal)">Skyline
+          Align</a> and shared with it automatically. Changing them here changes them there.</p>
+      </div>
+      <label class="row"><span>Show the panorama</span><input type="checkbox" id="showPano" checked /></label>
+      <div class="slider-block">
+        <div class="head"><span>Terrain brightness</span><span class="val" id="dimVal">35%</span></div>
+        <input type="range" id="dim" min="0" max="100" step="1" value="35" />
+        <p class="note">A daylit photograph under a night sky reads as a mistake.
+          Turn it down until the skyline is a silhouette and the stars win.</p>
+      </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Where you are</legend>
+      <div class="grid2">
+        <label class="row" style="display:block"><span style="font-size:11px;color:var(--ink-3)">Latitude</span>
+          <input type="number" id="lat" step="0.000001" placeholder="42.3601" /></label>
+        <label class="row" style="display:block"><span style="font-size:11px;color:var(--ink-3)">Longitude</span>
+          <input type="number" id="lon" step="0.000001" placeholder="-71.0589" /></label>
+      </div>
+      <button id="gps" style="margin-top:8px">Use this device's GPS</button>
+      <p class="note" id="posNote">East longitude is positive.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>When</legend>
+      <label class="row" style="display:block"><span style="font-size:11px;color:var(--ink-3)">Night of (local)</span>
+        <input type="date" id="date" /></label>
+      <label class="row"><span>Whole 24 hours</span><input type="checkbox" id="allDay" /></label>
+      <label class="row"><span>Run at</span>
+        <select id="speed" style="width:auto">
+          <option value="60">1 min/s</option>
+          <option value="300" selected>5 min/s</option>
+          <option value="900">15 min/s</option>
+          <option value="3600">1 hour/s</option>
+        </select></label>
+      <p class="note" id="windowNote">The bar spans civil dusk to civil dawn —
+        the hours the object is actually observable in. Tick the box for the
+        whole day when you want to watch the Sun instead.</p>
+    </fieldset>
+
+    <fieldset>
+      <legend>Sky</legend>
+      <div class="slider-block">
+        <div class="head"><span>Faintest star</span><span class="val" id="magVal">5.5</span></div>
+        <input type="range" id="mag" min="1" max="6.5" step="0.1" value="5.5" />
+      </div>
+      <div class="slider-block">
+        <div class="head"><span>Star size</span><span class="val" id="starSizeVal">1.6x</span></div>
+        <input type="range" id="starSize" min="0.6" max="4" step="0.1" value="1.6" />
+      </div>
+      <div class="slider-block">
+        <div class="head"><span>Faintest deep-sky</span><span class="val" id="dsoMagVal">9.0</span></div>
+        <input type="range" id="dsoMag" min="3" max="10" step="0.1" value="9" />
+      </div>
+      <label class="row"><span>Deep-sky objects</span><input type="checkbox" id="showDso" checked /></label>
+      <label class="row"><span>Deep-sky labels</span><input type="checkbox" id="showDsoNames" checked /></label>
+      <label class="row"><span>Constellation figures</span><input type="checkbox" id="showCon" checked /></label>
+      <label class="row"><span>Star names</span><input type="checkbox" id="showNames" checked /></label>
+      <label class="row"><span>Sun, Moon and planets</span><input type="checkbox" id="showBodies" checked /></label>
+      <label class="row"><span>Compass marks</span><input type="checkbox" id="showGrid" checked /></label>
+      <label class="row"><span>Refraction</span><input type="checkbox" id="refract" checked /></label>
+    </fieldset>
+
+    <fieldset>
+      <legend>View</legend>
+      <div class="slider-block">
+        <div class="head"><span>Field of view</span><span class="val" id="fovVal">70°</span></div>
+        <input type="range" id="fov" min="4" max="120" step="1" value="70" />
+      </div>
+      <label class="row"><span>Keep the target centred</span><input type="checkbox" id="follow" checked /></label>
+      <label class="row"><span>Draw its track</span><input type="checkbox" id="showTrack" checked /></label>
+      <div class="grid2 tight">
+        <button id="lookN">Face north</button>
+        <button id="lookH">Level</button>
+      </div>
+    </fieldset>
+
+    <p class="note" style="opacity:0.75">Stars: HYG v4.0. Figures: Stellarium
+      modern skyculture. Deep sky: OpenNGC. All CC BY-SA 4.0; see
+      <code>sky/README.txt</code>. Positions J2000, precessed to the moment shown.
+      Not an ephemeris and not a pointing model.</p>
+  </aside>
+</main>
+
+<script type="module">
+import {
+  julianDay, precess, lstDeg, equatorialToHorizontal, refractionDeg,
+  sunPosition, moonPosition, planetPosition, PLANET_NAMES, twilight, wrap360, wrap180
+} from './astro.js';
+import { SkyView, dirOf, colourOf, compassMarks, CARDINALS } from './skyview.js';
+import { detectSkyline, cutSkyTexture, horizonProfile, horizonMesh, sampleHorizon } from './panorama-sky.js';
+
+const $ = id => document.getElementById(id);
+const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
+const BINS = 720;                       // the survey's own resolution, js/survey.js
+
+/* ------------------------------------------------------------------ state */
+
+const state = {
+  stars: null,
+  dso: null,
+  image: null,
+  texCanvas: null,
+  boundary: null, boundaryWidth: 0, boundaryHeight: 0,
+  profile: null,               // Float32Array(720), altitude per half-degree bin
+  profileSource: '',
+  spanDeg: 97, topDeg: 48.5,
+  azOffset: 0, altOffset: 0,
+  lat: null, lon: null,
+  magLimit: 5.5, dsoMagLimit: 9, starSize: 1.6, dim: 0.35,
+  target: null,
+  when: new Date(),            // the moment being shown
+  windowFrom: null, windowTo: null,
+  playing: false, speed: 300,
+  altAz: null,                 // stars, [az,alt] per catalogue index
+  dsoAltAz: null,
+  track: null                  // the selected target's night, computed once per change
+};
+
+/* The alignment is SHARED WITH sky/skyline-align.html, under its key.
+ *
+ * Two keys would be two answers. The offsets are measured on that page and
+ * consumed on this one, and an operator who aligned on one page and then found
+ * this one still at zero would quite reasonably conclude the alignment had not
+ * worked. One store, written by whichever page the slider was moved on. */
+const SHARED_KEY = 'skyline-align/v1';
+const OWN_KEY = 'planetarium/v1';
+
+function save() {
+  try {
+    const prev = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
+    localStorage.setItem(SHARED_KEY, JSON.stringify({
+      ...prev,
+      lat: state.lat, lon: state.lon, azOffset: state.azOffset,
+      altOffset: state.altOffset, spanDeg: state.spanDeg, topDeg: state.topDeg
+    }));
+    localStorage.setItem(OWN_KEY, JSON.stringify({
+      magLimit: state.magLimit, dsoMagLimit: state.dsoMagLimit,
+      starSize: state.starSize, dim: state.dim,
+      // The profile is the expensive thing to obtain and the small thing to
+      // keep, so it survives a refresh and the page is useful before anything
+      // has been dropped on it.
+      profile: state.profile ? Array.from(state.profile, v => Number(v.toFixed(2))) : null,
+      profileSource: state.profileSource
+    }));
+  } catch { /* private mode, or storage refused. Not worth a message. */ }
+}
+
+function restore() {
+  try {
+    const shared = JSON.parse(localStorage.getItem(SHARED_KEY) || '{}');
+    for (const k of ['lat', 'lon', 'azOffset', 'altOffset', 'spanDeg', 'topDeg']) {
+      if (Number.isFinite(shared?.[k])) state[k] = shared[k];
+    }
+  } catch { /* ditto */ }
+  try {
+    const own = JSON.parse(localStorage.getItem(OWN_KEY) || '{}');
+    for (const k of ['magLimit', 'dsoMagLimit', 'starSize', 'dim']) {
+      if (Number.isFinite(own?.[k])) state[k] = own[k];
+    }
+    if (Array.isArray(own?.profile) && own.profile.length === BINS) {
+      state.profile = Float32Array.from(own.profile);
+      state.profileSource = own.profileSource || 'remembered from last time';
+    }
+  } catch { /* ditto */ }
+}
+
+/* ----------------------------------------------------------- the renderer */
+
+const canvas = $('view');
+const view = new SkyView(canvas, { onOverlay: drawOverlay, onCameraChange: syncCamera });
+view.camera.altDeg = 20;
+view.setLines('grid', compassMarks(), 'static');
+
+function syncCamera() {
+  $('fov').value = view.camera.fovDeg;
+  $('fovVal').textContent = `${view.camera.fovDeg.toFixed(0)}°`;
+  updateReadout();
+}
+
+/** Drawing order: marks, figures, stars, then the ground — the terrain is
+ *  opaque and has to cover whatever is underneath it. The silhouette mesh goes
+ *  before the panorama so that where both exist the photograph wins. */
+function layers() {
+  const out = [];
+  if ($('showGrid').checked) out.push({ type: 'lines', name: 'grid', color: [0.18, 0.78, 0.90, 0.30] });
+  if ($('showCon').checked) out.push({ type: 'lines', name: 'figures', color: [0.42, 0.58, 0.78, 0.38] });
+  out.push({ type: 'points', name: 'stars', magLimit: state.magLimit });
+  out.push({ type: 'points', name: 'bodies', magLimit: 20, scale: 1.5 });
+  if (state.profile) {
+    out.push({ type: 'mesh', name: 'horizon', color: [0.025, 0.045, 0.055, 1] });
+    // The fill alone is nearly the background colour, which is right for a
+    // silhouette and useless for finding where the silhouette IS. The edge
+    // line is the thing the eye tracks, so it is drawn separately.
+    out.push({ type: 'lines', name: 'horizonEdge', color: [0.30, 0.45, 0.52, 0.85] });
+  }
+  if ($('showPano').checked) out.push({ type: 'dome' });
+  return out;
+}
+
+function requestDraw() {
+  view.starSize = state.starSize;
+  Object.assign(view.dome, {
+    azOffset: state.azOffset, altOffset: state.altOffset,
+    topDeg: state.topDeg, spanDeg: state.spanDeg, dim: state.dim
+  });
+  view.setLayers(layers());
+  view.requestDraw();
+}
+
+/* ------------------------------------------------------- positions, shared */
+
+/** Equatorial coordinates OF DATE for anything the page can select. Stars and
+ *  deep-sky objects are catalogued at J2000 and have to be precessed; the Sun,
+ *  Moon and planets come out of astro.js already of date. */
+function equatorialOf(target, jd) {
+  if (target.kind === 'body') {
+    if (target.id === 'Sun') return sunPosition(jd);
+    if (target.id === 'Moon') return moonPosition(jd);
+    return planetPosition(target.id, jd);
+  }
+  return precess(target.ra, target.dec, jd);
+}
+
+function altAzOf(target, jd, lst, refract) {
+  const eq = equatorialOf(target, jd);
+  if (!eq) return null;
+  const h = equatorialToHorizontal(eq.raDeg, eq.decDeg, lst, state.lat);
+  return { az: h.azDeg, alt: refract ? h.altDeg + refractionDeg(h.altDeg) : h.altDeg };
+}
+
+/** The measured skyline at a bearing, or null where the survey never looked. */
+const skylineAt = az => sampleHorizon(state.profile, az,
+  { azOffset: state.azOffset, altOffset: state.altOffset });
+
+/* -------------------------------------------------------- the sky, computed */
+
+function computeSky() {
+  if (!state.stars || state.lat === null || state.lon === null) return;
+  const jd = julianDay(state.when);
+  const lst = lstDeg(jd, state.lon);
+  const refract = $('refract').checked;
+
+  const cat = state.stars;
+  const n = cat.ra.length;
+  const dirs = new Float32Array(n * 3);
+  const mags = new Float32Array(n);
+  const cols = new Float32Array(n * 3);
+  const altAz = new Float32Array(n * 2);
+  for (let i = 0; i < n; i++) {
+    const p = precess(cat.ra[i], cat.dec[i], jd);
+    const h = equatorialToHorizontal(p.raDeg, p.decDeg, lst, state.lat);
+    const alt = refract ? h.altDeg + refractionDeg(h.altDeg) : h.altDeg;
+    altAz[i * 2] = h.azDeg; altAz[i * 2 + 1] = alt;
+    const d = dirOf(h.azDeg, alt);
+    dirs[i * 3] = d[0]; dirs[i * 3 + 1] = d[1]; dirs[i * 3 + 2] = d[2];
+    mags[i] = cat.mag[i];
+    const c = colourOf(cat.ci[i]);
+    cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
+  }
+  state.altAz = altAz;
+  view.setPoints('stars', { dirs, mags, colors: cols });
+  buildFigures();
+
+  // Deep-sky objects are drawn as glyphs on the 2D layer rather than as GL
+  // points: a galaxy is not a star and must not look like one, or every search
+  // result would be a dot among nine thousand identical dots.
+  if (state.dso) {
+    const m = state.dso.objects.length;
+    const aa = new Float32Array(m * 2);
+    for (let i = 0; i < m; i++) {
+      const o = state.dso.objects[i];
+      const p = precess(o.ra, o.dec, jd);
+      const h = equatorialToHorizontal(p.raDeg, p.decDeg, lst, state.lat);
+      aa[i * 2] = h.azDeg;
+      aa[i * 2 + 1] = refract ? h.altDeg + refractionDeg(h.altDeg) : h.altDeg;
+    }
+    state.dsoAltAz = aa;
+  }
+
+  buildBodies(jd, lst, refract);
+
+  const tw = twilight(jd, state.lat, state.lon);
+  const chip = $('twilightChip');
+  chip.textContent = `${tw.label} · sun ${tw.sunAltDeg.toFixed(1)}°`;
+  chip.className = 'chip ' + (tw.label === 'night' ? 'live' : tw.label === 'daylight' ? 'warn' : '');
+}
+
+function buildFigures() {
+  const cat = state.stars, aa = state.altAz;
+  if (!cat || !aa) return;
+  const verts = [];
+  for (const g of cat.constellations) {
+    for (const line of g.lines) {
+      for (let k = 0; k + 1 < line.length; k++) {
+        for (const i of [line[k], line[k + 1]]) {
+          const d = dirOf(aa[i * 2], aa[i * 2 + 1]);
+          verts.push(d[0], d[1], d[2]);
+        }
+      }
+    }
+  }
+  view.setLines('figures', new Float32Array(verts));
+}
+
+let bodyLabels = [];
+function buildBodies(jd, lst, refract) {
+  bodyLabels = [];
+  if (!$('showBodies').checked) {
+    view.setPoints('bodies', { dirs: new Float32Array(0), mags: new Float32Array(0), colors: new Float32Array(0) });
+    return;
+  }
+  const dirs = [], mags = [], cols = [];
+  const add = (name, eq, mag, colour) => {
+    if (!eq) return;
+    const h = equatorialToHorizontal(eq.raDeg, eq.decDeg, lst, state.lat);
+    const alt = refract ? h.altDeg + refractionDeg(h.altDeg) : h.altDeg;
+    const d = dirOf(h.azDeg, alt);
+    dirs.push(d[0], d[1], d[2]);
+    mags.push(mag);
+    cols.push(colour[0], colour[1], colour[2]);
+    bodyLabels.push({ name, az: h.azDeg, alt });
+  };
+  add('Sun', sunPosition(jd), -8, [1.0, 0.92, 0.55]);
+  const moon = moonPosition(jd);
+  add(`Moon ${(moon.illuminated * 100).toFixed(0)}%`, moon, -7, [0.92, 0.93, 0.85]);
+  for (const name of PLANET_NAMES) {
+    const p = planetPosition(name, jd);
+    if (p) add(name, p, p.magnitude, name === 'Mars' ? [1.0, 0.62, 0.48] : [1.0, 0.97, 0.85]);
+  }
+  view.setPoints('bodies', {
+    dirs: new Float32Array(dirs), mags: new Float32Array(mags), colors: new Float32Array(cols)
+  });
+}
+
+/* --------------------------------------------------------------- the search
+ *
+ * ONE INDEX OVER EVERYTHING SELECTABLE. A person at the eyepiece types "M33",
+ * "triangulum", "jupiter" or "vega" and should not first have to decide which
+ * of four catalogues that is. The index is built once, after both catalogues
+ * load, and holds a few thousand short strings -- small enough that a linear
+ * scan per keystroke is imperceptible and nothing needs a trie.
+ */
+
+let index = [];
+
+function buildIndex() {
+  index = [];
+  for (const name of ['Sun', 'Moon', ...PLANET_NAMES]) {
+    index.push({ kind: 'body', id: name, label: name, keys: [name.toLowerCase()], mag: -4 });
+  }
+  if (state.stars) {
+    for (const [idxStr, name] of Object.entries(state.stars.names)) {
+      const i = +idxStr;
+      index.push({
+        kind: 'star', starIndex: i, ra: state.stars.ra[i], dec: state.stars.dec[i],
+        label: name, sub: `star · mag ${state.stars.mag[i].toFixed(2)}`,
+        keys: [name.toLowerCase()], mag: state.stars.mag[i]
+      });
+    }
+  }
+  if (state.dso) {
+    for (const o of state.dso.objects) {
+      const keys = [o.id.toLowerCase()];
+      // "NGC7000" is how OpenNGC spells it and "ngc 7000" is how a person
+      // does; both have to hit, and so does the unpadded "ngc7000".
+      const m = /^([A-Za-z]+)0*(\d+)$/.exec(o.id);
+      if (m) {
+        keys.push(`${m[1].toLowerCase()} ${m[2]}`, `${m[1].toLowerCase()}${m[2]}`);
+      }
+      if (o.m) keys.push(`m${o.m}`, `m ${o.m}`, `messier ${o.m}`);
+      for (const nm of o.names) keys.push(nm.toLowerCase());
+      const label = o.m ? `M${o.m}${o.names[0] ? ' · ' + o.names[0] : ''}`
+        : (o.names[0] || prettyId(o.id));
+      index.push({
+        kind: 'dso', id: o.id, ra: o.ra, dec: o.dec, label,
+        sub: [prettyId(o.id), o.type, o.const && 'in ' + o.const,
+          o.mag != null && `mag ${o.mag.toFixed(1)}${o.magApprox ? '≈' : ''}`,
+          o.size && `${o.size}′`].filter(Boolean).join(' · '),
+        keys, mag: o.mag == null ? 9 : o.mag, obj: o
+      });
+    }
+  }
+}
+
+/** NGC0224 reads as NGC 224 to everyone except the file it came out of. */
+function prettyId(id) {
+  const m = /^([A-Za-z]+)0*(\d+)(.*)$/.exec(id);
+  return m ? `${m[1]} ${m[2]}${m[3]}` : id;
+}
+
+/**
+ * Rank: an exact key first, then a key that starts with the query, then one
+ * that contains it; brighter wins inside each band.
+ *
+ * The ordering is the whole usefulness of the box. Typing "m3" with "contains"
+ * ranked equally would bury Messier 3 under thirty objects whose names happen
+ * to contain the pair, and the operator would conclude the search is broken.
+ */
+function search(q) {
+  const needle = q.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (!needle) return [];
+  const hits = [];
+  for (const e of index) {
+    let best = 9;
+    for (const k of e.keys) {
+      if (k === needle) { best = 0; break; }
+      if (k.startsWith(needle)) best = Math.min(best, 1);
+      else if (k.includes(needle)) best = Math.min(best, 2);
+    }
+    if (best < 9) hits.push({ e, rank: best });
+  }
+  hits.sort((a, b) => a.rank - b.rank || a.e.mag - b.e.mag);
+  return hits.slice(0, 40).map(h => h.e);
+}
+
+function showResults(list) {
+  const ul = $('results');
+  ul.innerHTML = '';
+  if (!list.length) return;
+  const jd = julianDay(state.when);
+  const lst = state.lon === null ? 0 : lstDeg(jd, state.lon);
+  for (const e of list) {
+    const li = document.createElement('li');
+    const nm = document.createElement('span');
+    nm.className = 'nm';
+    nm.textContent = e.label;
+    const mg = document.createElement('span');
+    mg.className = 'mg';
+    // Say right here whether it is up, because half the search results on any
+    // given night are below the ground and clicking each one to find out is
+    // the slowest possible way to learn it.
+    if (state.lat !== null) {
+      const h = altAzOf(e, jd, lst, $('refract').checked);
+      if (h) {
+        const sky = skylineAt(h.az);
+        const clear = sky == null ? h.alt > 0 : h.alt > sky;
+        mg.className = 'mg ' + (clear ? 'up' : 'down');
+        mg.textContent = `${h.alt >= 0 ? '+' : ''}${h.alt.toFixed(0)}°`;
+      }
+    }
+    li.append(nm, mg);
+    li.title = e.sub || '';
+    li.addEventListener('click', () => selectTarget(e));
+    ul.append(li);
+  }
+}
+
+function selectTarget(e) {
+  state.target = e;
+  $('search').value = e.label;
+  $('results').innerHTML = '';
+  computeTrack();
+  if ($('follow').checked) centreOnTarget();
+  updateCard();
+  requestDraw();
+}
+
+function centreOnTarget() {
+  if (!state.target || state.lat === null) return;
+  const jd = julianDay(state.when);
+  const h = altAzOf(state.target, jd, lstDeg(jd, state.lon), $('refract').checked);
+  if (h) view.lookAt(h.az, clamp(h.alt, -20, 85));
+}
+
+/* ------------------------------------------------------------ the night run
+ *
+ * WHY THE WINDOW IS DUSK TO DAWN AND NOT MIDNIGHT TO MIDNIGHT. The bar is the
+ * main control on the page, so every pixel of it should be a minute someone
+ * could be observing in. A 24-hour bar spends more than half its length in
+ * daylight, which makes the useful part of the night about a third of the
+ * width and the scrub correspondingly coarse. Civil twilight is the honest
+ * edge: the sky is no longer blue and the first targets are reachable.
+ */
+
+function nightWindow(dateStr) {
+  const base = dateStr ? new Date(dateStr + 'T12:00:00') : new Date();
+  const noon = new Date(base.getFullYear(), base.getMonth(), base.getDate(), 12, 0, 0, 0);
+  const allDay = $('allDay').checked;
+  const dayEnd = new Date(noon.getTime() + 24 * 3600e3);
+  if (allDay || state.lat === null) return { from: noon, to: dayEnd, label: 'noon to noon' };
+
+  // Two-minute steps over the 24 hours from local noon. The Sun moves about
+  // half a degree in that, which is finer than the -6 degree threshold needs.
+  const step = 120e3;
+  let dusk = null, dawn = null, prev = null;
+  for (let t = noon.getTime(); t <= dayEnd.getTime(); t += step) {
+    const alt = twilight(julianDay(new Date(t)), state.lat, state.lon).sunAltDeg;
+    if (prev !== null) {
+      if (dusk === null && prev >= -6 && alt < -6) dusk = new Date(t);
+      else if (dusk !== null && dawn === null && prev < -6 && alt >= -6) dawn = new Date(t);
+    }
+    prev = alt;
+  }
+  if (!dusk || !dawn) {
+    // Midsummer above the Arctic circle, or midwinter below it. Say so rather
+    // than silently showing a window that means something else.
+    return { from: noon, to: dayEnd, label: 'the Sun never crosses civil twilight here on this date — showing the whole day' };
+  }
+  return { from: dusk, to: dawn, label: 'civil dusk to civil dawn' };
+}
+
+function applyWindow() {
+  const w = nightWindow($('date').value);
+  state.windowFrom = w.from;
+  state.windowTo = w.to;
+  $('scrubFrom').textContent = fmtClock(w.from);
+  $('scrubTo').textContent = fmtClock(w.to);
+  $('windowNote').textContent = `The bar spans ${w.label}: `
+    + `${fmtClock(w.from)} to ${fmtClock(w.to)}, ${((w.to - w.from) / 3600e3).toFixed(1)} hours.`;
+  setScrubFromTime(state.when);
+}
+
+function scrubToTime(v) {
+  const span = state.windowTo - state.windowFrom;
+  return new Date(state.windowFrom.getTime() + span * (v / 1000));
+}
+
+function setScrubFromTime(d) {
+  const span = state.windowTo - state.windowFrom;
+  const v = clamp(Math.round((d - state.windowFrom) / span * 1000), 0, 1000);
+  $('scrubBar').value = v;
+  $('scrubWhen').textContent = fmtClock(d);
+}
+
+function setWhen(d, { recompute = true } = {}) {
+  state.when = d;
+  $('scrubWhen').textContent = fmtClock(d);
+  if (recompute) computeSky();
+  if (state.target && $('follow').checked) centreOnTarget();
+  updateCard();
+  requestDraw();
+}
+
+/* ------------------------------------------------------------- the track
+ *
+ * The object's whole night, sampled once and kept: where it is, and whether
+ * the measured skyline is in the way. Everything the card says and everything
+ * the curve draws comes out of this one array, so the drawn line and the
+ * quoted times cannot disagree.
+ */
+
+const TRACK_SAMPLES = 288;              // the window in roughly three-minute steps
+
+function computeTrack() {
+  state.track = null;
+  if (!state.target || state.lat === null || !state.windowFrom) return;
+  const refract = $('refract').checked;
+  const t0 = state.windowFrom.getTime(), t1 = state.windowTo.getTime();
+  const pts = [];
+  for (let i = 0; i <= TRACK_SAMPLES; i++) {
+    const t = t0 + (t1 - t0) * i / TRACK_SAMPLES;
+    const jd = julianDay(new Date(t));
+    const h = altAzOf(state.target, jd, lstDeg(jd, state.lon), refract);
+    if (!h) continue;
+    const sky = skylineAt(h.az);
+    pts.push({ t, az: h.az, alt: h.alt, sky, clear: sky == null ? h.alt > 0 : h.alt > sky });
+  }
+  if (!pts.length) return;
+
+  // Crossings, refined by bisection. Three-minute samples would quote a rise
+  // time three minutes wrong, which is enough to miss the start of a session.
+  const margin = p => p.alt - (p.sky == null ? 0 : p.sky);
+  const events = [];
+  for (let i = 1; i < pts.length; i++) {
+    const a = margin(pts[i - 1]), b = margin(pts[i]);
+    if ((a < 0) === (b < 0)) continue;
+    let lo = pts[i - 1].t, hi = pts[i].t;
+    for (let k = 0; k < 24; k++) {
+      const mid = (lo + hi) / 2;
+      const jd = julianDay(new Date(mid));
+      const h = altAzOf(state.target, jd, lstDeg(jd, state.lon), refract);
+      const sky = skylineAt(h.az);
+      const m = h.alt - (sky == null ? 0 : sky);
+      if ((m < 0) === (a < 0)) lo = mid; else hi = mid;
+    }
+    events.push({ t: new Date((lo + hi) / 2), rising: b > a });
+  }
+
+  let best = null;
+  for (const p of pts) if (!best || p.alt > best.alt) best = p;
+  const clearPts = pts.filter(p => p.clear);
+  let bestClear = null;
+  for (const p of clearPts) if (!bestClear || p.alt > bestClear.alt) bestClear = p;
+
+  state.track = {
+    pts, events, best, bestClear,
+    clearMinutes: clearPts.length / pts.length * (t1 - t0) / 60e3
+  };
+}
+
+/* ---------------------------------------------------------------- the card */
+
+function updateCard() {
+  const card = $('card');
+  const t = state.target;
+  if (!t) { card.innerHTML = '<p class="note">Nothing selected.</p>'; return; }
+  if (state.lat === null) {
+    card.innerHTML = '<p class="note warn">Set your latitude and longitude first — '
+      + 'nothing can be placed in the sky without them.</p>';
+    return;
+  }
+
+  const jd = julianDay(state.when);
+  const h = altAzOf(t, jd, lstDeg(jd, state.lon), $('refract').checked);
+  const sky = h ? skylineAt(h.az) : null;
+  const lines = [];
+  if (h) {
+    lines.push(`now      az ${h.az.toFixed(1).padStart(5)}°   alt ${h.alt.toFixed(1).padStart(5)}°`);
+    if (sky == null) {
+      lines.push('skyline  not surveyed at this bearing');
+    } else {
+      const d = h.alt - sky;
+      lines.push(`skyline  ${sky.toFixed(1).padStart(5)}° here  → ${d >= 0 ? '+' : ''}${d.toFixed(1)}°`);
+    }
+  }
+
+  const tr = state.track;
+  if (tr) {
+    if (tr.bestClear) {
+      lines.push(`highest  ${fmtClock(new Date(tr.bestClear.t))} at ${tr.bestClear.alt.toFixed(1)}° (az ${tr.bestClear.az.toFixed(0)}°)`);
+    }
+    for (const e of tr.events.slice(0, 4)) {
+      lines.push(`${e.rising ? 'clears ' : 'hidden '}  ${fmtClock(e.t)}`);
+    }
+  }
+
+  let verdict = '', cls = '';
+  if (tr) {
+    if (tr.clearMinutes <= 0) {
+      const short = tr.best && state.profile
+        ? ` Closest is ${fmtClock(new Date(tr.best.t))}, ${Math.abs(tr.best.alt - (tr.best.sky ?? 0)).toFixed(1)}° short at azimuth ${tr.best.az.toFixed(0)}°.`
+        : '';
+      verdict = `Never clears your skyline in this window.${short}`;
+      cls = 'bad';
+    } else {
+      const hrs = tr.clearMinutes / 60;
+      verdict = `${hrs.toFixed(1)} hours above your skyline`
+        + (state.profile ? '' : ' — against a FLAT horizon; no survey loaded, so the barn is not in this answer');
+      cls = state.profile ? 'good' : 'soon';
+    }
+  }
+
+  card.innerHTML = '';
+  const title = document.createElement('div');
+  title.className = 'title';
+  title.textContent = t.label;
+  const sub = document.createElement('div');
+  sub.className = 'sub2';
+  sub.textContent = t.sub || '';
+  const pre = document.createElement('pre');
+  pre.textContent = lines.join('\n');
+  card.append(title, sub, pre);
+  if (verdict) {
+    const v = document.createElement('div');
+    v.className = 'verdict ' + cls;
+    v.textContent = verdict;
+    card.append(v);
+  }
+}
+
+/* ------------------------------------------------------------- the overlay */
+
+function drawOverlay(ctx, { project, dpr, width, height }) {
+  ctx.font = `${11 * dpr}px ui-monospace, monospace`;
+  ctx.textBaseline = 'middle';
+
+  if ($('showGrid').checked) {
+    ctx.fillStyle = 'rgba(46,199,230,0.92)';
+    ctx.textAlign = 'center';
+    for (const [az, name] of CARDINALS) {
+      const p = project(az, 0);
+      if (p) ctx.fillText(name, p[0], p[1] - 14 * dpr);
+    }
+  }
+
+  if ($('showDso').checked && state.dso && state.dsoAltAz) drawDsoGlyphs(ctx, project, dpr);
+
+  ctx.textAlign = 'left';
+  if ($('showBodies').checked) {
+    ctx.fillStyle = 'rgba(224,163,60,0.95)';
+    for (const b of bodyLabels) {
+      const p = project(b.az, b.alt);
+      if (p) ctx.fillText(b.name, p[0] + 9 * dpr, p[1]);
+    }
+  }
+  if ($('showNames').checked && state.stars && state.altAz) {
+    ctx.fillStyle = 'rgba(232,244,248,0.70)';
+    const aa = state.altAz;
+    for (const [idxStr, name] of Object.entries(state.stars.names)) {
+      const i = +idxStr;
+      if (state.stars.mag[i] > Math.min(state.magLimit, 3.2)) continue;
+      const p = project(aa[i * 2], aa[i * 2 + 1]);
+      if (p) ctx.fillText(name, p[0] + 8 * dpr, p[1]);
+    }
+  }
+
+  if ($('showTrack').checked) drawTrack(ctx, project, dpr);
+  drawReticle(ctx, project, dpr);
+  // The readout rides the frame, not the camera: the position changes it too,
+  // and that arrives without the camera moving at all.
+  updateReadout();
+}
+
+/*
+ * A galaxy is not a star, and the glyphs say which is which.
+ *
+ * Stellarium's convention, near enough, because it is the one anybody who has
+ * used a star chart already reads: an ellipse for a galaxy, a dotted circle
+ * for a cluster, a square for a nebula, a small circle with ticks for a
+ * planetary. Drawn on the 2D layer rather than as GL points, because the
+ * alternative is 570 more identical dots among nine thousand.
+ */
+function drawDsoGlyphs(ctx, project, dpr) {
+  const aa = state.dsoAltAz;
+  const objs = state.dso.objects;
+  const labels = $('showDsoNames').checked;
+  const r = 4 * dpr;
+  ctx.lineWidth = 1.2 * dpr;
+  ctx.textAlign = 'left';
+  for (let i = 0; i < objs.length; i++) {
+    const o = objs[i];
+    if (o.mag != null && o.mag > state.dsoMagLimit) continue;
+    const az = aa[i * 2], alt = aa[i * 2 + 1];
+    if (alt < -2) continue;
+    const p = project(az, alt);
+    if (!p) continue;
+    const selected = state.target && state.target.kind === 'dso' && state.target.id === o.id;
+    ctx.strokeStyle = selected ? 'rgba(224,163,60,0.95)' : 'rgba(180,140,242,0.62)';
+    ctx.beginPath();
+    if (o.type.startsWith('galaxy')) {
+      ctx.ellipse(p[0], p[1], r * 1.35, r * 0.72, 0, 0, Math.PI * 2);
+    } else if (o.type.includes('cluster')) {
+      ctx.setLineDash([2 * dpr, 2 * dpr]);
+      ctx.arc(p[0], p[1], r, 0, Math.PI * 2);
+    } else {
+      ctx.rect(p[0] - r, p[1] - r, r * 2, r * 2);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // Labels only when there is room for them: at a wide field every Messier
+    // number at once is a wall of text over the sky.
+    if (labels && (selected || view.camera.fovDeg < 45 || (o.m && view.camera.fovDeg < 80))) {
+      ctx.fillStyle = selected ? 'rgba(224,163,60,0.95)' : 'rgba(180,140,242,0.72)';
+      ctx.fillText(o.m ? `M${o.m}` : prettyId(o.id), p[0] + r + 3 * dpr, p[1]);
+    }
+  }
+}
+
+/*
+ * The track, split where the skyline cuts it.
+ *
+ * The solid part is sky the operator can actually use; the dotted part is the
+ * object going on existing behind the barn. Drawing it as one line would make
+ * the page a prettier almanac and no more useful than one.
+ */
+function drawTrack(ctx, project, dpr) {
+  const tr = state.track;
+  if (!tr) return;
+  ctx.lineWidth = 1.6 * dpr;
+  let run = [], runClear = null;
+  const flush = () => {
+    if (run.length > 1) {
+      ctx.setLineDash(runClear ? [] : [3 * dpr, 4 * dpr]);
+      ctx.strokeStyle = runClear ? 'rgba(224,163,60,0.85)' : 'rgba(224,163,60,0.32)';
+      ctx.beginPath();
+      ctx.moveTo(run[0][0], run[0][1]);
+      for (let i = 1; i < run.length; i++) ctx.lineTo(run[i][0], run[i][1]);
+      ctx.stroke();
+    }
+    run = [];
+  };
+  for (const s of tr.pts) {
+    const p = project(s.az, s.alt);
+    if (!p) { flush(); runClear = null; continue; }
+    if (runClear !== null && s.clear !== runClear) {
+      run.push(p);                       // carry the joint so the line does not gap
+      flush();
+    }
+    runClear = s.clear;
+    run.push(p);
+  }
+  flush();
+  ctx.setLineDash([]);
+
+  // An hour tick with the hour on it, so the curve reads as a clock and not
+  // only as a shape.
+  ctx.fillStyle = 'rgba(224,163,60,0.80)';
+  ctx.textAlign = 'center';
+  let lastHour = -1;
+  for (const s of tr.pts) {
+    const d = new Date(s.t);
+    if (d.getHours() === lastHour || d.getMinutes() > 6) continue;
+    lastHour = d.getHours();
+    const p = project(s.az, s.alt);
+    if (!p) continue;
+    ctx.beginPath();
+    ctx.arc(p[0], p[1], 2.2 * dpr, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillText(`${String(d.getHours()).padStart(2, '0')}h`, p[0], p[1] - 9 * dpr);
+  }
+  ctx.textAlign = 'left';
+}
+
+/** The target itself: brackets, not a dot, so it is visible over a star. */
+function drawReticle(ctx, project, dpr) {
+  const t = state.target;
+  if (!t || state.lat === null) return;
+  const jd = julianDay(state.when);
+  const h = altAzOf(t, jd, lstDeg(jd, state.lon), $('refract').checked);
+  if (!h) return;
+  const p = project(h.az, h.alt);
+  if (!p) return;
+  const r = 13 * dpr;
+  ctx.strokeStyle = 'rgba(224,163,60,0.95)';
+  ctx.lineWidth = 1.5 * dpr;
+  ctx.beginPath();
+  for (const [sx, sy] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) {
+    ctx.moveTo(p[0] + sx * r, p[1] + sy * r * 0.45);
+    ctx.lineTo(p[0] + sx * r, p[1] + sy * r);
+    ctx.lineTo(p[0] + sx * r * 0.45, p[1] + sy * r);
+  }
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(224,163,60,0.95)';
+  ctx.textAlign = 'left';
+  ctx.font = `${12 * dpr}px ui-monospace, monospace`;
+  ctx.fillText(t.label, p[0] + r + 5 * dpr, p[1] - r * 0.7);
+}
+
+function updateReadout() {
+  const lines = [];
+  lines.push(`look   az ${wrap360(view.camera.azDeg).toFixed(1).padStart(5)}°  alt ${view.camera.altDeg.toFixed(1).padStart(5)}°`);
+  lines.push(`fov    ${view.camera.fovDeg.toFixed(0)}°`);
+  if (state.lat !== null) lines.push(`site   ${state.lat.toFixed(4)}, ${state.lon.toFixed(4)}`);
+  else lines.push('site   not set');
+  $('readout').textContent = lines.join('\n');
+}
+
+/* ---------------------------------------------------------- the horizon in */
+
+function rebuildHorizon() {
+  if (!state.profile) {
+    $('horizonChip').textContent = 'no horizon';
+    $('horizonChip').className = 'chip warn';
+    return;
+  }
+  view.setLines('horizon', horizonMesh(state.profile,
+    { azOffset: state.azOffset, altOffset: state.altOffset }));
+  view.setLines('horizonEdge', horizonEdge(state.profile));
+  let holes = 0;
+  for (const v of state.profile) if (!Number.isFinite(v)) holes++;
+  $('horizonChip').textContent = holes
+    ? `horizon · ${holes} of ${BINS} bins missing`
+    : `horizon · ${state.profileSource}`;
+  $('horizonChip').className = 'chip ' + (holes ? 'warn' : 'live');
+  computeTrack();
+  updateCard();
+}
+
+/** The skyline as a polyline, with a break at every bin the survey missed --
+ *  the same holes the mesh leaves, so the two cannot tell different stories. */
+function horizonEdge(profile) {
+  const v = [];
+  const n = profile.length;
+  for (let i = 0; i < n; i++) {
+    const a = profile[i], b = profile[(i + 1) % n];
+    if (!Number.isFinite(a) || !Number.isFinite(b)) continue;
+    const p0 = dirOf(state.azOffset + (i + 0.5) / n * 360, a + state.altOffset);
+    const p1 = dirOf(state.azOffset + (i + 1.5) / n * 360, b + state.altOffset);
+    v.push(p0[0], p0[1], p0[2], p1[0], p1[1], p1[2]);
+  }
+  return new Float32Array(v);
+}
+
+/** The measured profile straight out of a `.horizon-project` or a `report.json`. */
+async function loadProjectFile(file) {
+  const note = $('horizonNote');
+  const j = JSON.parse(await file.text());
+  const bits = [];
+  const prof = j?.profile;
+  if (Array.isArray(prof) && prof.length) {
+    const out = new Float32Array(BINS);
+    out.fill(NaN);
+    // A project may hold a different bin count one day; resample by bin centre
+    // rather than assuming 720 and silently rotating the whole horizon.
+    for (let i = 0; i < BINS; i++) {
+      const src = prof[Math.round((i + 0.5) / BINS * prof.length - 0.5)];
+      const alt = typeof src === 'number' ? src : src?.alt;
+      if (Number.isFinite(alt)) out[i] = Math.max(0, alt);
+    }
+    state.profile = out;
+    state.profileSource = file.name;
+    bits.push(`${prof.length}-bin profile`);
+  }
+  const site = j?.site || {};
+  if (Number.isFinite(site.latitude) && Number.isFinite(site.longitude)) {
+    $('lat').value = site.latitude; $('lon').value = site.longitude;
+    readPos();
+    bits.push('site position');
+  }
+  // A project's own azimuthOffsetDeg is a correction already applied to its
+  // bearings. Adding the align page's offset on top would apply it twice, so
+  // it is reported and not adopted.
+  if (Number.isFinite(site.azimuthOffsetDeg) && site.azimuthOffsetDeg !== 0) {
+    bits.push(`its own azimuthOffsetDeg is ${site.azimuthOffsetDeg} — already in those bearings, so the slider here is on top of it`);
+  }
+  const r = j?.report?.render || j?.render || {};
+  if (Number.isFinite(r.altitudeMin) && Number.isFinite(r.altitudeMax) && r.altitudeMax > r.altitudeMin) {
+    state.topDeg = r.altitudeMax;
+    state.spanDeg = r.altitudeMax - r.altitudeMin;
+    syncBandInputs();
+    bits.push(`band ${r.altitudeMin}° to ${r.altitudeMax}°`);
+  }
+  if (!bits.length) throw new Error('no profile, site or render band in that file');
+  note.className = 'note';
+  note.textContent = 'read ' + bits.join(', ') + '.';
+  $('drop').classList.add('loaded');
+  $('drop').textContent = file.name;
+  rebuildHorizon();
+  save();
+  requestDraw();
+}
+
+/** A panorama: the skyline is re-detected with the same worker the app uses. */
+async function loadPanoramaFile(file) {
+  const note = $('horizonNote');
+  note.className = 'note';
+  note.textContent = 'reading…';
+  const img = await createImageBitmap(file);
+  state.image = img;
+  const span = clamp(360 * img.height / img.width, 20, 180);
+  state.spanDeg = Math.round(span * 2) / 2;
+  /* The band leans hard upward in this app's own renders -- the 2026-09-23
+   * build came out -18 to +79 on a 97 degree span -- so a fifth of the span
+   * below the horizon is a far better guess than centring it, which would have
+   * been 30 degrees out. Load the report to replace the guess with a fact. */
+  state.topDeg = Math.round((state.spanDeg * 0.8) * 2) / 2;
+  syncBandInputs();
+  $('drop').classList.add('loaded');
+  $('drop').innerHTML = `${file.name}<br /><span style="font-size:11px">${img.width}×${img.height}</span>`;
+  note.textContent = 'detecting the skyline…';
+
+  let result;
+  try {
+    result = await detectSkyline(img);
+  } catch (err) {
+    note.className = 'note bad';
+    note.textContent = `the skyline detector did not run: ${err.message}. `
+      + 'Showing the panorama with the sky left in; the horizon is still whatever was loaded before.';
+    state.boundary = null;
+    rebuildTexture();
+    return;
+  }
+  state.boundary = result.boundary;
+  state.boundaryWidth = result.width;
+  state.boundaryHeight = result.height;
+  note.textContent = `skyline traced over ${result.width} columns, `
+    + `${(result.skyFraction * 100).toFixed(0)}% sky`
+    + (result.unpaintedFraction ? `, ${(result.unpaintedFraction * 100).toFixed(1)}% unpainted` : '')
+    + '. Rise and set below are against THIS edge.';
+  if (result.noSky) { note.className = 'note warn'; note.textContent += ' Almost no sky found, so it may be wrong.'; }
+  state.profile = horizonProfile({
+    boundary: state.boundary, boundaryWidth: state.boundaryWidth,
+    boundaryHeight: state.boundaryHeight, topDeg: state.topDeg, spanDeg: state.spanDeg
+  }, BINS);
+  state.profileSource = file.name;
+  rebuildTexture();
+  rebuildHorizon();
+  save();
+}
+
+function rebuildTexture() {
+  if (!state.image) return;
+  const cut = cutSkyTexture(state.image, {
+    boundary: state.boundary,
+    boundaryWidth: state.boundaryWidth,
+    boundaryHeight: state.boundaryHeight,
+    topDeg: state.topDeg, spanDeg: state.spanDeg,
+    skyMarginDeg: 6, cutSky: true, markUnpainted: false,
+    maxTexSize: view.maxTexSize, canvas: state.texCanvas
+  });
+  state.texCanvas = cut.canvas;
+  view.setTexture(cut.canvas);
+  requestDraw();
+}
+
+function syncBandInputs() {
+  $('span').value = state.spanDeg;
+  $('spanVal').textContent = `${state.spanDeg.toFixed(1)}°`;
+  $('top').value = state.topDeg;
+  $('topVal').textContent = `${state.topDeg.toFixed(1)}°`;
+  showBand();
+}
+
+function showBand() {
+  const lo = state.topDeg - state.spanDeg;
+  $('bandNote').textContent =
+    `covers ${lo >= 0 ? '+' : ''}${lo.toFixed(1)}° to ${state.topDeg >= 0 ? '+' : ''}${state.topDeg.toFixed(1)}° of altitude`
+    + (lo > 0 ? ' — nothing at the horizon, which is almost certainly wrong' : '');
+  $('bandNote').className = lo > 0 ? 'note warn' : 'note';
+}
+
+/** The band moves where the traced skyline sits in altitude, so both the
+ *  picture and the PROFILE have to be rebuilt from it — not just the picture.
+ *  Re-cutting one and not the other is how a drawn silhouette ends up
+ *  disagreeing with a quoted rise time. */
+function afterBandChange() {
+  showBand();
+  if (state.boundary) {
+    state.profile = horizonProfile({
+      boundary: state.boundary, boundaryWidth: state.boundaryWidth,
+      boundaryHeight: state.boundaryHeight, topDeg: state.topDeg, spanDeg: state.spanDeg
+    }, BINS);
+  }
+  rebuildTexture();
+  rebuildHorizon();
+  save();
+  requestDraw();
+}
+
+async function loadFile(file) {
+  const note = $('horizonNote');
+  try {
+    if (/\.(json|horizon-project)$/i.test(file.name)) await loadProjectFile(file);
+    else await loadPanoramaFile(file);
+    $('hint').style.display = 'none';
+  } catch (err) {
+    note.className = 'note bad';
+    note.textContent = `could not read that file: ${err.message}`;
+  }
+}
+
+/* ------------------------------------------------------------ time helpers */
+
+function fmtClock(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function toDateInput(d) {
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
+/* ----------------------------------------------------------------- playing */
+
+let playTimer = null, playLast = 0;
+function setPlaying(on) {
+  state.playing = on;
+  $('playBtn').textContent = on ? '❚❚' : '▶';
+  if (playTimer) { cancelAnimationFrame(playTimer); playTimer = null; }
+  if (!on) return;
+  playLast = performance.now();
+  const step = now => {
+    if (!state.playing) return;
+    const dt = (now - playLast) / 1000;
+    playLast = now;
+    let t = state.when.getTime() + dt * state.speed * 1000;
+    // Running off the end of the night stops, rather than wrapping. Wrapping
+    // would put the operator at dusk again with no signal that the night ended.
+    if (t >= state.windowTo.getTime()) { t = state.windowTo.getTime(); setPlaying(false); }
+    setWhen(new Date(t));
+    setScrubFromTime(state.when);
+    if (state.playing) playTimer = requestAnimationFrame(step);
+  };
+  playTimer = requestAnimationFrame(step);
+}
+
+/* ----------------------------------------------------------------- controls */
+
+function bindSlider(id, valId, key, fmt, after) {
+  const el = $(id);
+  const show = () => { $(valId).textContent = fmt(state[key]); };
+  el.value = state[key];
+  show();
+  el.addEventListener('input', () => {
+    state[key] = parseFloat(el.value);
+    show();
+    if (after) after();
+    save();
+    requestDraw();
+  });
+}
+
+function readPos() {
+  const la = parseFloat($('lat').value), lo = parseFloat($('lon').value);
+  state.lat = Number.isFinite(la) ? clamp(la, -90, 90) : null;
+  state.lon = Number.isFinite(lo) ? wrap180(lo) : null;
+  save();
+  if (state.lat !== null && state.lon !== null) {
+    $('hint').style.display = 'none';
+    applyWindow();
+    computeSky();
+    computeTrack();
+    updateCard();
+    requestDraw();
+  }
+}
+
+function wireUp() {
+  $('ver').textContent = 'sky/planetarium';
+
+  $('drop').addEventListener('click', () => $('file').click());
+  $('file').addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+  for (const ev of ['dragenter', 'dragover']) {
+    $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.add('over'); });
+  }
+  for (const ev of ['dragleave', 'drop']) {
+    $('drop').addEventListener(ev, e => { e.preventDefault(); $('drop').classList.remove('over'); });
+  }
+  $('drop').addEventListener('drop', e => {
+    const f = e.dataTransfer?.files?.[0];
+    if (f) loadFile(f);
+  });
+
+  bindSlider('span', 'spanVal', 'spanDeg', v => `${v.toFixed(1)}°`, afterBandChange);
+  bindSlider('top', 'topVal', 'topDeg', v => `${v.toFixed(1)}°`, afterBandChange);
+  bindSlider('azOff', 'azOffVal', 'azOffset', v => `${v >= 0 ? '+' : ''}${v.toFixed(2)}°`,
+    () => { rebuildHorizon(); });
+  bindSlider('altOff', 'altOffVal', 'altOffset', v => `${v >= 0 ? '+' : ''}${v.toFixed(2)}°`,
+    () => { rebuildHorizon(); });
+  bindSlider('mag', 'magVal', 'magLimit', v => v.toFixed(1));
+  bindSlider('starSize', 'starSizeVal', 'starSize', v => `${v.toFixed(1)}x`);
+  bindSlider('dsoMag', 'dsoMagVal', 'dsoMagLimit', v => v.toFixed(1));
+  $('dim').value = Math.round(state.dim * 100);
+  $('dimVal').textContent = `${Math.round(state.dim * 100)}%`;
+  $('dim').addEventListener('input', e => {
+    state.dim = parseInt(e.target.value, 10) / 100;
+    $('dimVal').textContent = `${e.target.value}%`;
+    save(); requestDraw();
+  });
+  $('fov').addEventListener('input', e => view.setFov(parseFloat(e.target.value)));
+
+  $('search').addEventListener('input', e => showResults(search(e.target.value)));
+  $('search').addEventListener('focus', e => { if (e.target.value) showResults(search(e.target.value)); });
+  $('search').addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    const first = search(e.target.value)[0];
+    if (first) selectTarget(first);
+  });
+
+  $('lat').addEventListener('change', readPos);
+  $('lon').addEventListener('change', readPos);
+  $('gps').addEventListener('click', () => {
+    const note = $('posNote');
+    if (!navigator.geolocation) { note.className = 'note bad'; note.textContent = 'this browser has no geolocation'; return; }
+    note.className = 'note'; note.textContent = 'asking the device…';
+    navigator.geolocation.getCurrentPosition(p => {
+      $('lat').value = p.coords.latitude.toFixed(6);
+      $('lon').value = p.coords.longitude.toFixed(6);
+      note.textContent = `fixed to ±${Math.round(p.coords.accuracy)} m.`;
+      readPos();
+    }, err => {
+      note.className = 'note bad';
+      note.textContent = `${err.message}. Type it in instead; a rough position is fine.`;
+    }, { enableHighAccuracy: true, timeout: 15000 });
+  });
+
+  $('date').addEventListener('change', () => {
+    applyWindow();
+    setWhen(scrubToTime(parseFloat($('scrubBar').value)));
+    computeTrack();
+    updateCard();
+  });
+  $('allDay').addEventListener('change', () => {
+    applyWindow();
+    setWhen(scrubToTime(parseFloat($('scrubBar').value)));
+    computeTrack();
+    updateCard();
+  });
+  $('scrubBar').addEventListener('input', e => {
+    setPlaying(false);
+    setWhen(scrubToTime(parseFloat(e.target.value)));
+  });
+  $('playBtn').addEventListener('click', () => setPlaying(!state.playing));
+  $('speed').addEventListener('change', e => { state.speed = parseInt(e.target.value, 10); });
+  $('nowBtn').addEventListener('click', () => {
+    setPlaying(false);
+    const now = new Date();
+    $('date').value = toDateInput(now.getHours() < 12
+      ? new Date(now.getTime() - 24 * 3600e3)   // 02:00 belongs to last night
+      : now);
+    applyWindow();
+    setWhen(now);
+    setScrubFromTime(now);
+    computeTrack();
+  });
+
+  for (const id of ['showDso', 'showDsoNames', 'showCon', 'showNames', 'showBodies',
+    'showGrid', 'showPano', 'showTrack']) {
+    $(id).addEventListener('change', () => {
+      if (id === 'showBodies') computeSky();
+      requestDraw();
+    });
+  }
+  $('refract').addEventListener('change', () => { computeSky(); computeTrack(); updateCard(); requestDraw(); });
+  $('follow').addEventListener('change', e => { if (e.target.checked) centreOnTarget(); });
+  $('lookN').addEventListener('click', () => { $('follow').checked = false; view.lookAt(0, view.camera.altDeg); });
+  $('lookH').addEventListener('click', () => { $('follow').checked = false; view.lookAt(view.camera.azDeg, 8); });
+}
+
+/* --------------------------------------------------------------------- boot */
+
+async function boot() {
+  restore();
+  wireUp();
+  if (state.lat !== null) $('lat').value = state.lat;
+  if (state.lon !== null) $('lon').value = state.lon;
+  $('azOff').value = state.azOffset;
+  $('azOffVal').textContent = `${state.azOffset >= 0 ? '+' : ''}${state.azOffset.toFixed(2)}°`;
+  $('altOff').value = state.altOffset;
+  $('altOffVal').textContent = `${state.altOffset >= 0 ? '+' : ''}${state.altOffset.toFixed(2)}°`;
+  syncBandInputs();
+
+  const now = new Date();
+  $('date').value = toDateInput(now.getHours() < 12 ? new Date(now.getTime() - 24 * 3600e3) : now);
+  state.when = now;
+
+  /*
+   * OPENED BY DOUBLE-CLICKING THE FILE, THIS PAGE CANNOT WORK, AND IT HAS TO
+   * SAY SO IN THOSE WORDS.
+   *
+   * Under file:// every document gets its own opaque origin, so `fetch` of the
+   * catalogues sitting right beside it is a cross-origin request and is
+   * refused, and `new Worker` of the segmenter is refused for the same reason.
+   * The honest-looking message — "could not load star-catalog.json" — sends
+   * the reader off to check a file that is perfectly fine.
+   */
+  if (location.protocol === 'file:') {
+    $('twilightChip').className = 'chip bad';
+    $('twilightChip').textContent = 'needs a server';
+    $('hint').innerHTML = 'Opened straight from disk. Browsers give every file:// page its own '
+      + 'origin, so this cannot read its own catalogues or start the skyline detector — '
+      + 'nothing is wrong with the files. Serve the project folder instead: '
+      + '<code>python -m http.server 8642</code> in the repository root, then open '
+      + '<code>localhost:8642/sky/planetarium.html</code>.';
+    return;
+  }
+
+  try {
+    const [stars, dso] = await Promise.all([
+      fetch('./star-catalog.json').then(r => { if (!r.ok) throw new Error(`star-catalog.json: HTTP ${r.status}`); return r.json(); }),
+      fetch('./dso-catalog.json').then(r => { if (!r.ok) throw new Error(`dso-catalog.json: HTTP ${r.status}`); return r.json(); })
+    ]);
+    state.stars = stars;
+    state.dso = dso;
+  } catch (err) {
+    $('twilightChip').className = 'chip bad';
+    $('twilightChip').textContent = 'no catalogue';
+    $('hint').textContent = `Could not load a catalogue (${err.message}). `
+      + 'Rebuild with tools/build-star-catalog.py and tools/build-dso-catalog.py.';
+    return;
+  }
+  buildIndex();
+  $('searchNote').textContent = `${state.dso.objects.length} deep-sky objects to magnitude `
+    + `${state.dso.magLimit}, all 110 Messier, plus the named stars and the planets.`;
+
+  rebuildHorizon();
+  if (state.lat === null || state.lon === null) {
+    $('hint').textContent = 'Set your latitude and longitude — the sky cannot be placed without them.';
+  } else {
+    $('hint').style.display = 'none';
+  }
+  if (state.profile && state.profileSource) {
+    $('horizonNote').textContent = `Using the profile ${state.profileSource}, kept from last time. `
+      + 'Drop the panorama on top if you want the picture as well.';
+  }
+  applyWindow();
+  setScrubFromTime(state.when);
+  computeSky();
+  requestDraw();
+
+  // The clock chip is the twilight chip here, and it only changes when the
+  // shown moment does, so there is no ticking timer: a page left open on a
+  // held moment should not be recomputing nine thousand stars every second.
+}
+
+boot();
+</script>
+</body>
+</html>
