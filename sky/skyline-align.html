@@ -222,6 +222,24 @@
     </fieldset>
 
     <fieldset>
+      <legend>Silhouette — do this once</legend>
+      <button id="handoff" class="primary" disabled>Send this horizon to the Planetarium</button>
+      <p class="note" id="handoffNote">Keeps the aligned skyline where the
+        Planetarium can find it, so you never pose this again. Stays put until
+        you replace it.</p>
+      <div class="grid2 tight" style="margin-top:9px">
+        <button id="saveProfile" disabled>.horizon-profile</button>
+        <button id="saveSvg" disabled>SVG</button>
+      </div>
+      <button id="savePng" disabled style="margin-top:5px">PNG alpha mask</button>
+      <p class="note">All three are drawn from the 720 measured numbers with the
+        two offsets baked in, so they are in TRUE bearings and need nothing else
+        to be read. They are the traced skyline itself — not the picture's cut
+        edge, which also carries the 6° of sky kept above it and the stitcher's
+        unpainted holes.</p>
+    </fieldset>
+
+    <fieldset>
       <legend>Where you are</legend>
       <div class="grid2">
         <label class="row" style="display:block"><span style="font-size:11px;color:var(--ink-3)">Latitude</span>
@@ -302,7 +320,10 @@ import {
   sunPosition, moonPosition, planetPosition, PLANET_NAMES, twilight, wrap360, wrap180
 } from './astro.js';
 import { SkyView, dirOf, colourOf, compassMarks, CARDINALS } from './skyview.js';
-import { detectSkyline, cutSkyTexture } from './panorama-sky.js';
+import {
+  detectSkyline, cutSkyTexture, horizonProfile, bakeOffsets,
+  silhouetteSvg, silhouetteCanvas
+} from './panorama-sky.js';
 
 const $ = id => document.getElementById(id);
 const clamp = (v, lo, hi) => v < lo ? lo : v > hi ? hi : v;
@@ -314,6 +335,7 @@ const state = {
   image: null,            // the source panorama, as an ImageBitmap/Image
   texCanvas: null,        // RGBA with the sky punched out
   boundary: null,         // detected skyline row per texture column
+  profile: null,          // the 720-bin horizon, in PANORAMA bearings
   spanDeg: 97,            // altitude degrees covered by the image
   topDeg: 48.5,           // altitude of the image's TOP row
   azOffset: 0,
@@ -342,11 +364,16 @@ const state = {
 const SAVE_KEY = 'skyline-align/v1';
 function save() {
   try {
+    const prev = JSON.parse(localStorage.getItem(SAVE_KEY) || '{}');
     localStorage.setItem(SAVE_KEY, JSON.stringify({
       lat: state.lat, lon: state.lon, azOffset: state.azOffset,
       altOffset: state.altOffset, spanDeg: state.spanDeg, topDeg: state.topDeg,
       magLimit: state.magLimit, starSize: state.starSize,
-      skyMarginDeg: state.skyMarginDeg
+      skyMarginDeg: state.skyMarginDeg,
+      // The handoff. Written only by the button, so a half-posed session does
+      // not quietly replace a horizon somebody already accepted.
+      profile: prev.profile ?? null,
+      profileSource: prev.profileSource ?? null
     }));
   } catch { /* private mode, or storage refused. Not worth a message. */ }
 }
@@ -598,7 +625,49 @@ async function processPanorama(img) {
   state.boundary = result.boundary;
   state.boundaryWidth = result.width;
   state.boundaryHeight = result.height;
+  rebuildProfile();
   buildTexture(img);
+}
+
+const BINS = 720;                        // the survey's own resolution, js/survey.js
+
+/**
+ * The traced skyline as the 720 numbers the survey speaks in.
+ *
+ * Kept beside the texture rather than read back off it, because they are not
+ * the same line: the texture's edge is the cut, which sits `skyMarginDeg`
+ * ABOVE the trace on purpose and is interrupted by whatever the stitcher never
+ * painted. The horizon is the trace.
+ */
+function rebuildProfile() {
+  state.profile = state.boundary ? horizonProfile({
+    boundary: state.boundary, boundaryWidth: state.boundaryWidth,
+    boundaryHeight: state.boundaryHeight, topDeg: state.topDeg, spanDeg: state.spanDeg
+  }, BINS) : null;
+  const has = !!state.profile;
+  for (const id of ['handoff', 'saveProfile', 'saveSvg', 'savePng']) $(id).disabled = !has;
+}
+
+/** The profile in TRUE bearings — what anything leaving this page gets. */
+function alignedProfile() {
+  return bakeOffsets(state.profile, { azOffset: state.azOffset, altOffset: state.altOffset });
+}
+
+function download(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function siteSlug() {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `horizon-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}`;
 }
 
 function buildTexture(img) {
@@ -641,6 +710,11 @@ function reportClamp(clamped, width) {
 /** The band drives the horizon clamp, so a change to it re-cuts the panorama. */
 function afterBandChange() {
   showBand();
+  // The band is what turns a traced ROW into an ALTITUDE, so it moves the
+  // profile as surely as it moves the cut. Rebuilding one and not the other is
+  // how an exported silhouette ends up disagreeing with the picture it came
+  // from, and nothing on screen would show it.
+  rebuildProfile();
   if (state.image) buildTexture(state.image);
 }
 
@@ -826,6 +900,68 @@ function wireUp() {
     });
   }
   $('redetect').addEventListener('click', () => { if (state.image) processPanorama(state.image); });
+
+  $('handoff').addEventListener('click', () => {
+    const prof = alignedProfile();
+    const note = $('handoffNote');
+    try {
+      const prev = JSON.parse(localStorage.getItem(SAVE_KEY) || '{}');
+      localStorage.setItem(SAVE_KEY, JSON.stringify({
+        ...prev,
+        // Baked, and the offsets zeroed with it. The planetarium applies the
+        // shared offsets to whatever profile it holds, so handing it an
+        // already-rotated profile AND a non-zero offset would turn the horizon
+        // twice -- 355 bins the wrong way, and no error anywhere.
+        profile: Array.from(prof, v => (Number.isFinite(v) ? Number(v.toFixed(2)) : null)),
+        profileSource: `aligned here, ${new Date().toLocaleString()}`,
+        azOffset: 0, altOffset: 0
+      }));
+      state.azOffset = 0; state.altOffset = 0;
+      $('azOff').value = 0; $('altOff').value = 0;
+      $('azOffVal').textContent = '+0.00°'; $('altOffVal').textContent = '+0.00°';
+      requestDraw();
+      note.className = 'note';
+      note.textContent = 'Sent. The Planetarium will open on this horizon with no file and no '
+        + 'posing. The offsets above are now zero because they are baked into it — the '
+        + 'panorama will look turned, and that is the alignment, not a mistake.';
+    } catch (err) {
+      note.className = 'note bad';
+      note.textContent = `could not store it: ${err.message}`;
+    }
+  });
+
+  $('saveProfile').addEventListener('click', () => {
+    const prof = alignedProfile();
+    const body = {
+      format: 'horizon-profile',
+      version: 1,
+      generator: 'sky/skyline-align.html',
+      exportedAt: new Date().toISOString(),
+      site: {
+        latitude: state.lat, longitude: state.lon,
+        // Zero, and said out loud: the rotation is already in the numbers.
+        azimuthOffsetDeg: 0
+      },
+      note: 'Bearings are TRUE, north through east. The alignment measured on '
+        + 'sky/skyline-align.html is baked into these bins, which is why the offset is 0.',
+      binCount: BINS,
+      binStepDeg: 360 / BINS,
+      profile: Array.from(prof, v => (Number.isFinite(v) ? Number(v.toFixed(2)) : null))
+    };
+    download(new Blob([JSON.stringify(body, null, 1)], { type: 'application/json' }),
+      `${siteSlug()}.horizon-profile`);
+  });
+
+  $('saveSvg').addEventListener('click', () => {
+    download(new Blob([silhouetteSvg(alignedProfile(), { source: 'sky/skyline-align.html' })],
+      { type: 'image/svg+xml' }), `${siteSlug()}-silhouette.svg`);
+  });
+
+  $('savePng').addEventListener('click', () => {
+    silhouetteCanvas(alignedProfile()).toBlob(b => {
+      download(b, `${siteSlug()}-silhouette.png`);
+    }, 'image/png');
+  });
 
   const readPos = () => {
     const la = parseFloat($('lat').value), lo = parseFloat($('lon').value);

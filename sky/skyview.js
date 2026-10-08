@@ -343,12 +343,37 @@ export class SkyView {
     gl.bufferData(gl.ARRAY_BUFFER, verts, usage === 'static' ? gl.STATIC_DRAW : gl.DYNAMIC_DRAW);
   }
 
-  /** Upload the cut panorama. Takes the canvas `cutSkyTexture` returns. */
+  /**
+   * Upload the cut panorama. Takes the canvas `cutSkyTexture` returns.
+   *
+   * MIPMAPS, AND WHY THEY ARE NOT AN OPTIMISATION EITHER.
+   *
+   * MEASURED on the 2026-09-23 render at 3240x891, shown at 120 degrees of
+   * field on a 1000-pixel canvas: that is four texels per pixel across, and a
+   * plain LINEAR minification filter reads ONE of those four. The treeline
+   * came out as a comb of bright vertical streaks shooting up into the sky,
+   * which reads exactly like the sky cut having torn chunks out of the
+   * terrain -- and it is not the cut at all, it is undersampling. The cut is
+   * jagged by nature, because a traced treetop is jagged, and a jagged alpha
+   * edge is the worst possible thing to point a single-sample filter at.
+   *
+   * The texture is already a power of two in both directions for the REPEAT
+   * wrap (see `cutSkyTexture`), which is the same condition WebGL 1 puts on
+   * mipmapping, so this costs a third of the memory and nothing else. The
+   * check is kept anyway: a non-POT texture with a mipmapping filter is
+   * incomplete and samples as opaque black, which is the same silent failure
+   * documented over there.
+   */
   setTexture(source) {
     const gl = this.gl;
+    const pot = n => (n & (n - 1)) === 0 && n > 0;
+    const mip = pot(source.width) && pot(source.height);
     gl.bindTexture(gl.TEXTURE_2D, this.texture);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER,
+      mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    if (mip) gl.generateMipmap(gl.TEXTURE_2D);
     this.dome.ready = true;
     this.requestDraw();
   }
@@ -507,7 +532,13 @@ export class SkyView {
       if (!dragging) return;
       // Degrees per pixel scales with the field of view, so the drag feels the
       // same whether zoomed in or out.
-      const k = this.camera.fovDeg / canvas.clientHeight;
+      //
+      // The floor on the height is not defensive clutter. A canvas in a
+      // collapsed or hidden pane reports clientHeight 0, which makes k
+      // Infinity; the altitude then clamps to -85 and the azimuth becomes
+      // 0 * Infinity = NaN, which is a camera nothing can recover from and a
+      // black screen with no error anywhere.
+      const k = this.camera.fovDeg / Math.max(1, canvas.clientHeight);
       this.lookAt(this.camera.azDeg - (e.clientX - lastX) * k,
         this.camera.altDeg + (e.clientY - lastY) * k);
       lastX = e.clientX; lastY = e.clientY;

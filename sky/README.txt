@@ -92,6 +92,46 @@ it, which should stay on unless you are checking geometry rather than sky.
 This is not an ephemeris and must not be used to point a telescope.
 
 
+DO THE ALIGNMENT ONCE: THE SILHOUETTE PANEL
+-------------------------------------------
+Posing a panorama against the stars is a job for a clear night and a steady
+hand, and it is not a job to repeat every time you want to know when something
+clears the roof. Once the sliders are right, the "Silhouette" panel turns that
+work into something permanent.
+
+  Send this horizon      Bakes the two offsets into the 720 bins and keeps the
+  to the Planetarium     result where sky/planetarium.html looks on startup.
+                         No file, no re-posing, and it stays until replaced.
+                         The offsets go to zero afterwards BECAUSE they are now
+                         in the numbers -- the panorama will look turned, and
+                         that is the alignment and not a mistake.
+
+  .horizon-profile       The same 720 bins as a small JSON file, for keeping,
+                         for the planetarium on another device, and for
+                         whatever reads a horizon next.
+
+  SVG                    The outline, as vector. One point per bin, 0.1 degrees
+                         of azimuth per unit, 0 at due north.
+
+  PNG alpha mask         3600 x 900, one pixel per tenth of a degree, opaque
+                         terrain and transparent sky, ready to lay over an
+                         equirectangular render.
+
+ALL FOUR ARE THE TRACED SKYLINE AND NOT THE PICTURE'S CUT EDGE, and that is the
+whole point of generating them from the numbers. The cut edge is the skyline
+PLUS the `skyMarginDeg` band of real sky deliberately kept above it, minus
+whatever the stitcher never painted, at the texture's resolution. Over a
+treeline, where the traced row jumps tens of pixels between neighbouring
+columns, that reads as a comb of bright streaks standing in the sky -- which
+looks like the cut having torn pieces out of the terrain and is nothing of the
+kind. The exports have no margin, no fade, no holes and no resampling.
+
+Everything written out is in TRUE bearings, north through east, with
+`azimuthOffsetDeg: 0` stated in the file. A profile that is only correct when
+accompanied by two numbers in a different document is a profile that will
+eventually be used without them.
+
+
 THE PLANETARIUM
 ---------------
 Open sky/planetarium.html after you have an alignment.
@@ -103,9 +143,11 @@ answering it needs a measured horizon -- which is what this whole project
 produces. Rise and set here are computed against the survey's 720-bin profile,
 never against a flat horizon nobody has.
 
-WHAT YOU FEED IT. Either a `.horizon-project` (small, carries the measured
-profile and the site position outright) or the panorama PNG (bigger, gives you
-the picture too, and the skyline is re-detected from it with the same worker).
+WHAT YOU FEED IT. Usually nothing: press "Send this horizon to the Planetarium"
+on the align page and this one opens on it. Otherwise a `.horizon-project` or a
+`.horizon-profile` (small, carries the measured profile outright) or the
+panorama PNG (bigger, gives you the picture too, and the skyline is re-detected
+from it with the same worker).
 Both at once is best, and that they draw the same edge is a free check that
 they agree. The profile is remembered between visits; the panorama is not,
 because a multi-megabyte image in localStorage is a page that fails to open.
@@ -124,11 +166,37 @@ under the sky spans civil dusk to civil dawn rather than midnight to midnight,
 because every pixel of it should be a minute someone could observe in; a
 24-hour bar spends over half its length in daylight.
 
-THE DEEP-SKY CATALOGUE. sky/dso-catalog.json, 570 objects: all 110 Messier
-whatever their magnitude, and everything else to magnitude 10. Built by
-tools/build-dso-catalog.py from OpenNGC -- see below. M102 has never been
-settled and OpenNGC does not carry it; it is aliased here to NGC 5866 and
-labelled as disputed rather than quietly merged.
+THE DEEP-SKY CATALOGUE. sky/dso-catalog.json, 687 objects, built by
+tools/build-dso-catalog.py from OpenNGC -- see below. All 110 Messier whatever
+their magnitude; everything else to magnitude 10; everything with a name; and
+anything 10 arcminutes or wider that nobody has measured.
+
+That last rule is there because of a miss reported from the field: NGC 281,
+the Pacman, is 35 arcminutes across and a standard beginner target, and the
+first build did not have it. OpenNGC tabulates no magnitude at all for most
+large emission nebulae, so a magnitude cut throws away exactly the objects that
+are easiest to find. An object with no tabulated magnitude is not a faint
+object, it is an unmeasured one.
+
+M102 has never been settled and OpenNGC does not carry it; it is aliased here
+to NGC 5866 and labelled as disputed rather than quietly merged.
+
+FINDING THINGS BY THE NAME YOU KNOW. Also reported from the field: "Shedar"
+found nothing, because the label is "Schedar", and "Pacman" found nothing
+because OpenNGC does not carry nicknames. Three things answer that now, and
+none of them is picking a better single spelling, because there isn't one.
+
+  alternate spellings  Every name Stellarium lists for a star, not only the
+                       first. HIP 3179 answers to Schedar, Shedar and Shedir.
+  Bayer designations   1,517 of them, so "alpha Cas", "alp cas" and the Greek
+                       letter pasted off a chart all work.
+  nicknames            A short hand-kept table in tools/build-dso-catalog.py
+                       for the popular names OpenNGC lacks -- Pacman, Heart,
+                       Soul, Wizard, Seagull and the rest.
+
+A query that still matches nothing falls back to an edit distance of two, so a
+near miss finds the thing anyway. Only a miss falls back: a query that matched
+something exactly is never reordered by guesses.
 
 NOT A POINTING MODEL. Rise and set are good to well under a minute given the
 profile, and the profile is good to whatever the survey measured. The planets
@@ -153,9 +221,11 @@ not open where it is needed. It works in aeroplane mode.
            https://github.com/mattiaverga/OpenNGC
            database_files/NGC.csv and database_files/addendum.csv
            CC BY-SA 4.0
-           570 objects. Positions J2000.0, magnitudes V where OpenNGC has
+           687 objects. Positions J2000.0, magnitudes V where OpenNGC has
            one and estimated from B - 0.4 where it does not, which the
-           catalogue marks so the page can say so.
+           catalogue marks so the page can say so. A handful of popular
+           nicknames OpenNGC does not carry are added by the builder and
+           are listed there.
 
   Figures  Stellarium, skycultures/modern/index.json
            https://github.com/Stellarium/stellarium

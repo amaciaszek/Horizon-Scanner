@@ -386,16 +386,21 @@ function save() {
     localStorage.setItem(SHARED_KEY, JSON.stringify({
       ...prev,
       lat: state.lat, lon: state.lon, azOffset: state.azOffset,
-      altOffset: state.altOffset, spanDeg: state.spanDeg, topDeg: state.topDeg
+      altOffset: state.altOffset, spanDeg: state.spanDeg, topDeg: state.topDeg,
+      // The profile lives in the SHARED store, not this page's own, because
+      // the align page's "send this horizon" button writes it there and a
+      // second copy here would mean the two pages could disagree about what
+      // the horizon is. The expensive thing to obtain is the small thing to
+      // keep: it survives a refresh and the page is useful before anything
+      // has been dropped on it.
+      profile: state.profile
+        ? Array.from(state.profile, v => (Number.isFinite(v) ? Number(v.toFixed(2)) : null))
+        : (prev.profile ?? null),
+      profileSource: state.profileSource || prev.profileSource || null
     }));
     localStorage.setItem(OWN_KEY, JSON.stringify({
       magLimit: state.magLimit, dsoMagLimit: state.dsoMagLimit,
-      starSize: state.starSize, dim: state.dim,
-      // The profile is the expensive thing to obtain and the small thing to
-      // keep, so it survives a refresh and the page is useful before anything
-      // has been dropped on it.
-      profile: state.profile ? Array.from(state.profile, v => Number(v.toFixed(2))) : null,
-      profileSource: state.profileSource
+      starSize: state.starSize, dim: state.dim
     }));
   } catch { /* private mode, or storage refused. Not worth a message. */ }
 }
@@ -406,15 +411,19 @@ function restore() {
     for (const k of ['lat', 'lon', 'azOffset', 'altOffset', 'spanDeg', 'topDeg']) {
       if (Number.isFinite(shared?.[k])) state[k] = shared[k];
     }
+    if (Array.isArray(shared?.profile) && shared.profile.length === BINS) {
+      // null is a bin the survey never reached and has to stay unknown; the
+      // Float32Array carries it as NaN, which every reader here already tests
+      // for. Coercing it to 0 would promise open sky at a bearing nobody
+      // looked at.
+      state.profile = Float32Array.from(shared.profile, v => (v == null ? NaN : v));
+      state.profileSource = shared.profileSource || 'remembered from last time';
+    }
   } catch { /* ditto */ }
   try {
     const own = JSON.parse(localStorage.getItem(OWN_KEY) || '{}');
     for (const k of ['magLimit', 'dsoMagLimit', 'starSize', 'dim']) {
       if (Number.isFinite(own?.[k])) state[k] = own[k];
-    }
-    if (Array.isArray(own?.profile) && own.profile.length === BINS) {
-      state.profile = Float32Array.from(own.profile);
-      state.profileSource = own.profileSource || 'remembered from last time';
     }
   } catch { /* ditto */ }
 }
@@ -604,12 +613,28 @@ function buildIndex() {
     index.push({ kind: 'body', id: name, label: name, keys: [name.toLowerCase()], mag: -4 });
   }
   if (state.stars) {
-    for (const [idxStr, name] of Object.entries(state.stars.names)) {
+    const names = state.stars.names || {};
+    const aliases = state.stars.aliases || {};
+    const desig = state.stars.desig || {};
+    // Every star that has anything to be called: a proper name, an alternate
+    // spelling of one, or a Bayer letter. A star with none of those is a dot
+    // on the chart and nobody is going to type it.
+    const wanted = new Set([...Object.keys(names), ...Object.keys(desig)]);
+    for (const idxStr of wanted) {
       const i = +idxStr;
+      const bayer = desig[idxStr] ? expandBayer(desig[idxStr]) : null;
+      const label = names[idxStr] || (bayer ? bayer.label : null);
+      if (!label) continue;
+      const keys = [label.toLowerCase()];
+      for (const a of aliases[idxStr] || []) keys.push(a.toLowerCase());
+      if (bayer) keys.push(...bayer.keys);
       index.push({
         kind: 'star', starIndex: i, ra: state.stars.ra[i], dec: state.stars.dec[i],
-        label: name, sub: `star · mag ${state.stars.mag[i].toFixed(2)}`,
-        keys: [name.toLowerCase()], mag: state.stars.mag[i]
+        label,
+        sub: [bayer && bayer.label, 'star', `mag ${state.stars.mag[i].toFixed(2)}`,
+          (aliases[idxStr] || []).length ? 'also ' + aliases[idxStr].join(', ') : null]
+          .filter(Boolean).join(' · '),
+        keys, mag: state.stars.mag[i]
       });
     }
   }
@@ -624,6 +649,9 @@ function buildIndex() {
       }
       if (o.m) keys.push(`m${o.m}`, `m ${o.m}`, `messier ${o.m}`);
       for (const nm of o.names) keys.push(nm.toLowerCase());
+      // Sharpless, LBN, Collinder and the rest: how a large nebula is
+      // labelled on most charts, and so how it gets typed in here.
+      for (const a of o.alt || []) keys.push(a.toLowerCase());
       const label = o.m ? `M${o.m}${o.names[0] ? ' · ' + o.names[0] : ''}`
         : (o.names[0] || prettyId(o.id));
       index.push({
@@ -635,6 +663,33 @@ function buildIndex() {
       });
     }
   }
+}
+
+/*
+ * "Alp Cas" is how HYG writes it and not how anyone says it.
+ *
+ * The page expands rather than the builder, because the point is to match
+ * what someone TYPED: "alpha cas", "a cas", the Greek letter pasted out of a
+ * chart, or the three-letter abbreviation itself. All of them are keys; the
+ * label stays the conventional "Alpha Cas".
+ */
+const GREEK = {
+  alp: ['alpha', 'α'], bet: ['beta', 'β'], gam: ['gamma', 'γ'], del: ['delta', 'δ'],
+  eps: ['epsilon', 'ε'], zet: ['zeta', 'ζ'], eta: ['eta', 'η'], the: ['theta', 'θ'],
+  iot: ['iota', 'ι'], kap: ['kappa', 'κ'], lam: ['lambda', 'λ'], mu: ['mu', 'μ'],
+  nu: ['nu', 'ν'], xi: ['xi', 'ξ'], omi: ['omicron', 'ο'], pi: ['pi', 'π'],
+  rho: ['rho', 'ρ'], sig: ['sigma', 'σ'], tau: ['tau', 'τ'], ups: ['upsilon', 'υ'],
+  phi: ['phi', 'φ'], chi: ['chi', 'χ'], psi: ['psi', 'ψ'], ome: ['omega', 'ω']
+};
+
+function expandBayer(desig) {
+  const [letter, con] = desig.split(/\s+/);
+  if (!letter || !con) return null;
+  const forms = GREEK[letter.toLowerCase()];
+  const pretty = forms ? forms[0][0].toUpperCase() + forms[0].slice(1) : letter;
+  const keys = [`${letter} ${con}`.toLowerCase(), `${letter}${con}`.toLowerCase()];
+  for (const f of forms || []) keys.push(`${f} ${con}`.toLowerCase(), `${f}${con}`.toLowerCase());
+  return { label: `${pretty} ${con}`, keys };
 }
 
 /** NGC0224 reads as NGC 224 to everyone except the file it came out of. */
@@ -664,8 +719,52 @@ function search(q) {
     }
     if (best < 9) hits.push({ e, rank: best });
   }
+  /*
+   * NOTHING MATCHED IS USUALLY A SPELLING, NOT AN ABSENCE.
+   *
+   * These names are transliterations of Arabic and they were transliterated
+   * more than once, so there is no single right spelling to know. The
+   * alternates are carried where a source lists them -- Stellarium gives
+   * Schedar, Shedar and Shedir for the same star -- but no list is complete,
+   * and a chart that knows a star and will not answer to a near miss of its
+   * name is useless at the moment it is being used, in the dark, one-handed.
+   *
+   * So a miss falls back to an edit distance of two, and only to a miss: a
+   * query that matched something exactly must never be reordered by guesses.
+   */
+  if (!hits.length) {
+    for (const e of index) {
+      let best = 9;
+      for (const k of e.keys) {
+        const d = editDistance(needle, k);
+        if (d < best) best = d;
+        if (best === 0) break;
+      }
+      if (best <= 2) hits.push({ e, rank: 3 + best });
+    }
+  }
   hits.sort((a, b) => a.rank - b.rank || a.e.mag - b.e.mag);
   return hits.slice(0, 40).map(h => h.e);
+}
+
+/** Levenshtein, capped: anything past `max` is "far" and the exact figure
+ *  does not matter, so the row is abandoned as soon as it cannot come back. */
+function editDistance(a, b, max = 2) {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j++) prev[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1,
+        prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+      if (cur[j] < rowMin) rowMin = cur[j];
+    }
+    if (rowMin > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length];
 }
 
 function showResults(list) {

@@ -177,6 +177,16 @@ def main():
     for i, s in enumerate(kept):
         if s['proper']:
             names[str(i)] = s['proper']
+
+    # EVERY SPELLING STELLARIUM KNOWS, NOT ONLY THE ONE ON THE LABEL.
+    #
+    # Reported from the field: searching "Shedar" in the planetarium found
+    # nothing, because the label is "Schedar". Both are in Stellarium's own
+    # list for HIP 3179, along with "Shedir". A star chart that knows a name
+    # and will not answer to it is simply broken, and the fix is not to pick a
+    # better single spelling -- there isn't one -- but to carry them all. The
+    # label stays the first; the rest are search keys and nothing else.
+    aliases = {}
     for key, entries in (sky.get('common_names') or {}).items():
         if not key.startswith('HIP '):
             continue
@@ -185,12 +195,29 @@ def main():
         except ValueError:
             continue
         i = index_of.get(hip)
-        if i is None or str(i) in names or not entries:
+        if i is None or not entries:
             continue
-        first = entries[0]
-        label = first.get('english') or first.get('native')
-        if label:
-            names[str(i)] = label
+        spellings = []
+        for e in entries:
+            for label in (e.get('english'), e.get('native')):
+                if label and label not in spellings:
+                    spellings.append(label)
+        if not spellings:
+            continue
+        if str(i) not in names:
+            names[str(i)] = spellings[0]
+        extra = [n for n in spellings if n != names[str(i)]]
+        if extra:
+            aliases[str(i)] = extra
+
+    # BAYER DESIGNATIONS, because half of what a person says out loud at the
+    # eyepiece is "alpha Cas" and not a proper name at all. HYG's spelling is
+    # kept as it stands ("Alp Cas"); expanding the Greek is the page's job,
+    # since it is the page that has to match what someone typed.
+    desig = {}
+    for i, s in enumerate(kept):
+        if s['bayer'] and s['con']:
+            desig[str(i)] = f"{s['bayer']} {s['con']}"
 
     catalogue = {
         'source': {
@@ -207,6 +234,8 @@ def main():
         'mag': [round(s['mag'], 2) for s in kept],
         'ci': [round(s['ci'], 2) for s in kept],
         'names': names,
+        'aliases': aliases,
+        'desig': desig,
         'constellations': figures(sky.get('constellations', ()), named_only=False),
         'asterisms': figures(sky.get('asterisms', ()), named_only=True),
     }
@@ -218,7 +247,9 @@ def main():
     print(f'  {len(kept)} stars to magnitude {MAG_LIMIT}'
           f'{f" (+{faint} fainter, kept because a figure needs them)" if faint else ""}')
     print(f'  {len(catalogue["constellations"])} constellations, '
-          f'{len(catalogue["asterisms"])} named asterisms, {len(names)} proper names')
+          f'{len(catalogue["asterisms"])} named asterisms, {len(names)} proper names, '
+          f'{sum(len(v) for v in aliases.values())} alternate spellings, '
+          f'{len(desig)} Bayer designations')
     print(f'  brightest {catalogue["mag"][0]}, faintest {catalogue["mag"][-1]}')
 
 

@@ -23,11 +23,23 @@ WHAT IS KEPT, and why that line and not another:
                               aliased to NGC 5866 below, which is the usual
                               identification, and labelled so the page does not
                               pretend the question is closed.
-  everything to magnitude 10  562 objects. A 10-inch instrument under suburban
-                              sky is the use case this site is being surveyed
-                              for, and 10 is about where that stops being fun.
-                              The whole file is ~90 kB, so the limit is set by
-                              what is worth listing, not by download size.
+  everything to magnitude 10  A 10-inch instrument under suburban sky is the
+                              use case this site is being surveyed for, and 10
+                              is about where that stops being fun.
+  everything with a name      A named object is one people ask for by name.
+  anything big and unmeasured OpenNGC tabulates no magnitude at all for most
+                              large emission nebulae, so a magnitude cut throws
+                              away exactly the objects that are easiest to
+                              find. MEASURED, from the field: NGC 281, the
+                              Pacman -- 35 arcminutes across, a standard
+                              beginner target -- was missing from the first
+                              build for precisely this reason. An object with
+                              no tabulated magnitude is not a faint object, it
+                              is an unmeasured one, so anything 10 arcminutes
+                              or wider is kept regardless.
+
+  The whole file is about 100 kB, so the limits are set by what is worth
+  listing and not by download size.
 
 Types that are not objects -- OpenNGC's Dup (a duplicate entry), NonEx (does
 not exist), and the plain-star entries -- are dropped. A search result that
@@ -47,7 +59,57 @@ import sys
 from pathlib import Path
 
 MAG_LIMIT = 10.0
+BIG_ARCMIN = 10.0
 OUT = Path('sky/dso-catalog.json')
+
+# NAMES EVERYBODY USES THAT OPENNGC DOES NOT CARRY.
+#
+# OpenNGC's `Common names` column is good and incomplete, and what it is
+# missing is mostly the popular nicknames of large nebulae -- the ones an
+# observer types, because nobody says "NGC 281". Reported from the field:
+# searching "Pacman" found nothing. These are added to whatever OpenNGC
+# already has rather than replacing it, and an object named here is kept
+# whatever its magnitude, because being worth a nickname is the evidence that
+# somebody wants to find it.
+NICKNAMES = {
+    'NGC0281': ['Pacman Nebula'],
+    'IC1805': ['Heart Nebula'],
+    'IC1848': ['Soul Nebula'],
+    'IC1396': ["Elephant's Trunk Nebula"],
+    'NGC7380': ['Wizard Nebula'],
+    'IC0410': ['Tadpoles Nebula'],
+    'IC2177': ['Seagull Nebula'],
+    'NGC2359': ["Thor's Helmet"],
+    # OpenNGC hangs "Flame Nebula" on IC 434, which is the HII region the
+    # Horsehead is silhouetted against. Both names are in common use for both
+    # objects; carrying each on each is the only way a search answers either.
+    'NGC2024': ['Flame Nebula'],
+    'IC0434': ['Horsehead Nebula'],
+    'IC0443': ['Jellyfish Nebula'],
+    'NGC2237': ['Rosette Nebula'],
+    'NGC0869': ['Double Cluster', 'h Persei'],
+    'NGC0884': ['Double Cluster', 'chi Persei'],
+    'NGC3628': ['Hamburger Galaxy', 'Leo Triplet'],
+    'NGC5907': ['Splinter Galaxy'],
+    'NGC0253': ['Sculptor Galaxy', 'Silver Coin Galaxy'],
+    'NGC2264': ['Cone Nebula'],
+    'NGC1333': ['Embryo Nebula'],
+}
+
+# Catalogues worth answering to, and no more. OpenNGC's Identifiers column
+# also carries 2MASX, PGC, SDSS and a dozen survey designations that nobody
+# types at an eyepiece, and carrying them all would double the file.
+ALT_PREFIXES = ('Sh2-', 'LBN', 'LDN', 'Barnard', 'Cr ', 'Mel ', 'Tr ',
+                'Stock ', 'King ', 'vdB', 'Ced', 'Abell', 'Hickson', 'Arp')
+
+
+def alt_identifiers(text):
+    out = []
+    for raw in (text or '').split(','):
+        name = raw.strip()
+        if name and name.startswith(ALT_PREFIXES):
+            out.append(name)
+    return out[:4] or None
 
 # OpenNGC type codes, spelled out. The page shows these to a person standing
 # outside, so they are words rather than the two-letter codes.
@@ -103,19 +165,26 @@ def main(paths):
         if kind in ('Dup', 'NonEx'):
             continue
         mag, exact = magnitude(r)
+        try:
+            size = float(r['MajAx'])
+        except (TypeError, ValueError):
+            size = None
+        extra = NICKNAMES.get(r['Name'].strip(), [])
+        common = [n.strip() for n in (r['Common names'] or '').split(',') if n.strip()]
         # A Messier object is kept whatever its catalogue magnitude says --
         # M24 and M45 have no tabulated V at all, and they are the two most
-        # obvious things in a summer and a winter sky respectively.
-        if messier is None and (mag is None or mag > MAG_LIMIT):
+        # obvious things in a summer and a winter sky respectively. So is
+        # anything named, and anything large that nobody has measured; see the
+        # module docstring for why the magnitude cut on its own was wrong.
+        if not (messier is not None
+                or common or extra
+                or (mag is not None and mag <= MAG_LIMIT)
+                or (mag is None and size is not None and size >= BIG_ARCMIN)):
             continue
         ra = sexagesimal_to_deg(r['RA'], True)
         dec = sexagesimal_to_deg(r['Dec'], False)
         if ra is None or dec is None:
             continue
-        try:
-            size = float(r['MajAx'])
-        except (TypeError, ValueError):
-            size = None
         objects.append({
             'id': r['Name'].strip(),
             'm': messier,
@@ -126,7 +195,11 @@ def main(paths):
             'type': TYPE_NAMES.get(kind, kind),
             'size': None if size is None else round(size, 1),
             'const': r['Const'].strip() or None,
-            'names': [n.strip() for n in (r['Common names'] or '').split(',') if n.strip()]
+            'names': common + [n for n in extra if n not in common],
+            # A few of the other catalogues an observer might have the object
+            # written down in. Sharpless numbers in particular are how large
+            # nebulae are labelled on most charts.
+            'alt': alt_identifiers(r['Identifiers'])
         })
 
     # M102: see the docstring. Tagged rather than silently merged.
